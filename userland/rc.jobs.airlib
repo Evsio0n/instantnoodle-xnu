@@ -1,0 +1,143 @@
+# Commands run by the launchd job com.hackios.demo (RC_JOBS=rc.jobs.airlib).
+#
+# The 124 library functions of PortraitFilters that the generated wrapper can run, on the Adreno.
+#
+# These are air.visible functions: not entry points, and not dispatchable as themselves. Metal
+# stitches one into a caller at pipeline time through the ABI in its own metadata, which this
+# project does not implement. air_run --library runs the wrapper air_to_nir generates instead:
+# argument i from device buffer 0 at byte 16*i, the result into buffer 1 (docs/air.md section 5,
+# tools/air/libcheck.py). The argument buffer holds floats, not the usual byte pattern, because
+# these modules promise no infinities and no NaNs -- with arbitrary bytes both sides of a
+# comparison are outside the contract and a disagreement means nothing.
+#
+# What this run can establish: that the wrapper's shader dispatches on the hardware and that the
+# words it writes are the words our own folder computes on the host. For 21 of these functions
+# LLVM on the host agrees with that folding too, so those three readings form a chain. For the
+# rest the folder and the Adreno are both ours, and the comparison catches the backend and the
+# hardware disagreeing with the folder -- which is how the ir3 u32-to-f32 rounding bug surfaced --
+# and nothing more. It is not evidence about Metal's stitching ABI, which is not implemented.
+
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_kickLightKernel_pos
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_kickLightKernel_neg
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_dualLightKernel
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_strobeKernel
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_contourExtractRed
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_contourLightKernel
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_portraitSpotKernel
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_neckContour
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_contourExtractRedStudio
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_studioLightKernel
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_cheapEdgePreserveStudio
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_strobeKernelV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_contourExtractRedV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_contourLightKernelV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_cheapEdgePreserveContourV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_faceContourMask
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_darkenContour
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_portraitConvertToGrayscale
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_portraitLocalContrast
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_drawTriangle
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_protectEyes
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_highKey
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_imToIPT
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_iptToHueChroma
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_softExposure
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_foodVignette
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyFoodVignette
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_disparityError
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_whitenteeth
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_enrich
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_eyeBrightenSoftlight
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_mixKernel1
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_textureDiff
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_textureAdd
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_prepareDepth
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_mixKernel2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_prepareDepth2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_mixKernel3
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_blendSingleChannelMask
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_faceVignetteContour
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyVignetteContour
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_prepareBlackDisparity
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_prepareBlackDepth
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyBlackDepth
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_refineBlackDepth
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_faceVignette1
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_faceProtect
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_faceAndBodyFill_1
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_faceAndBodyFill_6
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyVignette
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_adaptiveNormalization2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_adaptiveNormalizationGPU
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_adaptiveNormalizationAbsolute
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_invertRed
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_blendDepth
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_thresholdMatte
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_thresholdAndApplyMatte
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_invertImages
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_transitionDepths
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_renormalize01
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_featherBand
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_protectInterior
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_invertImage
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_normalizeToPhysicalDepth
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_foreground
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_filterCut
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_denormalize
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_confidenceConvertToHalfFloat
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_renormalizeThreshold
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_confidenceExtractRed
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_brightenSat
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_brightenFood
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_accumulateTileKernel
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_whitenteethV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_enrichV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_eyeBrightenV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_eyeBrightenSoftlightV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_textureDiffV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_textureAddV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_cheapEdgePreserveV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_protectEyesNose
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_eyeBlurV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_featherEdgeLight
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_prepareDepthV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_faceVignetteStudioV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyFaceProtectStudio
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_prepareDepthContourV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_blendSingleChannelMaskV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_faceVignetteContourV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyVignetteContourV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyFaceProtect
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_transparentBorder
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyTransparentBorder
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_redContour
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_prepareBlackDisparityV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_prepareBlackDepthV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyBlackDepthV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyStageNoFeather
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyStageNoFeatherSpill
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_getRefinedMatte
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyRefinedMatte
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_refineBlackDepthV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_faceVignetteStageV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_faceProtectV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_applyVignetteStageV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_invertRedV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_blendDepthV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_thresholdMatteV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_thresholdAndApplyMatteV2
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_red
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_thresholdAndApplyWhiteBG
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_thresholdWhiteMatte
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_prepareWhiteDepth
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _applyWhiteNoFeather
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _getRefinedWhiteMatte
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _applyRefinedWhiteMatte
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_srgbToIPT
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_rectToHueChroma
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_iptToSRGB
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_hueChromaToRect
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_scaleHue
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_scaleHuePi
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_shadowKernelDynamic
+/hackios/bin/air_run --library /System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib _pf_polyKernelDynamic

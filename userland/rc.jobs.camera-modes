@@ -1,0 +1,9 @@
+# Commands run by the launchd job com.hackios.demo (see com.hackios.demo.plist).
+# rc.jobs.camera, and then Camera.app's modes changed by taps on its mode bar: Video, Portrait, Photo (with cam=5).
+# Each change stops the capture graph, which takes the stream's output handlers away, and starts a new one
+# (Video in format 1); mediaserverd died of every change until camera_device.c took only blocks as handlers
+# (OnePlus 8 runs 104112, 104931; run 105351 the first without a death). The taps are the OnePlus 8's
+# (1080x2400: the mode bar at 0.7625 of the height; Video at 0.315 of the width, Portrait 0.718, Photo 0.5).
+/hackios/bin/sound_test springboard
+/hackios/bin/camera_avtest
+/hackios/bin/rwtouch wait 10 swipe 0.5 0.985 0.5 0.3 200 wait 6 tap 0.845 0.36 wait 15 tap 0.315 0.7625 wait 10 tap 0.718 0.7625 wait 10 tap 0.5 0.7625 wait 15

@@ -1,0 +1,28 @@
+instantnoodle-xnu
+=================
+
+This repository builds on:
+
+- HackiOS by OOSEX GANG (https://github.com/oosexgang/hakios-xnu-kernel and its user space), which brought
+  Apple's XNU kernel and the iOS 16.5 user space to the POCO X5 Pro (redwood) and QEMU.
+- haxi0/iphont-xnu-kernel and haxi0/iphont-xnu-userland, the OnePlus 8 (instantnoodle) port this work started from.
+- Project Silicium / Mu-Silicium (https://github.com/Project-Silicium/Mu-Silicium), the UEFI the phone boots
+  through (uefi/).
+
+Apple, iOS and XNU are trademarks of Apple Inc. The XNU sources and the patches to them are under the Apple Public
+Source License 2.0 (LICENSE). This project is not affiliated with, authorised or endorsed by Apple Inc., OnePlus or
+Qualcomm.
+
+Not included: no Apple files (no IPSW contents, no dyld shared cache, no Apple binaries or keys), no device dumps,
+no logs. The build scripts under ios165/ and userland/ take what they need from the user's own IPSW download, and
+the camera and Wi-Fi firmware from the user's own phone, at build time.
+
+Included third-party binaries, as in the upstream repositories:
+
+- uefi/files/Binaries/ and prebuilt/uefi/: UEFI driver binaries extracted from the phones' boot firmware (xbl) with
+  UEFIReader, as Project Silicium distributes them for each device. They remain the property of their owners
+  (Qualcomm and the device makers); see the README files next to them.
+- prebuilt/: the kernel, the EFI loader and the user-space programs built from this repository's own sources.
+- uefi/files/Resources/DTBs/: device trees taken from the phones.
+- wifi/: the Linux ath11k/mac80211 sources it builds on keep their own licenses (GPL-2.0 / ISC), as marked in the
+  files.
