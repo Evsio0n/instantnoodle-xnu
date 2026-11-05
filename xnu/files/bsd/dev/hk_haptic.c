@@ -679,7 +679,11 @@ configure_aw8697(void)
 	    !put_bits(A7_BST_AUTO, 0x04, 0x00)) {
 		return false;
 	}
-	if (PE_parse_boot_argn("haptic_trim", &trim, sizeof(trim))) {
+	/*
+	 * (board=instantnoodle: 11, this phone's factory f0 trim, its profile's value -- a default of the board's now, the
+	 * command line being full, 2026-11-04; haptic_trim= says otherwise)
+	 */
+	if (PE_parse_boot_argn("haptic_trim", &trim, sizeof(trim)) || (instantnoodle_board() && (trim = 11) != 0)) {
 		if (trim > 0x3f) {
 			say("haptic: haptic_trim=%u is not a 6-bit trim: not written\n", trim);
 		} else if (!put(A7_TRIM_LRA, (uint8_t)trim)) {

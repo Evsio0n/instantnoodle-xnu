@@ -959,6 +959,77 @@ backlightSendLocked(void)
 }
 
 /*
+ * High brightness mode, for HDR (bsd/dev/hk_hbm.c decides when, for how long and within which limits): the AMB655UV01's
+ * own commands from Android's device tree (qcom,mdss_dsi_oppo19101samsung_amb655uv01_1080_2400_cmd, timing@0 and @1):
+ * on = 53 e0 (a DCS short write), then 51 0f 60 and 34 ms; off = 53 20 and 16 ms, then iOS's brightness again. In
+ * high-speed mode, as the off-command's state says and every brightness command here is sent. `locked' false only on
+ * the way to the loader or a panic (which may hold the lock). Returns whether the panel took every packet.
+ */
+static bool gHbmOn;                     /* the panel is in high brightness mode */
+static TUNABLE(uint32_t, gHbmAllowed, "hbm", 0);        /* (hk_hbm.c's gate: with it, the way out always says off) */
+
+static bool
+hbmSend(bool on)
+{
+	static const uint8_t kHbmOn[] = { 0x15, 0, 2, 0x53, 0xe0, 0x39, 34, 3, 0x51, 0x0f, 0x60, 0 };
+	static const uint8_t kHbmOff[] = { 0x39, 16, 2, 0x53, 0x20, 0 };
+	uint32_t dma = displayReg(gDSI, DSI_CMD_DMA_CTRL);
+	unsigned sent = 0;
+
+	*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma & ~DSI_CMD_DMA_LOW_POWER;     /* "dsi_hs_mode" */
+	for (const uint8_t * c = on ? kHbmOn : kHbmOff; *c != 0 && dsiPacket(gDSI, c[0], c + 3, c[2]); c += 3 + c[2]) {
+		sent++;
+		if (c[1] != 0) {
+			panelWait(c[1]);
+		}
+	}
+	*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma;
+	gHbmOn = on && sent == 2;
+	if (!on) {
+		backlightSendLocked();          /* (iOS's own brightness again) */
+	}
+	return sent == (on ? 2u : 1u);
+}
+
+extern "C" bool
+hk_display_hbm(bool on, bool locked)
+{
+	bool ok = false;
+
+	if (gPanelLock == NULL || !gPushing || !instantnoodle()) {
+		return false;
+	}
+	if (locked) {
+		IOLockLock(gPanelLock);
+	}
+	if (dsiReady() && (!on || !gPanelOff) && (on || gHbmOn)) {
+		if (locked && !gPanelOff && gPushed != 0) {
+			pushWait();             /* (the frame on its way finishes first) */
+		}
+		ok = hbmSend(on);
+	} else if (!on) {
+		ok = true;                      /* (it was off) */
+	}
+	if (locked) {
+		IOLockUnlock(gPanelLock);
+	}
+	return ok;
+}
+
+extern "C" bool
+hk_display_hbm_on(void)
+{
+	return gHbmOn;
+}
+
+/* The panel's TE period now, in us (an average of the last few; 0: no TE seen), for hk_hbm.c's log */
+extern "C" uint32_t
+hk_display_te_us(void)
+{
+	return __atomic_load_n(&gTeTime, __ATOMIC_ACQUIRE) != 0 ? (uint32_t) micros(__atomic_load_n(&gTePeriod, __ATOMIC_RELAXED)) : 0;
+}
+
+/*
  * The panel dark and lit again, for IOMobileFramebufferRequestPowerChange (backboardd: 0 when the screen locks or dims
  * out, 1 when it wakes): display off (0x28) and display on (0x29), DCS short writes, nothing else. The OLED's pixels
  * are off meanwhile, its TE goes on but nothing is pushed and no VSync is told; the display engine and the memory
@@ -987,6 +1058,9 @@ panelPower(bool on)
 		unsigned sent = 0;
 
 		pushWait();                     /* (the frame on its way finishes first) */
+		if (gHbmOn) {
+			hbmSend(false);         /* (high brightness ends before the screen goes dark: hk_hbm.c) */
+		}
 		*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma & ~DSI_CMD_DMA_LOW_POWER;   /* "dsi_hs_mode" */
 		for (const uint8_t * c = kOff; *c != 0 && dsiPacket(gDSI, c[0], c + 3, c[2]); c += 3 + c[2]) {
 			sent++;
@@ -1030,11 +1104,44 @@ hk_display_set_backlight(uint32_t level)
 	if (gPanelLock != NULL) {
 		IOLockLock(gPanelLock);
 		gBacklight = dcs;
-		sent = backlightSendLocked();
+		if (gHbmOn && dsiReady()) {
+			sent = hbmSend(false);  /* (iOS's brightness ends high brightness, and is sent with its end: hk_hbm.c) */
+		} else {
+			sent = backlightSendLocked();
+		}
 		IOLockUnlock(gPanelLock);
 	}
 	displayLog("display: brightness level %u of 65536: panel value %#x (%s)\n", level, dcs,
 	    sent ? "sent" : gPanelOff ? "kept for when the panel is lit" : "not sent: no DSI command path");
+}
+
+/*
+ * The brightness in nits (MiniAppleARMBacklight.cpp, boot-arg edr=1: CoreBrightness's new architecture sends nits x
+ * 65536 instead of a level). Up to the user's maximum, 430 nits at 0x7ff (the panel's tree), linear in light; above it
+ * the panel's high brightness mode for EDR, asked of hk_hbm.c, which keeps its limits -- the panel stays at 0x7ff
+ * whenever that says no. While it is on, nothing else is sent; when it ends it sends this brightness again.
+ */
+#define NITS_USER_MAX           430
+extern "C" void hk_hbm_hold(bool on);
+
+extern "C" void
+hk_display_set_nits(uint32_t nits16, uint32_t cap16)
+{
+	bool above = nits16 > ((uint32_t) NITS_USER_MAX << 16), sent = false;
+	uint32_t dcs = above ? 0x7ff : 1 + (uint32_t)((uint64_t) nits16 * 2046 / ((uint64_t) NITS_USER_MAX << 16));
+
+	if (gPanelLock != NULL) {
+		IOLockLock(gPanelLock);
+		gBacklight = dcs;
+		if (!gHbmOn) {
+			sent = backlightSendLocked();
+		}
+		IOLockUnlock(gPanelLock);
+	}
+	displayLog("display: brightness %u.%02u nits (cap %u): panel value %#x%s (%s)\n", nits16 >> 16, (nits16 & 0xffff) * 100 >> 16,
+	    cap16 >> 16, dcs, above ? ", above the user's maximum: high brightness asked for" : "",
+	    sent ? "sent" : gHbmOn ? "high brightness holds" : gPanelOff ? "kept for when the panel is lit" : "not sent");
+	hk_hbm_hold(above);
 }
 
 /* What the panel has been told (kern.hackios.backlight: its 11-bit value, 0 not yet; backlight_sent: how many writes) */
@@ -1095,6 +1202,17 @@ hk_display_quiesce(void)
 		panelWait(20);
 		gPanelOff = sent;
 		displayLog("display: back to the loader dark (display off %s)\n", sent ? "sent" : "NOT sent");
+	}
+	if ((gHbmOn || gHbmAllowed) && instantnoodle() && dsiReady()) {
+		/*
+		 * Never high brightness on the way to the loader or a panic (hk_hbm.c). With hbm=1 the off-command goes
+		 * whatever gHbmOn says: it is the panel's own normal state, and a panic halfway through a change leaves
+		 * the flag and the panel apart.
+		 */
+		bool was = gHbmOn;
+
+		hbmSend(false);
+		displayLog("display: high brightness off on the way to the loader (it was %s)\n", was ? "on" : "off");
 	}
 	if (gBacklight != 0 && gBacklight != BACKLIGHT_FIRMWARE) {
 		/* the loader's menu is read at the brightness the firmware chose, not at one iOS left (a shutdown sets 0) */

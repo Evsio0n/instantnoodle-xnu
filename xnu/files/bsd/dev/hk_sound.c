@@ -28,7 +28,7 @@
  *   sound=4  what iOS plays (/dev/hk-audio, hk_audio.c), until the run ends: the port
  *            and the stream as above, kept running (silence when iOS writes nothing); the
  *            amplifiers set up once and powered down, started and faded in (the driver's quick
- *            fade) whenever a write is not silence, stopped after three seconds of silence; their
+ *            fade) whenever a write is not silence, stopped after QUIET_BEFORE_OFF_US of silence; their
  *            level is what is set on the plug-in's volume control (ioctl HK_AUDIO_SET_VOLUME):
  *            so far under sound_below, which stays the loudest, and at 0 they stay off. (iOS sets
  *            that control only once, to the top, and applies its volume to the samples itself --
@@ -70,7 +70,7 @@
  * select, 134 data in (the amplifiers' sense), 137 data out, functions 1, 1, 1 and 3 (pinctrl-sm8250.c),
  * 8 mA, no pull. Its amplifiers have no volume of their own, so the speakers' guard puts their level on
  * the samples (hk_guard_digital()), the test tone's too. They start (26-39 ms) on the silence already queued
- * at the DSP (160 ms): the level is kept, so the first period of a short sound (the lock sound) is not lost.
+ * at the DSP (80 ms): the level is kept, so the first period of a short sound (the lock sound) is not lost.
  * sound_guard_as is refused there, since it would make them louder. The SMMU stream, its addresses, ADM
  * and ASM are redwood's. Unless sound_amps=1 is given (the device profile gives it), the amplifiers are
  * set up and kept powered down: the whole path runs, the DSP takes the samples, nothing is heard.
@@ -601,7 +601,18 @@ static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1
 #define AUDIO_STREAM_BITS       (1ull << 32)    /* the stream's low bits (0x1801 & 0xf), where the DSP takes them from */
 
 #define PERIODS                 8
-#define PERIOD_FRAMES           960             /* 20 ms */
+/*
+ * What iOS writes is heard after the periods already queued at the DSP: 8 x 10 ms, 80 ms. It was 8 x 20 ms, and the
+ * owner heard the delay (2026-11-04, "聲音延遲比較高": a key's click 160 ms behind the touch, and more). The periods
+ * keep a page each, so the microphones' memory behind them does not move. A shorter queue has to outlast the amplifiers'
+ * start (26-66 ms after the first write that is not silence) and the feeder's look every 2 ms; underflows are counted.
+ */
+/*
+ * The DSP round (2026-11-05, the owner: "晚点和dsp 处理"), to find what the DSP and the feeder hold: sound_periods=N (2 to 8) of
+ * sound_period_frames=N frames (120 to 1024, a page) queued. Underflows are counted; the defaults are what has been listened to.
+ */
+static uint32_t queue_periods = PERIODS, period_frames = 480;   /* 10 ms */
+#define PERIOD_FRAMES           period_frames
 #define PERIOD_BYTES            (PERIOD_FRAMES * 4)
 #define BUFFER_BYTES            (PERIODS * 4096)        /* a page each */
 #define MIC_BYTES               (16 * 4096)             /* the microphones' (hk_mic.c), behind the periods */
@@ -1087,11 +1098,11 @@ play(uint32_t ms, bool amplifiers)
 
 	returned = 0;
 	tone_at = 0;
-	for (unsigned p = 0; p < PERIODS; p++) {
+	for (unsigned p = 0; p < queue_periods; p++) {
 		period_fill(p, false);
 	}
 	began = last_look = now_us();
-	for (unsigned p = 0; p < PERIODS; p++) {
+	for (unsigned p = 0; p < queue_periods; p++) {
 		if (!period_write(p)) {
 			say("sound: the write of period %u could not be sent\n", p);
 			return false;
@@ -1104,7 +1115,7 @@ play(uint32_t ms, bool amplifiers)
 
 		if (back != 0) {
 			OSBitAndAtomic(~back, &returned);
-			for (unsigned p = 0; p < PERIODS; p++) {
+			for (unsigned p = 0; p < queue_periods; p++) {
 				if (!(back & 1u << p) || tone_over) {
 					continue;
 				}
@@ -1167,15 +1178,17 @@ play(uint32_t ms, bool amplifiers)
  * into a ring and does not wait; the feeder, a thread of ours, takes them from there into each
  * period the DSP gives back (and silence when there is nothing), so the stream never stops
  * while the run lasts. The amplifiers are only on while there is sound: the watcher starts them
- * (and fades them in to sound_below) when a write is not silence, and stops them after three
- * seconds of silence or no writes.
+ * (and fades them in to sound_below) when a write is not silence, and stops them after thirty
+ * seconds of silence or no writes: long enough that a keyboard's clicks do not wait for their start each time (it
+ * was three seconds; 2026-11-04, the owner on the delay). Their cost meanwhile is their idle current and the
+ * noise floor of two class-D amplifiers on silence; the guard's averages go on as before.
  */
 #define RING_FRAMES             32768           /* 0.68 s; a power of two, the indices run on and wrap */
 #define SILENCE                 8               /* samples no larger than this are silence (as hk_audio.c's) */
-#define QUIET_BEFORE_OFF_US     3000000ull
+#define QUIET_BEFORE_OFF_US     30000000ull
 /*
  * Parked: after PARK_AFTER_US of silence with the amplifiers off, the whole path to the speakers stops -- the feeder,
- * the stream and the device path (ASM, ADM), the port and its bit clock (AFE) -- instead of 50 periods a second of
+ * the stream and the device path (ASM, ADM), the port and its bit clock (AFE) -- instead of 100 periods a second of
  * silence through the DSP for as long as the system runs; and before the system's sleep (hk_sound_park()). The first
  * write that is not silence starts it all again; the sink keeps the newest RING_FRAMES meanwhile (0.68 s), so what
  * iOS plays first is late by the start (some tens of ms), not lost. sound_park=0: never parked.
@@ -1185,20 +1198,57 @@ play(uint32_t ms, bool amplifiers)
 static int16_t ring[RING_FRAMES * 2];
 static volatile uint32_t ring_head, ring_tail;  /* frames: written by the sink, taken by the feeder */
 static volatile uint64_t last_sound_us;         /* when the latest write that was not silence came */
+static volatile uint64_t onset_us;              /* ... and the first after 300 ms of silence (a click, a sound's start) */
+static volatile uint32_t onsets, onset_wait;   /* (onset_wait: the frames ahead of it in the ring, its wait there) */
+/*
+ * The ring is no queue to wait in: iOS writes at 48 kHz by its clock as the DSP takes 48 kHz by its own, so whatever is in
+ * the ring when the feeder starts stays ahead of everything after it for as long as iOS's IO runs. Run 193817 (2026-11-04):
+ * Search's keyboard starts iOS's IO seconds before the first key, iOS wrote silence into the parked ring until it was full,
+ * and every click of the keyboard after that was heard 682 ms late (the ring's 32768 frames) behind the DSP's 80 ms. So:
+ * while parked a write of silence is not kept, and the first that is not silence clears what is older (park_heard); and the
+ * feeder drops silence that has waited longer than RING_WAIT_MOST (one of iOS's write-aheads, with room), whenever.
+ */
+#define RING_WAIT_MOST          2048            /* frames, 43 ms */
+/*
+ * After a park the queue at the DSP is new, and the sound would be its first period -- heard some 25 ms after it was
+ * written, while the amplifiers come up 58-69 ms after it (runs 194854, 195427): a click's start would go unheard. So the
+ * feeder starts again with this much silence ahead of the sound, and it is heard once the amplifiers are up (about 87 ms;
+ * with 50 ms it came at 77, the amplifiers at 67-69).
+ */
+#define UNPARK_LEAD_MS          60              /* (in periods: over more than one filling of a shorter queue) */
+#define UNPARK_LEAD_PERIODS     (UNPARK_LEAD_MS * 48 / PERIOD_FRAMES)
+static volatile unsigned feeder_lead;           /* periods of silence the feeder begins with (after a park) */
+static volatile bool park_heard;                /* a sound came while parked: from it on, every write is kept */
+static uint64_t parked_silence, trimmed_frames; /* frames of silence not kept while parked; dropped from the ring's front */
 static volatile bool feeder_runs, watcher_runs;
 extern int hz;                          /* (bsd/kern/kern_clock.c) */
 static volatile bool parked, parking, park_wanted;
 static uint32_t park_on = 1, parks;
 static uint64_t fed_frames, silent_frames, ios_frames;
+static uint32_t ring_most;                      /* the most frames that waited in the ring for a period, since the feeder began */
 static volatile uint32_t ios_peak;              /* the largest sample since the amplifiers last started */
 
 /* From the writer's thread, under hk_audio.c's lock: never waits. */
 static uint32_t
 ios_sink(const int16_t *frames, uint32_t count)
 {
-	uint32_t head = ring_head, room = RING_FRAMES - (head - ring_tail), taken;
+	uint32_t head = ring_head, room, taken;
 	bool sound = false;
 
+	if (parked && !park_heard) {
+		uint32_t i = 0;
+
+		while (i < 2 * count && (frames[i] < 0 ? -(int32_t)frames[i] : frames[i]) <= SILENCE) {
+			i++;
+		}
+		if (i == 2 * count) {
+			parked_silence += count;
+			return count;
+		}
+		park_heard = true;
+		ring_tail = head;               /* (nothing older than this sound is to be heard first) */
+	}
+	room = RING_FRAMES - (head - ring_tail);
 	if (parked && room < count) {
 		/* (nobody takes from the ring while parked: the oldest go, the newest -- the sound that unparks -- stay) */
 		ring_tail += MIN(count, RING_FRAMES) - room;
@@ -1221,7 +1271,14 @@ ios_sink(const int16_t *frames, uint32_t count)
 	ring_head = head + taken;
 	ios_frames += taken;
 	if (sound) {
-		last_sound_us = now_us();
+		uint64_t now = now_us();
+
+		if (now - last_sound_us > 300000) {
+			onset_us = now;
+			onset_wait = head - ring_tail;
+			onsets++;
+		}
+		last_sound_us = now;
 		if (parked) {
 			wakeup((caddr_t)&last_sound_us);        /* (the watcher sleeps while parked: this is its sound to play) */
 		}
@@ -1261,13 +1318,33 @@ guard_say(const char *when, bool quiet)
 	    db_text(t[5], hk_guard_decibels(r.slow)));
 }
 
-/* A period from the ring, the rest of it silence. */
+/* A period from the ring, the rest of it silence (all of it: lead, see UNPARK_LEAD_PERIODS). */
 static void
-period_fill_ios(unsigned period)
+period_fill_ios(unsigned period, bool lead)
 {
 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
-	uint32_t tail = ring_tail, available = ring_head - tail, n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
+	uint32_t tail = ring_tail, available = ring_head - tail, n;
 
+	if (available > ring_most) {
+		ring_most = available;
+	}
+	if (!lead && available > RING_WAIT_MOST + PERIOD_FRAMES) {
+		/* silence that has waited too long goes (see RING_WAIT_MOST); sound waits as long as it must */
+		uint32_t quiet = 0, excess = available - RING_WAIT_MOST;
+
+		while (quiet < excess) {
+			int16_t left = ring[2 * ((tail + quiet) % RING_FRAMES)], right = ring[2 * ((tail + quiet) % RING_FRAMES) + 1];
+
+			if ((left < 0 ? -(int32_t)left : left) > SILENCE || (right < 0 ? -(int32_t)right : right) > SILENCE) {
+				break;
+			}
+			quiet++;
+		}
+		tail += quiet;
+		available -= quiet;
+		trimmed_frames += quiet;
+	}
+	n = lead ? 0 : available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
 	OSMemoryBarrier();
 	for (uint32_t i = 0; i < n; i++) {
 		samples[2 * i] = ring[2 * ((tail + i) % RING_FRAMES)];
@@ -1295,30 +1372,41 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint32_t sent = 0, failed = 0;
 
+	unsigned lead = feeder_lead;
+
+	feeder_lead = 0;
 	returned = 0;
-	for (unsigned p = 0; p < PERIODS; p++) {
-		period_fill_ios(p);
+	for (unsigned p = 0; p < queue_periods; p++) {
+		period_fill_ios(p, lead > 0);
+		lead -= lead > 0;
 		sent += period_write(p);
 	}
 	while (!stopping && !parking) {
 		uint32_t back = returned;
 		static bool was_on;
+		static uint32_t underflows_said;
 
+		if (underflows != underflows_said && underflows_said < 20) {
+			/* (the DSP ran out of periods: the queue is too short for the feeder's pace -- told as it happens, 20 times) */
+			say("sound: %u underflows at the DSP so far\n", underflows);
+			underflows_said = underflows;
+		}
 		if (guard_on && !was_on) {
 			guard_say("", true);    /* (what it did to the silence meanwhile is of no interest) */
 			guard_periods = 0;
 		} else if (was_on && !guard_on) {
 			guard_say(" until the amplifiers stopped", false);
-		} else if (guard_on && guard_periods >= 250) {
+		} else if (guard_on && guard_periods >= 5 * 48000 / PERIOD_FRAMES) {
 			guard_say(", 5 s", false);
 			guard_periods = 0;
 		}
 		was_on = guard_on;
 		if (back != 0) {
 			OSBitAndAtomic(~back, &returned);
-			for (unsigned p = 0; p < PERIODS; p++) {
+			for (unsigned p = 0; p < queue_periods; p++) {
 				if (back & 1u << p) {
-					period_fill_ios(p);
+					period_fill_ios(p, lead > 0);
+					lead -= lead > 0;
 					if (period_write(p)) {
 						sent++;
 					} else {
@@ -1330,8 +1418,11 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 		sleep_ms(2);
 	}
 	say("sound: the feeder stops: %u periods written (%u could not be sent), %u given back (%u with an error), %u underflows; "
-	    "from iOS %llu frames came, %llu went to the DSP, %llu of silence filled in\n", sent, failed, written_done, write_errors,
-	    underflows, ios_frames, fed_frames, silent_frames);
+	    "from iOS %llu frames came, %llu went to the DSP, %llu of silence filled in; at most %u frames (%u ms) waited in the "
+	    "ring for a period; %llu frames of silence not kept while parked, %llu dropped for waiting too long\n", sent, failed,
+	    written_done, write_errors, underflows, ios_frames, fed_frames, silent_frames, ring_most, ring_most / 48,
+	    parked_silence, trimmed_frames);
+	ring_most = 0;
 	feeder_runs = false;
 	thread_terminate(current_thread());
 }
@@ -1345,7 +1436,7 @@ guard_level(uint32_t level_below)
 
 /*
  * The amplifiers are off. The guard goes on at their level all the same: what it lets through now reaches them
- * 160 ms later, behind the periods queued at the DSP, and if that is sound, they will have been started by then
+ * 80 ms later, behind the periods queued at the DSP, and if that is sound, they will have been started by then
  * (70 ms after it comes). While they are off nothing but silence comes, and the averages fall as a speaker cools.
  * Only when nothing can be heard at all -- iOS's volume at 0, the amplifiers given up on -- is the guard told so.
  */
@@ -1374,11 +1465,20 @@ watch(void)
 	pause_ms = 0;                           /* (the bring-up's pauses: a start after parking is to be quick) */
 
 	uint64_t quiet_since = now_us();
+	uint32_t onsets_said = 0;
 
 	while (!stopping) {
 		uint64_t now = now_us(), sounded = last_sound_us;
-		uint32_t extra_now, generation_now;
+		uint32_t extra_now, generation_now, reach_ms = queue_periods * PERIOD_FRAMES / 48;
 		bool muted_now;
+
+		if (onsets != onsets_said && onsets_said < 60) {
+			/* (when iOS wrote a sound after silence, in the time of rwtouch's t-mark lines: a touch's delay to the speakers) */
+			onsets_said = onsets;
+			say("sound: a sound after silence (%u) written at %llu, with %u ms of the ring ahead of it (silence over %u ms "
+			    "of it is dropped), then the DSP's %u ms; the amplifiers %s\n", onsets_said, onset_us, onset_wait / 48,
+			    RING_WAIT_MOST / 48, queue_periods * PERIOD_FRAMES / 48, on ? "on" : parked ? "parked" : "off");
+		}
 
 		if (parked && sounded != 0 && now - sounded < 100000) {
 			/* sound to play: the path to the speakers started again, the amplifiers below as before */
@@ -1390,6 +1490,8 @@ watch(void)
 				parked = false;
 				parking = false;
 				feeder_runs = true;
+				feeder_lead = UNPARK_LEAD_PERIODS;
+				reach_ms = (uint32_t)((now_us() - sounded) / 1000) + UNPARK_LEAD_PERIODS * PERIOD_FRAMES / 48;
 				if (kernel_thread_start(feeder_thread, NULL, &feeder) == KERN_SUCCESS) {
 					thread_deallocate(feeder);
 				} else {
@@ -1415,6 +1517,7 @@ watch(void)
 			}
 			stream_off();
 			afe_off();
+			park_heard = false;
 			parked = true;
 			parks++;
 			park_wanted = false;
@@ -1463,13 +1566,13 @@ watch(void)
 				last_look = now_us();
 				last_monitor = 0;
 				monitor_looks = 0;
-				/* (what is written now is heard after the periods already queued at the DSP: PERIODS x 20 ms) */
+				/* (what is written now is heard after the periods already queued at the DSP: PERIODS x 10 ms) */
 				say("sound: the amplifiers are up %llu ms after the first write that was not silence; that write reaches "
-				    "them %u ms after it was made, behind the periods queued at the DSP\n", (last_look - sounded) / 1000,
-				    PERIODS * PERIOD_FRAMES / 48);
+				    "them %u ms after it was made, behind %s\n", (last_look - sounded) / 1000, reach_ms,
+				    reach_ms == queue_periods * PERIOD_FRAMES / 48 ? "the periods queued at the DSP" : "the restart and its lead of silence");
 			}
 		} else if (on && now - sounded > QUIET_BEFORE_OFF_US) {
-			say_when("three seconds of silence: the amplifiers are stopped");
+			say_when("thirty seconds of silence: the amplifiers are stopped");
 			say("sound: what iOS wrote while they were on peaked at %u%% of full scale (%u)\n", ios_peak * 100 / 32768,
 			    ios_peak);
 			guard_off(false);
@@ -1680,11 +1783,19 @@ hk_sound_dsp_up(void)
 		level = 4;
 	}
 	PE_parse_boot_argn("sound_secs", &seconds, sizeof(seconds));
+	/* (the OnePlus 8's level, its profile's since 2026-10-24: a default of the board's now, the command line being full) */
+	if (instantnoodle_board()) {
+		below = 96;
+	}
 	PE_parse_boot_argn("sound_below", &below, sizeof(below));
 	PE_parse_boot_argn("sound_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("sound_guard_as", &guard_as, sizeof(guard_as));
 	PE_parse_boot_argn("sound_gain", &gain, sizeof(gain));
 	PE_parse_boot_argn("sound_park", &park_on, sizeof(park_on));
+	PE_parse_boot_argn("sound_periods", &queue_periods, sizeof(queue_periods));
+	PE_parse_boot_argn("sound_period_frames", &period_frames, sizeof(period_frames));
+	queue_periods = queue_periods < 2 ? 2 : queue_periods > PERIODS ? PERIODS : queue_periods;
+	period_frames = period_frames < 120 ? 120 : period_frames > 1024 ? 1024 : period_frames;
 	if (gain > HK_GUARD_MAX_GAIN) {
 		gain = HK_GUARD_MAX_GAIN;
 	}

@@ -787,6 +787,18 @@ texture_type_name(unsigned type)
  * it, and reads which channel came back 1. 15 probes, 15 in the channel the table
  * claims. What that cannot see is which of the two columns Apple meant, because both
  * ends of it are ours -- and that is exactly the part the screen settled.
+ *
+ * [M5b, a correction: "settled" says more than was measured. What was measured: through this table
+ * and Apple's own compositor the wallpaper layer is blue, and through the left column it is
+ * (255, 12, 12). What real Metal measures, on an M1 Max and not A11, with the public API and
+ * texture.read of a word with one field set: the first-named channel is in the LOW bits, which is
+ * the LEFT column (43: b 0x001F, g 0x03E0, r 0x7C00, a 0x8000), and so this table is the mirror of
+ * it. tools/mesa/air/tex_model.h has all four. The picture does not show WHO did the exchange: a
+ * B,G,R,A swizzle on the compositor's texture or view would look exactly like it, and hkmetal.m
+ * ignored every swizzle, so this table may be standing in for one. That is a hypothesis, unverified,
+ * and the source of the exchange is open. The table stays as it is because it is what makes today's
+ * wallpaper blue; the Vulkan library has real Metal's, and hkmetal.m logs what each 16-bit texture
+ * asks for, for the boot that can tell.]
  */
 struct rwa_pixel_format {
    unsigned mtl;
@@ -925,6 +937,12 @@ format_is_depth_stencil(enum pipe_format f)
  * `RWA_PACKED16=0` declines them again, which is how the boot before this one ran and
  * is what to set if they ever need taking out of the picture; nothing else is a knob
  * here.
+ *
+ * [M5b: "Nothing here states the bit positions" stays true of Apple's headers, and real Metal has
+ * since been measured, on an M1 Max and not A11: the rule falsified above is what it does, first-
+ * named channel in the low bits. So the falsification was of the rule through this driver, which
+ * ignored swizzles, and not of the rule: the comment at rwa_pixel_formats has it, and the source
+ * of the exchange is open.]
  *
  * Read once, because a texture is created per frame and getenv is not free.
  */
@@ -3716,6 +3734,23 @@ static int
 argbuf_mask_of(const struct air_shader_info *info, const char *name, unsigned *mask,
                char *why, size_t why_size)
 {
+   /* [M5c: an array of descriptors is the Vulkan back end's alone (air_vk.c, ARRAYS OF DESCRIPTORS).
+    * Every pipeline and kernel of this library comes through here, so here is where it is said:
+    * the slots below are one per resource, and a texture_offset would read past them.] */
+   if (info->indexed_descriptors) {
+      say(why, why_size, "%s indexes an array of descriptors at run time, which only the Vulkan "
+                         "back end binds (M5c)", name);
+      return -1;
+   }
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      if (info->resources[i].array_size > 1) {
+         say(why, why_size, "%s declares %s as an array of %u descriptors, which only the Vulkan "
+                            "back end binds (M5c)", name,
+             info->resources[i].name ? info->resources[i].name : "a resource",
+             info->resources[i].array_size);
+         return -1;
+      }
+   }
    *mask = 0;
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
@@ -5770,7 +5805,7 @@ vertex_reads_attributes(nir_shader *vs)
  * nothing above it moved) and rwa_render_info from 108 to 116 (8 bytes at offset 108).
  */
 static_assert(sizeof(struct rwa_color_blend) == 32 &&
-                 sizeof(struct rwa_render_shape) == 1052 &&
+                 sizeof(struct rwa_render_shape) == 1088 &&
                  offsetof(struct rwa_render_shape, vertex_attribute) == 48 &&
                  offsetof(struct rwa_render_shape, vertex_layout) == 420 &&
                  offsetof(struct rwa_render_shape, color_blend) == 792 &&

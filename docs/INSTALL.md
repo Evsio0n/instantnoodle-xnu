@@ -118,7 +118,8 @@ what differs is where the UEFI goes and how things are written:
 
 | Where | What |
 |---|---|
-| `boot_b` (the slot the bootloader starts, `current-slot: b`) | the UEFI with our loader and no kernel -- replaces OxygenOS's kernel, which has no system left to run (backup: `ios-instantnoodle/backup/partitions/boot_b.img`) |
+| `boot_b` (the slot the bootloader started at the install, `current-slot: b`) | the UEFI with our loader and no kernel -- replaces OxygenOS's kernel, which has no system left to run (backup: `ios-instantnoodle/backup/partitions/boot_b.img`) |
+| **2026-11-04, read back:** `boot_a` (the slot the bootloader starts now, `current-slot: a`) | **the UEFI with our loader** (its first 4685824 bytes were `out/instantnoodle-installed.img`); `boot_b` holds OxygenOS's boot image (`androidboot.hardware=qcom`). Check `fastboot getvar current-slot` and `oem readpart` before writing either |
 | `userdata`, blocks 0..2042367 | the iOS volume and both cryptexes, as now (`tools/store-image.py`) |
 | `userdata`, blocks 2042368..2091519 | the boot area: two bundle slots of 96 MiB |
 | `userdata`, block 2091520 | the boot state (the boot guard) |
@@ -161,7 +162,7 @@ ABL's fastboot then never comes up on USB and the phone switches itself off; a h
 starts as off-mode charging (`startupmode=dc_charger`). Unplugging, getting into the mode wanted, then plugging in
 again is the cure; it is the same on OxygenOS and not something this port changes. So nothing here needs a reset into
 the stock fastboot: the loader does what it would be needed for, over a link that is already up --
-`xl install` (a bundle), `xl flashboot` (the installed boot, no reset), `xl flashpart boot_b IMAGE EXPECT` (a boot
+`xl install` (a bundle), `xl flashboot` (the installed boot, no reset), `xl flashpart boot_a|boot_b IMAGE EXPECT` (a boot
 partition, only when its SHA-256 is EXPECT, read back), `xl lastlog` (what the previous start logged), `xl settime`
 (the date: an offset from the PMIC's clock, which Android never set). The loader's own reboots set the stock way of
 it (PS_HOLD a hard reset, the reason in the PON's soft spare register: `fastboot reboot bootloader` / `recovery`).
@@ -171,6 +172,25 @@ What an installed run keeps: since 2026-10-24 `/private/var` is a journaled HFS+
 reason 3, the loader calls `ResetSystem(EfiResetShutdown)`); with the cable in, the phone then stays off and
 charges until the power key or the cable comes out ([subsystems/power.md](subsystems/power.md), off-mode charging; built, not yet run on the phone). Restart starts it again
 through the menu.
+
+### Updating the installed loader (2026-11-04)
+
+What was done to put a new loader into `boot_a`, each step checked before the next:
+
+1. **Build it for this phone.** The OnePlus 8's loader takes `userdata` only by its name, both GUIDs and its LBAs
+   (`fb_find_darwin`). The unique GUID in `loader.c` is a default, not this phone's: build with
+   `LOADER_DEFS="-DINSTANTNOODLE_USERDATA_UNIQ={...}" OUT=loader-X.efi xnuloader/build.sh`, the GUID read from the phone's
+   GPT or from the loader that is installed (kept outside git: `out/backup/loader-build-defs.txt`). Built without it, the
+   menu has no HackiOS ("userdata is not the partition the port was set up with"): seen in a RAM boot, not installed.
+2. **The image: only the loader changes.** `out/repack_uefi.py BASE.img PAYLOAD.bin OUT.img` puts `mkpayload.py`'s
+   payload into the boot image that is there (header v2: shim + Silicium FD + payload, ramdisk, DTB), the mkbootimg id
+   recomputed; it rebuilds the installed image byte for byte from its own parts.
+3. **RAM first.** `fastboot boot OUT.img` from the stock fastboot (the menu's "Bootloader (fastboot)" with the cable out,
+   plugged in on the fastboot screen): the menu, the countdown, HackiOS; and Developer mode.
+4. **A copy of what is there.** From the new loader's Developer mode: `fastboot oem readpart boot_a` then
+   `fastboot get_staged FILE` (the first 63 MB) -- the log has the whole partition's SHA-256, the EXPECT of the write.
+5. **The write.** `./xl flashpart boot_a OUT.img EXPECT`: the loader hashes the whole partition, writes only on a match,
+   flushes and reads back. Undo the same way with the copy and the SHA-256 the partition has after the write.
 
 ## Things to know
 

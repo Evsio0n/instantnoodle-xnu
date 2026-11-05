@@ -110,7 +110,7 @@ expect() {      # expect NAME PATTERN...: every pattern in the log (a leading ! 
 	else FAIL=$((FAIL + 1)); FAILED="$FAILED $name"; echo "FAIL $name"; grep -aE "flash:|menu:|ab:" $W/log.txt | head -30 | sed 's/^/   | /'; fi
 }
 
-L=xnuloader/loader.efi; [ -f $L ] || L=prebuilt/loader.efi
+L=${LOADER_EFI:-xnuloader/loader.efi}; [ -f $L ] || L=prebuilt/loader.efi      # LOADER_EFI: another build to test
 bundle $W/gen1.img 1; bundle $W/gen2.img 2
 DOWN=$'\e[B'; ENTER=$'\r'
 

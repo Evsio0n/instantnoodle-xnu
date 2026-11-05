@@ -54,6 +54,7 @@ extern void hk_slpi_boot_stop(void);
 extern void hk_slpi_boot_quiesce(void);
 extern void hk_adsp_stop(void);
 extern void hk_adsp_quiesce(void);
+extern void hk_sound_quiesce(void);   /* bsd/dev/hk_sound.c: the speakers' amplifiers held in reset */
 extern void hk_ddr_quiesce(void);
 extern void hk_haptic_quiesce(void);
 extern void hk_torch_quiesce(void);
@@ -410,6 +411,7 @@ loader_return(void)
 #endif
 	hk_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hk_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
+	hk_sound_quiesce();        /* the amplifiers first: hk_wifi_quiesce() may halt here for good (2026-11-04) */
 	hk_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	hk_slpi_boot_quiesce();
 	hk_adsp_quiesce();         /* nor the audio DSP */
@@ -418,6 +420,23 @@ loader_return(void)
 	hk_torch_quiesce();        /* the flashlight off, if it was lit */
 	hk_camera_quiesce();       /* the camera powered down, if it was powered up */
 	hk_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
+	{
+		/* how much of io_map()'s 64 MB submap the drivers' register maps took (osfmk/arm/io_map.c) */
+		extern uint64_t io_map_submap_bytes;
+		char digits[24];
+		uint64_t kb = io_map_submap_bytes / 1024;
+		int n = 0;
+
+		do {
+			digits[n++] = (char)('0' + kb % 10);
+			kb /= 10;
+		} while (kb != 0 && n < (int)sizeof(digits));
+		loader_log_puts("io_map: ");
+		while (n > 0) {
+			loader_log_putc(digits[--n]);
+		}
+		loader_log_puts(" KB of the io submap's 65536 KB mapped\n");
+	}
 	hk_display_quiesce();      /* the panel refreshing from the boot framebuffer again, for the loader's text */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later

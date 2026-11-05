@@ -55,7 +55,13 @@ OxygenOS. Cure: unplug, get into the mode wanted, plug in again. Consequences bu
 
 ## OnePlus 8 recovery facts
 - The phone has **no Android any more** (since 2026-10-23): only the stock bootloader (fastboot) and TWRP (`recovery_a`/`_b`).
-  Never wait for adb/Android. `userdata` holds the iOS volume. The UEFI+loader is in `boot_b`.
+  Never wait for adb/Android. `userdata` holds the iOS volume. The UEFI+loader was put in `boot_b`; **since then the
+  bootloader starts slot a and the UEFI+loader is in `boot_a`** (observed 2026-11-04: `getvar current-slot: a`, `oem readpart`
+  of both: `boot_a` = our UEFI image, `boot_b` = OxygenOS's boot image). Check both before writing either.
+- Back-ups of 2026-11-04 (git-ignored, never deleted): `out/backup/boot_a-20261104-6c9c5e3a.img` (the first 63 MB of `boot_a`
+  before the quiet-screen loader; the whole partition's SHA-256 6c9c5e3a...) and `out/backup/boot_b-20261104-a13126e8.img`
+  (OxygenOS), copies in `../../outputs/boot-backup-20261104/`. Undo of that loader:
+  `./xl flashpart boot_a out/backup/boot_a-20261104-6c9c5e3a.img <boot_a's SHA-256 now>` (docs/INSTALL.md).
 - Back-ups: the stock `boot_b` is at `ios-instantnoodle/backup/partitions/boot_b.img` (sibling directory **outside this repository**,
   `.gitignore`d) and the live `boot_b` of 2026-10-24 at `out/boot_b-restore.img` with its hash in `out/boot_b-now.sha256`
   (both ignored by git). **A fresh clone has no recovery image.** Restore:

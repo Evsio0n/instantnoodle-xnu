@@ -35,6 +35,12 @@ Nothing is marked "works" merely because a driver exists: evidence is stated. Fo
 | K22 | Agent toolkit | New USB mailbox/control path awaits owner-approved RAM loading | Unverified | S3 | yes | |
 | K23 | Scheduling | Edge: rare 10-11 ms render frame under heavy DF load; BG starved when UT saturates E; energy model unvalidated | Partial | S4 | yes | untested |
 | K24 | Testing | `sleep` check can fail a correct sleep (continuous clock 0.4 s short once) | Bug (test) | S4 | yes | |
+| K27 | Photos | An HDR photo opened full size shows its grey gain map (no Metal) | Partial | S3 | test roots | |
+| K28 | Metal (Gallium) | A Metal fragment shader that stores [[depth]] times the GPU out on the Gallium back end (recovered); GLES gl_FragDepth is fine; vk draws it | Bug | S3 | test runs | |
+| K29 | Metal (Gallium) | A half-precision result that overflows is stored as 65504, not +inf (vk: +inf) | Bug | S4 | test runs | |
+| K30 | Metal (Gallium) | Metal lines and points draw nothing on the Gallium back end (vk draws them) | Bug | S3 | test runs | |
+| K31 | Metal (Gallium) | Packed 16-bit formats mirrored against real Metal; the source of the exchange the wallpaper showed is open | Bug or unexplained | S3 | system with metal= | |
+| K32 | Metal (Vulkan) | An argument buffer is read at the command buffer's commit, not when the GPU runs it | Limitation | S3 | metal_drv_test --m5c | |
 
 ---
 
@@ -59,6 +65,74 @@ Nothing is marked "works" merely because a driver exists: evidence is stated. Fo
 ## K26 `pods` fails while iOS shows "Low Battery" — OnePlus 8 · **Bug (test)** · S4
 - **Observed (2026-10-27, `024633`, `024827`):** battery 19-20 %: the alert covers the App Library, `pods` reads 202 against 212. Charge, or close the alert.
 
+## K27 Photos shows an HDR photo's gain map at full size — OnePlus 8 · Photos · **Partial** · S3
+- **Observed (2026-11-04, runs 231531-233935, test roots only, verified on phone):** with libhackios-gl in assetsd and
+  MobileSlideShow, Photos imports and lists HDR HEICs in colour, but a photo opened full size is grey (the owner: "顯示黑白了"):
+  what shows is its HDR gain map (a monochrome auxiliary image). A non-HDR JPEG's thumbnail is in colour; its full-size view was not
+  opened.
+- **Cause, as far as found:** Photos' PHFigDecoder decodes the base through CMPhoto's accelerated path and gets -12914
+  (kVTImageRotationNotSupportedErr). Its options include AccelerationMode, TiledDownsampling, ForceHighSpeed and a crop. CMPhoto probes
+  AppleM2ScalerCSCDriver and links Metal and MetalPerformanceShaders; neither the scaler nor Metal exists here. VideoToolbox's own
+  rotations, scales and ImageIO's full decode all work (userland/src/vt_test.c, run 234735), so it is that path, not VideoToolbox as
+  such. The other HEIC logged no decode error yet showed grey too, so the HDR composite step without Metal may also fall back.
+- **No supported switch:** the decoder's choices are per-request flags in Photos' code, not preferences.
+- **Workaround:** none. Forcing Photos to its PHImageIODecoder (a hook, not done) would at best show the SDR base in colour;
+  the HDR highlights need Tungsten's Metal renderer ("Metal Device is nil ... degraded experience"). **Work:** T38 (17), after Metal (12).
+
+
+- **Since, on Metal over Vulkan (2026-11-05, runs 165643, 170709, test roots only, verified on phone):** the photo at full view is in colour and no longer the gain map, with no crash. **Not HDR:** the picture's highest pixel is at SDR white. PHFigDecoder still gets -12914. See K33 and TODO, M5e.
+
+## K33 HDR photo on Metal over Vulkan: the screen is dimmed with no highlights — OnePlus 8 · Photos · **Open** · S2
+- **Observed (2026-11-05, runs 165643 and 170709, RAM, shots):** at full view Photos' white is 187 of 255, about half in linear light, as CoreAnimation does for EDR; the picture's highest pixel is 191; brightness-nits stays at 70-83 where run 231531's notes (OpenGL ES compositor) have it rising to 140. Same with and without hbm=1.
+- **Not known:** whether the compositor on hk-gl does the same with this photo: that boot has not been done. The drawable is BGRA8 and no RGBA16F surface appears in Photos.
+- **Consequence:** dimmer than SDR and no HDR. Not to reach an install until explained.
+
+## K28 Metal on Gallium: a fragment [[depth]] store times the GPU out — OnePlus 8 · Metal · **Bug** · S3
+- **Observed (2026-11-05, run 030433, RAM test root, verified on phone):** metal_drv_test on the Gallium back end
+  (libhackiosair, the default Metal path) with AppleMetalGLRenderer's texturedFragment2DDepth and texturedFragment3DDepth, each
+  given a Depth32Float attachment: the submission never finishes ("adreno: gpu: no answer: submission 2901 ... the core has done
+  2888", hkmetal "THE GPU DID NOT FINISH ... within two seconds"); the kernel resets and recovers the 3D core each time (4 times in
+  that boot) and the jobs after it, the display included, go on. The same two shaders draw right on the Vulkan back end
+  (air_vk.c over turnip, same ir3 compiler): the stored depth reads back as sampled.
+- **What it is not:** a depth attachment alone works on Gallium (--draw-depth with clearFragment20: the test discards as on vk,
+  Depth16/32/32_S8), and 3D sampling alone works (texturedFragment3DFloat). texturedFragment3DDepth binds an ordinary 3D colour
+  texture and hangs too, so the common factor is the fragment stage writing depth on freedreno's Gallium path. Until M3c-2
+  (2026-11-05) both back ends refused these shaders at pipeline creation, so the path had never run.
+- **Not the driver (run 034547):** the same store through OpenGL ES, `gl_test fragdepth z32f|z16` (GLSL ES 3.00
+  gl_FragDepth through libOSMesa, the window server's FD650 driver), reaches the depth buffer and finishes in 1.8 ms. So
+  the window server, WebKit and GLES applications are not affected; the fault is in what the Metal path (air_metal.c,
+  the AIR frontend's NIR) hands Gallium. metal_drv_test's sweeps refuse such a shader on Gallium by name since M3c-3.
+- **Workaround:** none on Gallium; no system UI shader known so far writes [[depth]]. The Vulkan back end (`metal_backend=vk`,
+  TODO T38 (12)) draws them. Not investigated further, because Gallium is to be replaced by it.
+
+## K29 Metal on Gallium: half overflow saturates instead of giving +inf — OnePlus 8 · Metal · **Bug** · S4
+- **Observed (2026-11-05, run 054947, RAM test root):** PortraitFilters' MetalFaceMask_ErodeCube* multiply three half
+  samples; where the product passes 65504, the Gallium back end (libhackiosair, freedreno) stores 0x7BFF (65504) and the
+  Vulkan back end stores 0x7C00 (+inf). A host model reproduces both back ends' digests exactly, and every product that
+  fits is identical on both. IEEE binary16, and Apple's GPUs, give +inf. Likely freedreno's fp16 conversion saturating
+  (inferred, not traced). Matters only to shaders that overflow half; the Vulkan back end does not have it.
+- **Also a Gallium deviation (read from air_metal.c, 2026-11-05):** primitive restart is off there, while Metal always restarts on
+  strips (third-party sources in air_vk.c's THE DRAW PATH; no Apple statement found), so a strip with a restart index is refused or wrong on Gallium.
+
+## K30 Metal on Gallium: lines and points draw nothing — OnePlus 8 · Metal · **Bug** · S3
+- **Observed (2026-11-05, run 094931, RAM test root):** air_metal_test --draw-vertex --pixels on the Gallium back end: line list, line strip
+  and point list leave the target empty (the coverage map has no pixel). air_metal.c's rasterizer state has line_width 0 and
+  point_size_per_vertex 0 (read; the likely cause, not yet confirmed by a fix). So Metal's lines and points have always been broken on the Gallium
+  path, and the Vulkan back end, which draws all three, is the right one. Not fixed, since Gallium is to be replaced.
+
+## K32 Metal on Vulkan: an argument buffer is read at commit, not when the GPU runs — OnePlus 8 · Metal · **Limitation** · S3
+Real Metal's GPU reads the handles when it runs, so a set encoded again after a draw is encoded and before the command buffer runs has its new contents for both (measured on an M1 Max, `argbuf-reencode-one-cb`). hkmetal.m's deferred work records the contract draws at `-commit`, so the same row gives the same pixels on the phone (verified on phone, run 124507): a set encoded again any time before commit is seen. What is left is a set changed after commit and before the GPU reaches it, which real Metal would see and this does not; no row and nothing in the corpus does that. Handles written by the processor, a kernel or a blit have no record at all and are refused by name (docs/air.md 8.2).
+
+## K31 Metal on Gallium: the packed 16-bit formats are mirrored against real Metal — OnePlus 8 · Metal · **Bug or unexplained** · S3
+- **Measured (2026-11-05, public Metal API on an Apple M1 Max, not A11):** in Metal's packed 16-bit formats the first-named channel is in the low bits:
+  B5G6R5 0x001F b, 0x07E0 g, 0xF800 r; A1BGR5 0x0001 a, 0x003E b, 0x07C0 g, 0xF800 r; ABGR4 0x000F a, 0x00F0 b, 0x0F00 g, 0xF000 r; BGR5A1 0x001F b, 0x03E0 g,
+  0x7C00 r, 0x8000 a. MoltenVK's table agrees.
+- **What the Gallium back end does (air_metal.c):** the mirror of that, red low and blue high, chosen because the window server's wallpaper came out
+  (255,12,12) where it is blue under the first reading (a picture no longer in this tree, docs/air.md). Removing the mirror would turn today's wallpaper red.
+- **Measured (run 124103, `metal=2 metal_profile=1 camtl=1`, Gallium library, the compositor on Metal):** hkmetal's packed16 lines are one format and no swizzle: 43 BGR5A1, descriptor and view routes, swizzle r g b a on both, no surface, usage 0x5 (shader read and render target). So the compositor renders into it and reads it back, and the swizzle hypothesis below is refuted for that boot. The wallpaper is the right colour. Most of the rest of the home screen is missing (icons, labels, status bar): one small rectangle of the Clock icon is there, in all 7 shots by file size and in the one viewed.
+- **On Metal over Vulkan (M5d, verified on phone, run 141516):** the wallpaper is right with the measured table and no mirror, and no format-43 texture of 100 pixels or more is bound in any draw. A red shape did appear on vk, and it was not this: it is the stock wallpaper's `Head Mask.HEIC`, red by design, showing because the layer it masks is a 420f surface that was being refused. So nothing says the mirror is needed on vk; whether the old (255,12,12) picture was the same mask is not known, and its run is gone.
+- **Open:** who does the exchange. A B,G,R,A swizzle in the compositor would look exactly like it, and hkmetal ignored swizzles until M5b (hypothesis, unverified).
+  The Vulkan back end now follows the measured table; a swizzling compositor could double-exchange there until this is settled. To be found before metal=2 on vk (M5d).
 ## K01 Metal graphics — OnePlus 8 · Graphics · **Partial** (experimental) · S2
 - **Expected:** apps and the system draw with Metal like an iPhone. **Actual:** OpenGL ES (Mesa) draws the whole UI and is solid. Metal is an experimental driver, off by default (`metal=1` test programs;
   `metal=2 metal_profile=1` hands it the whole system and reaches the home screen). See the exact breakdown in [gpu.md](subsystems/gpu.md#metal-work-in-progress-instantnoodle-only).
@@ -134,6 +208,8 @@ Do not use this device for secrets. Work: T28. Evidence: [kernel-standins.md](re
 ## K14 Persistence — RAM-only runs · **By design** · S3
 `/private/var` is a memory file system remade empty each boot (capped at ~2 GB): home-screen layout, app data, Settings, networks and the Keychain do not survive; apps are registered anew and may appear on a different page unless `sb_delay` is set.
 The installed boot keeps `/private/var` on flash (HFS+ on the OnePlus 8). Starting a persistent RAM run needs `var_store=1 ufs_write=1` and the owner's permission (it writes flash).
+Occasionally a daemon fails on the fresh `/var`: run 060507 (2026-11-05, `ramhfs`, 1 boot of 11 that night) had ScreenTimeAgent abort with "Failed to load local persistent store" (CoreData, `-[STDaemonPersistenceController _loadLocalPersistentStore]`); launchd restarts it. Not seen in the other ten.
+Also seen once (run 085644, 2026-11-05, 1 boot of 14): mobiletimerd[120] jumped into a read-write page of the shared cache ("Data/Stack execution not permitted ... protections were read-write", exception 1 code 0x2, then a corpse), after another instance had logged "Settings is nil". Unexplained; whether it comes from the fresh `/var` is an inference from its neighbour above, not established.
 
 ## K15 UI rendering gaps — OnePlus 8 · **Bug** · S3
 - Long-press on the lock-screen wallpaper (poster switcher) would show black; it is disabled instead (`poster_switcher_allowed()`); cause unknown.

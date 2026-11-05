@@ -179,6 +179,95 @@ air_fmod(nir_builder *b, nir_def *x, nir_def *y)
 
 /* -- the families ------------------------------------------------------- */
 
+/*
+ * air.pack.* and air.unpack.* (M5d): Metal's pack_float_to_* and unpack_*_to_*, by the widths of their
+ * fields, channel 0 at the low end of the word. The order of 565 is measured (the row three-pack565: red
+ * is low, which is not MTLPixelFormatB5G6R5Unorm's word), the rest are Metal's specification's, and the
+ * rows pack-* judge them all against an M1. unorm4x8 keeps NIR's own opcode below where it has one.
+ */
+struct packed_form {
+   bool snorm;
+   unsigned count;
+   unsigned width[4];
+};
+
+static bool
+packed_fields(const struct air_name *n, struct packed_form *out)
+{
+   const char *a = n->part[1], *b = n->num >= 4 ? n->part[2] : "";
+
+   *out = (struct packed_form){ 0 };
+   if (!strcmp(a, "unorm4x8") || !strcmp(a, "snorm4x8")) {
+      if (!strcmp(a, "unorm4x8") && !strcmp(n->part[0], "unpack"))
+         return false;
+      *out = (struct packed_form){ a[0] == 's', 4, { 8, 8, 8, 8 } };
+   } else if (!strcmp(a, "unorm2x16") || !strcmp(a, "snorm2x16")) {
+      *out = (struct packed_form){ a[0] == 's', 2, { 16, 16 } };
+   } else if ((!strcmp(a, "unorm") || !strcmp(a, "snorm")) && !strcmp(b, "rgb10a2")) {
+      *out = (struct packed_form){ a[0] == 's', 4, { 10, 10, 10, 2 } };
+   } else if ((!strcmp(a, "unorm") || !strcmp(a, "snorm")) && !strcmp(b, "rgb565")) {
+      *out = (struct packed_form){ a[0] == 's', 3, { 5, 6, 5 } };
+   } else {
+      return false;
+   }
+   return true;
+}
+
+static nir_def *
+pack_fields(struct air_ctx *c, nir_def *value, const struct packed_form *f, unsigned result_bits)
+{
+   nir_def *v = nir_f2f32(&c->b, value);
+   nir_def *word = nir_imm_int(&c->b, 0);
+   unsigned at = 0;
+
+   for (unsigned k = 0; k < f->count; k++) {
+      const unsigned w = f->width[k];
+      nir_def *x = nir_channel(&c->b, v, k), *field;
+
+      if (f->snorm) {
+         const float top = (float)((1u << (w - 1)) - 1);
+         x = nir_fmin(&c->b, nir_fmax(&c->b, x, nir_imm_float(&c->b, -1.0f)), nir_imm_float(&c->b, 1.0f));
+         /* away from zero at a half: -0.5 packs to -64 of 127, measured on an M1 */
+         x = nir_fmul_imm(&c->b, x, top);
+         field = nir_f2i32(&c->b, nir_fmul(&c->b, nir_fsign(&c->b, x),
+                                           nir_ffloor(&c->b, nir_fadd_imm(&c->b, nir_fabs(&c->b, x), 0.5))));
+         field = nir_iand_imm(&c->b, field, (1u << w) - 1);
+      } else {
+         const float top = (float)((1ull << w) - 1);
+         x = nir_fmul_imm(&c->b, nir_fsat(&c->b, x), top);
+         field = nir_f2u32(&c->b, nir_ffloor(&c->b, nir_fadd_imm(&c->b, x, 0.5)));
+      }
+      word = nir_ior(&c->b, word, nir_ishl_imm(&c->b, field, at));
+      at += w;
+   }
+   return nir_u2uN(&c->b, word, result_bits);
+}
+
+static nir_def *
+unpack_fields(struct air_ctx *c, nir_def *word, const struct packed_form *f, unsigned result_bits)
+{
+   nir_def *w32 = nir_u2u32(&c->b, word);
+   nir_def *out[4];
+   unsigned at = 0;
+
+   for (unsigned k = 0; k < f->count; k++) {
+      const unsigned w = f->width[k];
+
+      if (f->snorm) {
+         nir_def *up = nir_ishl_imm(&c->b, w32, 32 - at - w);
+         nir_def *field = nir_i2f32(&c->b, nir_ishr_imm(&c->b, up, 32 - w));
+         out[k] = nir_fmax(&c->b, nir_fmul_imm(&c->b, field, 1.0 / (double)((1u << (w - 1)) - 1)),
+                           nir_imm_float(&c->b, -1.0f));
+      } else {
+         nir_def *field = nir_iand_imm(&c->b, nir_ushr_imm(&c->b, w32, at), (1ull << w) - 1);
+         out[k] = nir_fmul_imm(&c->b, nir_u2f32(&c->b, field), 1.0 / (double)((1ull << w) - 1));
+      }
+      at += w;
+   }
+   nir_def *v = nir_vec(&c->b, out, f->count);
+   return result_bits == 16 ? nir_f2f16(&c->b, v) : v;
+}
+
 static bool
 math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, bool *handled)
 {
@@ -205,6 +294,7 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    /* the sign of an integer operation is the last-but-one part: air.min.s.i32 */
    bool is_signed = n->num >= 3 ? is_signed_part(n->part[1]) : true;
    nir_def *r = NULL;
+   struct packed_form packed;
    *handled = true;
 
    /* fast math is what every one of these means: Metal's "fast" library */
@@ -447,6 +537,25 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "fast_fmax") || !strcmp(op, "fmax") || !strcmp(op, "max")) {
       r = is_float ? nir_fmax(&c->b, a[0], a[1])
                    : (is_signed ? nir_imax(&c->b, a[0], a[1]) : nir_umax(&c->b, a[0], a[1]));
+   } else if (!strcmp(op, "fast_fmin3") || !strcmp(op, "fmin3") || !strcmp(op, "min3")) {
+      r = is_float ? nir_fmin(&c->b, a[0], nir_fmin(&c->b, a[1], a[2]))
+                   : (is_signed ? nir_imin(&c->b, a[0], nir_imin(&c->b, a[1], a[2]))
+                                : nir_umin(&c->b, a[0], nir_umin(&c->b, a[1], a[2])));
+   } else if (!strcmp(op, "fast_fmax3") || !strcmp(op, "fmax3") || !strcmp(op, "max3")) {
+      r = is_float ? nir_fmax(&c->b, a[0], nir_fmax(&c->b, a[1], a[2]))
+                   : (is_signed ? nir_imax(&c->b, a[0], nir_imax(&c->b, a[1], a[2]))
+                                : nir_umax(&c->b, a[0], nir_umax(&c->b, a[1], a[2])));
+   } else if (!strcmp(op, "fast_fmedian3") || !strcmp(op, "fmedian3") || !strcmp(op, "median3")) {
+      /* max(min(a, b), min(max(a, b), c)) */
+      if (is_float)
+         r = nir_fmax(&c->b, nir_fmin(&c->b, a[0], a[1]),
+                      nir_fmin(&c->b, nir_fmax(&c->b, a[0], a[1]), a[2]));
+      else if (is_signed)
+         r = nir_imax(&c->b, nir_imin(&c->b, a[0], a[1]),
+                      nir_imin(&c->b, nir_imax(&c->b, a[0], a[1]), a[2]));
+      else
+         r = nir_umax(&c->b, nir_umin(&c->b, a[0], a[1]),
+                      nir_umin(&c->b, nir_umax(&c->b, a[0], a[1]), a[2]));
    } else if (!strcmp(op, "fast_clamp") || !strcmp(op, "clamp")) {
       if (is_float)
          r = nir_fmin(&c->b, nir_fmax(&c->b, a[0], a[1]), a[2]);
@@ -538,6 +647,10 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
        */
       r = nir_b2iN(&c->b, nir_ine_imm(&c->b, a[0], 0),
                    air_nir_bit_size(c, in->base.type));
+   } else if ((!strcmp(op, "pack") || !strcmp(op, "unpack")) && n->num >= 3 &&
+              packed_fields(n, &packed)) {
+      r = !strcmp(op, "pack") ? pack_fields(c, a[0], &packed, air_nir_bit_size(c, in->base.type))
+                              : unpack_fields(c, a[0], &packed, air_nir_bit_size(c, in->base.type));
    } else if (!strcmp(op, "unpack") && n->num >= 2 &&
               !strcmp(n->part[1], "unorm4x8")) {
       /* four unsigned bytes of a word, each divided by 255. Component 0 is the
@@ -743,8 +856,7 @@ atomic_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n
    if (shared) {
       r = nir_shared_atomic(&c->b, v->bit_size, off, v, .atomic_op = aop);
    } else if (p.class == AIR_PTR_SSBO) {
-      r = nir_ssbo_atomic(&c->b, v->bit_size, nir_imm_int(&c->b, p.binding), off, v,
-                          .atomic_op = aop);
+      r = nir_ssbo_atomic(&c->b, v->bit_size, air_ptr_index(c, &p), off, v, .atomic_op = aop);
    } else {
       return air_error(c, "intrinsic: an atomic on a pointer that is not a buffer");
    }
@@ -756,7 +868,7 @@ atomic_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n
 /* -- barriers ----------------------------------------------------------- */
 
 static bool
-barrier_op(struct air_ctx *c, const struct air_inst *in)
+barrier_op(struct air_ctx *c, const struct air_inst *in, mesa_scope scope)
 {
    /* air.wg.barrier(i32 flags, i32 scope): the flags say which memory is
     * ordered. 2 is threadgroup memory, 1 device, 4 texture; the corpus only
@@ -776,8 +888,8 @@ barrier_op(struct air_ctx *c, const struct air_inst *in)
    if (!modes)
       modes = nir_var_mem_shared;
 
-   nir_barrier(&c->b, .execution_scope = SCOPE_WORKGROUP,
-               .memory_scope = SCOPE_WORKGROUP, .memory_semantics = NIR_MEMORY_ACQ_REL,
+   nir_barrier(&c->b, .execution_scope = scope,
+               .memory_scope = scope, .memory_semantics = NIR_MEMORY_ACQ_REL,
                .memory_modes = modes);
    return true;
 }
@@ -1076,6 +1188,9 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
       uint64_t bytes;
       if (!air_const_uint(in->operands[3], &bytes))
          return air_error(c, "intrinsic: memcpy of a run-time length");
+      /* M5e: an array of descriptors copied into a local has no bytes to copy (POINTERS IN A LOCAL) */
+      if (src->ptr.class == AIR_PTR_DESC_ARRAY)
+         return air_copy_descriptors(c, dst->ptr, src->ptr, bytes);
       /* in 4-byte pieces, which is what every memcpy in the corpus is a
        * multiple of (they copy float vectors out of constant buffers)
        */
@@ -1089,6 +1204,8 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
          if (!v || !air_store_ptr(c, d, v, 4))
             return false;
       }
+      /* M5c: and a pointer kept in those bytes, which has none (POINTERS IN A LOCAL) */
+      air_copy_pointer_slots(c, dst->ptr, src->ptr, bytes);
       return true;
    }
    if (!strncmp(name, "llvm.memset.", 12)) {
@@ -1422,7 +1539,7 @@ query_texture(struct air_ctx *c, const struct air_ptr *tex, const struct air_tex
               nir_texop op, nir_def *lod, unsigned comps)
 {
    if (tex->is_image) {
-      nir_def *index = nir_imm_int(&c->b, tex->binding);
+      nir_def *index = air_ptr_index(c, tex);
       switch (op) {
       case nir_texop_txs: {
          /* an image size has as many components as the image has dimensions;
@@ -1443,7 +1560,9 @@ query_texture(struct air_ctx *c, const struct air_ptr *tex, const struct air_tex
       }
    }
 
-   nir_tex_instr *q = nir_tex_instr_create(c->nir, lod ? 1 : 0);
+   /* [M5c: the source of an array element is made here, with the rest: nir_tex_instr_add_src on an
+    * instruction that holds a source and is not in a block yet follows a null, run 124507.] */
+   nir_tex_instr *q = nir_tex_instr_create(c->nir, (lod ? 1 : 0) + (tex->element ? 1 : 0));
    q->op = op;
    q->sampler_dim = t->dim;
    q->is_array = t->is_array;
@@ -1452,6 +1571,9 @@ query_texture(struct air_ctx *c, const struct air_ptr *tex, const struct air_tex
    q->sampler_index = 0;
    if (lod)
       q->src[0] = (nir_tex_src){ .src_type = nir_tex_src_lod, .src = nir_src_for_ssa(lod) };
+   if (tex->element)
+      q->src[lod ? 1 : 0] = (nir_tex_src){ .src_type = nir_tex_src_texture_offset,
+                                           .src = nir_src_for_ssa(tex->element) };
    /* NIR fixes the size of a query's result itself -- txs is two components
     * for a 2D texture whatever the caller asks one of them for -- so it is
     * asked here and the component picked afterwards.
@@ -1581,6 +1703,13 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    struct air_ptr tex;
    if (!tex_handle(c, in, 1, AIR_PTR_TEXTURE, &tex))
       return false;
+   /* [M5d: this refused, "of a null texture, which has no binding to read". A texture whose
+    * [[texture(n)]] came out as -1 is not in this specialization (VideoToolbox's scaler sets its unused
+    * ones so, A RESOURCE'S INDEX THAT IS A FUNCTION CONSTANT'S), and an argument a constant rules
+    * out is read only where that constant rules the read out too. So an index nothing has: if the
+    * folding leaves this instruction, the back end says it samples what it does not declare.] */
+   if (tex.binding == ~0u)
+      tex.binding = AIR_NO_TEXTURE;
 
    unsigned arg = 2;   /* operands[0] is the callee, [1] the texture */
    struct air_ptr samp = { 0 };
@@ -1590,6 +1719,27 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       if (!tex_handle(c, in, arg, AIR_PTR_SAMPLER, &samp))
          return false;
       arg++;
+   }
+   /*
+    * M5c: THE OTHER FORM OF A READ, which this Mac's Metal compiler makes (air64_v29, language 2.4,
+    * macOS 27; read off its output for every texture kind in tools/air/mtlref's m5c library) and
+    * none of iOS 16.5's system libraries has:
+    *
+    *   air.read_texture_2d.v4f32(tex, air.get_read_sampler(), coord, <2 x i32> 0, lod, access)
+    *
+    * against iOS 16.5's (tex, coord, lod, 0). The sampler is a constant of the compiler's and comes
+    * right after the texture, a zero offset after the coordinate where the kind has an offset at
+    * all (2D, 2D array, 3D, depth: not 1D, cube or multisample), and the last word says the access
+    * (0 sample, 1 read, 3 read_write) of what the metadata says already. An application built
+    * by a newer Xcode may carry this, so it is read and not just tested around.
+    */
+   bool read_with_sampler = false;
+   if (!strcmp(t.op, "read") && arg < in->num_operands) {
+      struct air_val *maybe = air_get(c, in->operands[arg]);
+      if (maybe && maybe->kind == AIR_VAL_PTR) {
+         read_with_sampler = true;
+         arg++;
+      }
    }
 
    /* A depth texture takes a plane or aspect selector before the coordinate,
@@ -1657,12 +1807,23 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       if (!tex.is_image)
          return air_error(c, "intrinsic: air.%s to a texture the interface says is not "
                              "written", n->part[0]);
-      nir_image_store(&c->b, nir_imm_int(&c->b, tex.binding),
+      /* The type of what is written is the value's: a write returns void, and dest_type says uint for
+       * every one of them. The GPU converts by this type: 0.5 and 1.0 written as uint into an RGBA16Float
+       * were 0xffff, which is why VideoToolbox's scale came out empty (M5e, run 161649). */
+      nir_alu_type value_type = tex_dest_type(c, in->operands[arg - 1]->type, n);
+      if (nir_alu_type_get_type_size(value_type) == 16) {
+         /* (as SPIR-V's image writes are: 32 bits, and the format narrows it) */
+         value = nir_alu_type_get_base_type(value_type) == nir_type_float ? nir_f2f32(&c->b, value) :
+                 nir_alu_type_get_base_type(value_type) == nir_type_int ? nir_i2i32(&c->b, value) :
+                 nir_u2u32(&c->b, value);
+         value_type = nir_alu_type_get_base_type(value_type) | 32;
+      }
+      nir_image_store(&c->b, air_ptr_index(c, &tex),
                       nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
                       nir_imm_int(&c->b, 0), nir_pad_vector(&c->b, value, 4),
                       nir_imm_int(&c->b, 0),
                       .image_dim = t.dim, .image_array = t.is_array,
-                      .src_type = dest_type);
+                      .src_type = value_type);
       return true;
    }
 
@@ -1670,12 +1831,14 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
    if (!coord)
       return false;
+   if (read_with_sampler && !t.no_offset && !t.is_ms && t.dim != GLSL_SAMPLER_DIM_1D)
+      arg++;   /* M5c: the zero offset of the other form, above */
 
    if (!strcmp(t.op, "read") && tex.is_image) {
       uint64_t extra;
       if (!tex_flag(c, in, arg, &extra))
          return false;
-      nir_def *res = nir_image_load(&c->b, 4, dest_bits, nir_imm_int(&c->b, tex.binding),
+      nir_def *res = nir_image_load(&c->b, 4, dest_bits, air_ptr_index(c, &tex),
                                     nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
                                     nir_imm_int(&c->b, t.is_ms ? extra : 0),
                                     nir_imm_int(&c->b, t.is_ms ? 0 : extra),
@@ -1728,7 +1891,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
     * exactly six, and the next source anyone adds should not be the one that overflows
     * this silently.
     */
-   nir_tex_src srcs[7];
+   nir_tex_src srcs[9];   /* [M5c: two more for an array element and sampler] */
    unsigned nsrc = 0;
    srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_coord,
                                  .src = nir_src_for_ssa(coord) };
@@ -1856,6 +2019,13 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       };
    }
 
+   /* [M5c: an array of descriptors chosen at run time] */
+   if (tex.element)
+      srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_texture_offset,
+                                    .src = nir_src_for_ssa(tex.element) };
+   if (have_sampler && samp.element)
+      srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_sampler_offset,
+                                    .src = nir_src_for_ssa(samp.element) };
    nir_tex_instr *tex_instr = nir_tex_instr_create(c->nir, nsrc);
    tex_instr->op = op;
    tex_instr->sampler_dim = t.dim;
@@ -1923,8 +2093,40 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
 
    if (!strcmp(n.part[0], "is_function_constant_defined"))
       return fc_defined_op(c, in);
+   /*
+    * M5c: a null texture, MPSImage's for a slot its object leaves empty, and the question asked of
+    * one. There is no binding behind it: a handle with a binding no resource has, which a
+    * texture operation on it refuses by name (tex_handle). is_null_texture of a real one is false,
+    * and that is a statement about the shader's own argument: an unbound one is read as a
+    * refusal at the draw, or as gated (air_vk.c), so a shader that asks about a slot it was
+    * given nothing for is told no, where real Metal says yes.
+    */
+   if (!strncmp(n.part[0], "get_null_texture", 16)) {
+      air_set(c, &in->base, air_val_ptr(c, (struct air_ptr){ .class = AIR_PTR_TEXTURE,
+                                                             .binding = ~0u }));
+      return true;
+   }
+   if (!strncmp(n.part[0], "is_null_texture", 15)) {
+      struct air_ptr tex;
+      if (!tex_handle(c, in, 1, AIR_PTR_TEXTURE, &tex))
+         return false;
+      if (tex.maybe_null)
+         return air_error(c, "intrinsic: air.%s of a phi of a texture and a null one, whose answer "
+                             "is a function constant's and is not known here", n.part[0]);
+      air_set(c, &in->base, air_val_ssa(c, nir_imm_bool(&c->b, tex.binding == ~0u)));
+      return true;
+   }
+   /* M5c: the sampler a newer compiler's read takes (texture_op): nothing to bind and nothing it
+    * means here, and the one thing done with it is to pass it there. */
+   if (!strcmp(n.part[0], "get_read_sampler")) {
+      air_set(c, &in->base, air_val_ptr(c, (struct air_ptr){ .class = AIR_PTR_NONE }));
+      return true;
+   }
    if (n.num >= 2 && !strcmp(n.part[0], "wg") && !strcmp(n.part[1], "barrier"))
-      return barrier_op(c, in);
+      return barrier_op(c, in, SCOPE_WORKGROUP);
+   /* M5c: threadgroup_barrier's narrower sibling, MPSImage's 100-odd kUpsample kernels have one */
+   if (n.num >= 2 && !strcmp(n.part[0], "simdgroup") && !strcmp(n.part[1], "barrier"))
+      return barrier_op(c, in, SCOPE_SUBGROUP);
    if (!strcmp(n.part[0], "atomic"))
       return atomic_op(c, in, &n);
    if (!strcmp(n.part[0], "discard_fragment"))

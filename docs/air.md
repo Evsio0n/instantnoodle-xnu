@@ -1356,7 +1356,8 @@ Four things in that are each a wrong guess away from a shader drawn over the wro
 *What of this is read and what is inferred.* The keys, the node shapes, the flattening, the
 non-contiguous indices, `air.arg_unused` on an attribute and the function-constant gate are all
 read out of real modules — `air2nir --ll` of QuartzCore's library and of Resident Evil 4's. Two
-things are not. The **second integer after `air.location_index`** is inferred to be the number of
+things are not. [M5c: the first of these two is settled, observed: real Metal's compiler on an M1 writes
+`air.location_index, i32 0, i32 3` for `array<texture2d<float>, 3>`; tools/air/m5c.metal, `airdump`.] The **second integer after `air.location_index`** is inferred to be the number of
 consecutive indices the argument takes, which is Apple's form for an array of resources. Nothing
 in reach carries another value: all **974** `air.location_index` nodes of the five system
 libraries, on every key that has one, and all **4 764** on Resident Evil 4's vertex inputs — 5 738
@@ -2723,7 +2724,10 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
   **A boot chose the right-hand column, and the left one was an inference that was wrong.**
   Served under the left column, Apple's own compositor drew the home screen's wallpaper layer
   — flat, unblended, the bottom of the stack — as exactly `(255, 12, 12)` over 8 004 sampled
-  pixels, where the wallpaper is blue (`logs/packed.png`). That is the sign this document
+  pixels, where the wallpaper is blue ([2026-11-05: `logs/packed.png` was cited here and is not in this
+  tree, nor is the run that made it: the passage entered with c4379c2. Which run, and through what
+  boot-arg, is unknown; the compositor is only on Metal with `camtl=1`, so that it was that is inference.]).
+  That is the sign this document
   wrote down in advance: *under the other reading red and blue are exchanged.* Inverting that
   pixel through our own packing and back out through each candidate layout, the only readings
   that make it a blue are those with red and blue exchanged; and of those, only the **pure

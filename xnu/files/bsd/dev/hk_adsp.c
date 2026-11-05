@@ -1034,10 +1034,27 @@ root_file(const char *name, uint64_t *size)
 
 static bool from_root;                  /* the image is in memory of ours (root_file()), to be given back once written */
 
-/* For the sound (hk_sound.c): a file of /fw on the root, read whole into memory of ours, and given back. */
+/*
+ * For the sound (hk_sound.c, instantnoodle_speaker.c): a file of fw/ in the small image, else of /fw on the root, read
+ * whole into memory of ours, and given back. (With the iOS volume on the flash as the root there is no /fw: the
+ * speakers' tfa98xx.cnt was not found, 2026-11-04, while adsp.mdt was -- image_file() below looks in the small image first.)
+ */
+extern const uint8_t *hk_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 const uint8_t *
 hk_adsp_fw_file(const char *name, uint64_t *size)
 {
+	uint64_t length = 0;
+	const uint8_t *in_image = hk_image_file("fw", name, &length, NULL);   /* (hk_image.c; fw/ is stored plain) */
+
+	if (in_image != NULL && length != 0 && length <= ADSP_MEMORY_SIZE) {
+		uint8_t *copy = kalloc_data(length, Z_WAITOK);
+
+		if (copy != NULL) {
+			memcpy(copy, in_image, length);
+			*size = length;
+			return copy;
+		}
+	}
 	return root_file(name, size);
 }
 
@@ -1050,7 +1067,6 @@ hk_adsp_fw_free(const uint8_t *data, uint64_t size)
 }
 
 /* A file of fw/ in the small image (ADSP=1 userland/build.sh puts fw-audio/ there), else of /fw on the root (above). */
-extern const uint8_t *hk_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 static const uint8_t *
 image_file(const char *name, uint64_t *size)
 {

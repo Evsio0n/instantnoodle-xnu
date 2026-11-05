@@ -74,6 +74,11 @@ sound_below=96 slider_cal=... sb_clock=24`; add `wifi=1`.)
 - Recovery from CrashDump: hold Power + Volume Up. `xl reboot` lands in the bootloader; `xl enter` goes from stock fastboot. A cold
   GPU cycle is cheap (`xl reboot`, `xl enter`, retry if "loader did not come up"; without `xl ramdisk userland/flashboot.apfs` launchd is missing).
 - A reset with the USB cable in confuses the stock ABL (charger detect says DCP, fastboot never appears): unplug, enter the mode, replug.
+- **The UEFI+loader is in `boot_a`** (the bootloader starts slot a: observed 2026-11-04); `boot_b` is OxygenOS's boot image.
+  A loader for this phone is built with its userdata GUID (`LOADER_DEFS`, docs/INSTALL.md "Updating the installed loader").
+  Since 2026-11-04 the installed boot's screen has the menu and one "starting" line, the log only in logdump (`xl lastlog`,
+  with `time:` lines in ms since power-on). The stock fastboot by keys from power-off: **not confirmed yet** (the menu's
+  "Bootloader (fastboot)" entry works; docs/INSTALL.md's "volume down + power" is from the phones with Android).
 - `slider_cal`, `sb_clock=24` (status-bar clock clear of the camera hole at x 61-137 of 1080) are in the profile.
 - `/private/var` size shows ~2 GB on RAM boots (ramfs cap `max_mem/4`), 95 GB with the HFS+ volume.
 - The OnePlus has no ambient light sensor wired in this port, so auto-brightness has nothing to read.

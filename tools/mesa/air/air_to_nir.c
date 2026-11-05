@@ -12,10 +12,19 @@
 
 #include "air_private.h"
 
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include "nir_serialize.h"
+#include "util/blob.h"
+#include "util/mesa-sha1.h"
 #include "util/hash_table.h"
 #include "util/u_math.h"
 
@@ -102,7 +111,8 @@ val_is_pointerish(const struct air_val *v)
 static bool
 same_ptr(const struct air_ptr *a, const struct air_ptr *b)
 {
-   if (a->class != b->class || a->binding != b->binding || a->is_image != b->is_image)
+   if (a->class != b->class || a->binding != b->binding || a->is_image != b->is_image ||
+       a->element != b->element)
       return false;
    if (a->offset == b->offset)
       return true;
@@ -122,6 +132,22 @@ air_val_agg(struct air_ctx *c, unsigned n)
    v->kind = AIR_VAL_AGG;
    v->num_elems = n;
    v->elems = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(n, 1));
+   return v;
+}
+
+/* An undef aggregate. Fields stay NONE until insertvalue puts something there, except a field that
+ * is itself an aggregate, which `insertvalue %struct.TextureFetcher undef, ptr %t, 0, 0` walks
+ * through: its path goes into { { ptr }, { ptr } }, which MPSImage's 245 kUpsample kernels build. */
+static struct air_val *
+air_val_undef_agg(struct air_ctx *c, const struct air_type *t)
+{
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+   struct air_val *v = air_val_agg(c, n);
+   for (unsigned i = 0; i < n; i++) {
+      const struct air_type *e = t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem;
+      if (e->kind == AIR_TYPE_STRUCT || e->kind == AIR_TYPE_ARRAY)
+         v->elems[i] = air_val_undef_agg(c, e);
+   }
    return v;
 }
 
@@ -148,6 +174,13 @@ air_nir_bit_size(struct air_ctx *c, const struct air_type *t)
     * returned so that the instruction under construction stays well formed
     * while the error just set discards the shader.
     */
+   /* M5c: i2 to i7, which LLVM narrows a switch to (`trunc i32 %x to i2`, `switch i2`): eight bits
+    * here, always masked to the narrow width where one is made. Only the ways MPSImage has of
+    * using one are served, and arithmetic on one is refused (narrow_value).
+    * [M5d: and i9 to i15 and i17 to i31 the same way, in the next width NIR has: RenderBox's
+    * uber_fragment switches on an i10, MPSCore has 27 modules with an i31.] */
+   if (air_int_is_narrow(bits))
+      return bits < 8 ? 8 : bits < 16 ? 16 : 32;
    if (bits != 1 && bits != 8 && bits != 16 && bits != 32 && bits != 64) {
       /* Zero is a different fact wearing the same symptom, and saying so in one
        * message made 79 modules read as carrying a 0-bit integer when what they
@@ -287,6 +320,8 @@ scalar_constant(struct air_ctx *c, const struct air_type *t, uint64_t bits)
       default: break;
       }
    }
+   if (air_int_is_narrow(n))   /* M5c: masked, like a trunc */
+      return nir_imm_intN_t(&c->b, bits & ((1u << n) - 1), n < 8 ? 8 : n < 16 ? 16 : 32);
    return nir_imm_intN_t(&c->b, bits, MAX2(n, 1));
 }
 
@@ -334,10 +369,7 @@ air_constant_val(struct air_ctx *c, const struct air_constant *k)
    case AIR_CONST_UNDEF:
    case AIR_CONST_POISON:
       if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
-         unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
-         struct air_val *v = air_val_agg(c, n);
-         /* fields stay NONE until insertvalue puts something there */
-         return v;
+         return air_val_undef_agg(c, t);
       }
       if (t->kind == AIR_TYPE_POINTER) {
          struct air_ptr p = { .class = AIR_PTR_NONE, .pointee = t->elem };
@@ -437,6 +469,12 @@ air_constant_val(struct air_ctx *c, const struct air_constant *k)
             p = air_ptr_add(c, p, nir_imm_int(&c->b, off));
          return air_val_ptr(c, p);
       }
+      /* M5d: `inttoptr (i64 48 to ptr addrspace(2))` is a field of a null struct, which LLVM makes of
+       * `has_params ? params : null` on the path the constant rules out (VideoToolbox's scaler). There is
+       * no place behind it, so it is null, and what is loaded through it is air_load_ptr's to say. */
+      if (k->expr_op == AIR_OP_CAST && k->expr_sub == AIR_CAST_INTTOPTR &&
+          k->base.type->kind == AIR_TYPE_POINTER)
+         return air_val_ptr(c, (struct air_ptr){ .class = AIR_PTR_NONE });
       return air_error(c, "instruction: constant expression %u", k->expr_op), NULL;
    }
    return air_error(c, "instruction: constant kind %u", k->ckind), NULL;
@@ -511,11 +549,11 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
    nir_def *res;
    switch (ptr.class) {
    case AIR_PTR_UBO:
-      res = nir_load_ubo(&c->b, comps, bits, nir_imm_int(&c->b, ptr.binding), off,
+      res = nir_load_ubo(&c->b, comps, bits, air_ptr_index(c, &ptr), off,
                          .align_mul = align, .align_offset = 0, .range_base = 0, .range = ~0);
       break;
    case AIR_PTR_SSBO:
-      res = nir_load_ssbo(&c->b, comps, bits, nir_imm_int(&c->b, ptr.binding), off,
+      res = nir_load_ssbo(&c->b, comps, bits, air_ptr_index(c, &ptr), off,
                           .align_mul = align, .align_offset = 0);
       break;
    case AIR_PTR_SHARED:
@@ -534,6 +572,12 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
       for (unsigned i = 0; c->options && i < c->options->num_constants; i++)
          if (c->options->constants[i].index == ptr.binding)
             v = &c->options->constants[i];
+      /* [M5c: one the application did not set, when the list is what it set (partial_constants):
+       * a shader only reads it under is_function_constant_defined, or Metal would have refused
+       * the function, and the air.static_init constructor reads every one regardless.] */
+      static const struct air_constant_value not_set = { 0 };
+      if (!v && c->options && c->options->partial_constants)
+         v = &not_set;
       if (!v)
          return air_error(c, "interface: function constant %u has no value", ptr.binding), NULL;
       if (comps == 1) {
@@ -553,16 +597,20 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
        * constant, so all components are zero whatever the packing, and the
        * first thing that would tell a wrong packing from a right one is a
        * pipeline that sets one of these two constants.
+       *
+       * [M5c: and a pipeline does now (hkmetal.m, -newFunctionWithName:constantValues:error:), and
+       * rows of metal_drv_test's --m5c judge it. Two words, so a float4 fits.]
        */
-      if (comps * bits > 64)
+      if (comps * bits > 128)
          return air_error(c, "interface: a function constant of %u components of %u bits, "
-                             "which does not fit the one word air_constant_value carries",
+                             "which does not fit the two words air_constant_value carries",
                           comps, bits), NULL;
       nir_def *fields[NIR_MAX_VEC_COMPONENTS];
       for (unsigned i = 0; i < comps; i++) {
          uint64_t mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
-         fields[i] = nir_imm_intN_t(&c->b, (v->bits >> (i * bits)) & mask,
-                                    as_bool ? 8 : bits);
+         unsigned at = i * bits;
+         uint64_t word = at >= 64 ? v->bits_hi >> (at - 64) : v->bits >> at;
+         fields[i] = nir_imm_intN_t(&c->b, word & mask, as_bool ? 8 : bits);
       }
       res = nir_vec(&c->b, fields, comps);
       break;
@@ -575,9 +623,15 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
        * bytes in an argument buffer are the runtime's 8-byte handles.
        */
       return air_error(c, "instruction: a load of bytes out of an argument buffer"), NULL;
+   case AIR_PTR_NONE:
+      /* [M5d: this refused, "a load through a null pointer". It is a path a function constant rules out
+       * (see the inttoptr above) that the folding has not reached yet, or a shader doing something
+       * undefined. Zero, and said.] */
+      air_note(c, "a load through a null pointer, answered with zero");
+      res = nir_imm_zero(&c->b, comps, as_bool ? 8 : bits);
+      break;
    default:
-      return air_error(c, "instruction: a load through a %s pointer",
-                       ptr.class == AIR_PTR_NONE ? "null" : "texture or sampler"), NULL;
+      return air_error(c, "instruction: a load through a texture or sampler pointer"), NULL;
    }
    return as_bool ? nir_ine_imm(&c->b, res, 0) : res;
 }
@@ -595,7 +649,7 @@ air_store_ptr(struct air_ctx *c, struct air_ptr ptr, nir_def *value, unsigned al
    nir_def *off = ptr_offset(c, ptr);
    switch (ptr.class) {
    case AIR_PTR_SSBO:
-      nir_store_ssbo(&c->b, value, nir_imm_int(&c->b, ptr.binding), off,
+      nir_store_ssbo(&c->b, value, air_ptr_index(c, &ptr), off,
                      .write_mask = BITFIELD_MASK(comps), .align_mul = align);
       return true;
    case AIR_PTR_SHARED:
@@ -631,11 +685,43 @@ md_str(const struct air_md *node, unsigned i)
    return air_md_string(node->ops[i]);
 }
 
+/*
+ * A RESOURCE'S INDEX THAT IS A FUNCTION CONSTANT'S (M5d). `[[texture(kFirst + 2)]]` with a constant in it:
+ * the metadata's air.location_index is then not a number but
+ * `ptr addrspace(2) @__metal_implicit_attr_int_expr_58`, a module variable the air.static_init
+ * constructor works out, and every one of VideoToolbox's 44 such arguments read here as index 0. The
+ * interface is laid out before the constructor is translated, so the module goes through twice: the
+ * first time to learn what the constructor leaves in those variables (fold_module_variables, which is
+ * why a constant is needed and a run-time value is not), and again with the answers, when a module
+ * has any. A thread's own, because one process compiles on several.
+ */
+#define AIR_MAX_ATTR_VALUES 256
+struct air_attr_table {
+   unsigned count;
+   const char *name[AIR_MAX_ATTR_VALUES];
+   uint32_t value[AIR_MAX_ATTR_VALUES];
+};
+static _Thread_local const struct air_attr_table *attr_answers;
+static _Thread_local struct air_attr_table *attr_learning;
+static _Thread_local bool attr_asked;
+static _Thread_local bool attr_interface_only;   /* the first time through: the constructor, and not the body */
+
 static bool
 md_int(const struct air_md *node, unsigned i, uint64_t *out)
 {
    if (!node || i >= node->num_ops || !node->ops[i] || node->ops[i]->kind != AIR_MD_VALUE)
       return false;
+   /* (A RESOURCE'S INDEX THAT IS A FUNCTION CONSTANT'S) */
+   const struct air_value *value = node->ops[i]->value;
+   if (value && value->kind == AIR_VALUE_GLOBAL && value->name &&
+       strstr(value->name, "__metal_implicit_attr_int_expr")) {
+      attr_asked = true;
+      *out = 0;
+      for (unsigned k = 0; attr_answers && k < attr_answers->count; k++)
+         if (!strcmp(attr_answers->name[k], value->name))
+            *out = attr_answers->value[k];
+      return true;
+   }
    /* zero is written as a null constant, as everywhere else in the bitcode */
    return air_const_uint(node->ops[i]->value, out);
 }
@@ -657,6 +743,18 @@ md_key_int(const struct air_md *node, const char *key, uint64_t *out)
 {
    int i = md_key(node, key);
    return i >= 0 && md_int(node, i + 1, out);
+}
+
+/* M5c: how many consecutive indices a resource takes, the second integer after air.location_index:
+ * an array's length, or 1. */
+static unsigned
+location_span(const struct air_md *node)
+{
+   int li = md_key(node, "air.location_index");
+   uint64_t span = 1;
+   if (li < 0 || !md_int(node, li + 2, &span) || span == 0)
+      return 1;
+   return (unsigned)span;
 }
 
 /* the operand after the key, when it is a nested node: the shape Apple uses for
@@ -776,6 +874,41 @@ air_module_function_constants(void *mem_ctx, const void *bitcode, size_t size,
                break;
             }
          }
+      }
+   }
+   ralloc_free(ctx);
+   return num;
+}
+
+unsigned
+air_module_function_constant_decls(void *mem_ctx, const void *bitcode, size_t size,
+                                   struct air_constant_decl **out)
+{
+   void *ctx = ralloc_context(mem_ctx);
+   const char *err;
+   struct air_module *m = air_module_read(ctx, bitcode, size, &err);
+   *out = NULL;
+   if (!m) {
+      ralloc_free(ctx);
+      return 0;
+   }
+   const struct air_named_md *n = named_md(m, "air.function_constants");
+   unsigned num = 0;
+   if (n && n->num_ops) {
+      *out = rzalloc_array(mem_ctx, struct air_constant_decl, n->num_ops);
+      for (unsigned i = 0; i < n->num_ops; i++) {
+         const struct air_md *node = n->ops[i];
+         uint64_t index, required = 0;
+         if (!node || node->num_ops < 4 || !md_int(node, 3, &index))
+            continue;
+         md_int(node, 4, &required);
+         const char *type = md_str(node, 1), *name = md_str(node, 2);
+         (*out)[num++] = (struct air_constant_decl){
+            .index = (unsigned)index,
+            .type = type ? ralloc_strdup(mem_ctx, type) : NULL,
+            .name = name ? ralloc_strdup(mem_ctx, name) : NULL,
+            .required = required != 0,
+         };
       }
    }
    ralloc_free(ctx);
@@ -928,6 +1061,8 @@ add_resource(struct air_ctx *c, enum air_resource_kind kind, unsigned index, uns
       .raster_order_group = has_group ? (int)group : -1,
       /* a direct argument: Metal names it by .index and there is no set */
       .argbuf_set = ~0u, .argbuf_id = ~0u,
+      .array_size = 1,
+      .gated = node && md_key(node, "air.function_constant") >= 0,
    };
    return &info->resources[info->num_resources++];
 }
@@ -1269,6 +1404,29 @@ argbuf_members(struct air_ctx *c, const struct air_md *sti, const struct air_typ
 {
    unsigned n = 0;
    for (unsigned i = 0; i < sti->num_ops; n++) {
+      /* M5c: `array<constant float4 *, 3> b [[id(5)]]`, which real Metal's compiler writes with the
+       * key first, on an M1, and not as this header's inline data:
+       *
+       *   !"air.struct_type_info", !23, i32 40, i32 24, i32 0, !"metal::array", !"b",
+       *      !"air.indirect_argument", i32 5
+       *   !23 = !{i32 0, i32 8, i32 3, !"float4", !"__elems", !"air.indirect_argument", !24}
+       *
+       * The id is the integer where a node would be, the length the third field of the inner one,
+       * and the descriptor the inner one's (its own location_index is 0, 1, and means nothing).
+       */
+      const struct air_md *handles = NULL;
+      const char *first_key = md_str(sti, i);
+      if (first_key && !strcmp(first_key, "air.struct_type_info") && i + 1 < sti->num_ops &&
+          sti->ops[i + 1] && sti->ops[i + 1]->kind == AIR_MD_NODE) {
+         const struct air_md *inner = sti->ops[i + 1];
+         const char *elems = md_str(inner, 4), *inner_key = md_str(inner, 5);
+         if (inner->num_ops == 7 && elems && !strcmp(elems, "__elems") && inner_key &&
+             !strcmp(inner_key, "air.indirect_argument") && inner->ops[6] &&
+             inner->ops[6]->kind == AIR_MD_NODE) {
+            handles = inner;
+            i += 2;
+         }
+      }
       uint64_t off = 0, msize = 0, flag = 0;
       const char *mtype = md_str(sti, i + 3), *mname = md_str(sti, i + 4);
       if (!md_int(sti, i, &off) || !md_int(sti, i + 1, &msize) ||
@@ -1282,9 +1440,13 @@ argbuf_members(struct air_ctx *c, const struct air_md *sti, const struct air_typ
 
       const char *key = md_str(sti, i + 5);
       const struct air_md *desc = NULL;
+      uint64_t handles_id = 0, handles_span = 1;
       if (key && !strcmp(key, "air.indirect_argument") && i + 6 < sti->num_ops &&
           sti->ops[i + 6] && sti->ops[i + 6]->kind == AIR_MD_NODE)
          desc = sti->ops[i + 6];
+      if (handles && key && !strcmp(key, "air.indirect_argument") && i + 6 < sti->num_ops &&
+          md_int(sti, i + 6, &handles_id) && md_int(handles, 2, &handles_span))
+         desc = handles->ops[6];
       if (!desc)
          return air_error(c, "interface: member %s of the argument buffer %s is followed "
                              "by %s and not by an air.indirect_argument descriptor",
@@ -1318,15 +1480,19 @@ argbuf_members(struct air_ctx *c, const struct air_md *sti, const struct air_typ
          return air_error(c, "interface: member %s of the argument buffer %s has no "
                              "air.location_index", mname,
                           ab->name ? ab->name : "unnamed");
-      /* An ARRAY of descriptors in one member: the shader could then pick one
-       * at run time, which no resolution can do. Every one of Resident Evil
-       * 4's 82 048 members spans exactly one index, so this is a guard on a
-       * shape not yet seen rather than a gap with modules behind it.
+      /* An ARRAY of descriptors in one member, which the shader may index at run time. Every one
+       * of Resident Evil 4's 82 048 members spans exactly one index, and this was a guard on a
+       * shape not yet seen: "spans %u descriptor indices". [M5c: real Metal's compiler makes it
+       * from `array<texture2d<float>, 3> t [[id(0)]]` on an M1, and it is bound now.]
        */
-      if (md_int(desc, mli + 2, &mspan) && mspan != 1)
-         return air_error(c, "interface: member %s of the argument buffer %s spans %u "
-                             "descriptor indices", mname,
-                          ab->name ? ab->name : "unnamed", (unsigned)mspan);
+      md_int(desc, mli + 2, &mspan);
+      if (handles) {
+         mid = handles_id;
+         mspan = handles_span;
+      }
+      if (mspan == 0)
+         return air_error(c, "interface: member %s of the argument buffer %s spans no "
+                             "descriptor index", mname, ab->name ? ab->name : "unnamed");
 
       /* against the module's own struct type */
       if (n >= st->num_members)
@@ -1342,6 +1508,21 @@ argbuf_members(struct air_ctx *c, const struct air_md *sti, const struct air_typ
                              "there at %u", mname, ab->name ? ab->name : "unnamed",
                           (unsigned)msize, (unsigned)off, (unsigned)tysize,
                           (unsigned)tyoff);
+
+      /* [M5c: an array's handle type is its element's: `{ [3 x %struct.metal::texture2d] }` from
+       * metal::array, or `[3 x ptr addrspace(2)]` from a C array; what follows reads the handle] */
+      if (mspan > 1) {
+         if (mt->kind == AIR_TYPE_STRUCT && mt->name && mt->num_members == 1 &&
+             !strncmp(mt->name, "struct.metal::array", 19))
+            mt = mt->members[0];
+         if (mt->kind != AIR_TYPE_ARRAY || mt->count != mspan ||
+             air_type_alloc_size(c->m, mt) != 8 * mspan)
+            return air_error(c, "interface: member %s of the argument buffer %s spans %u "
+                                "descriptor indices and the module's struct type does not "
+                                "put an array of that many eight-byte handles there", mname,
+                             ab->name ? ab->name : "unnamed", (unsigned)mspan);
+         mt = mt->elem;
+      }
 
       enum air_resource_kind rk;
       unsigned addrspace;
@@ -1387,7 +1568,7 @@ argbuf_members(struct air_ctx *c, const struct air_md *sti, const struct air_typ
       ab->members[n] = (struct air_argbuf_member) {
          .offset = off, .kind = rk, .metal_id = (unsigned)mid, .index = ~0u,
          .addrspace = addrspace, .read = read, .write = write,
-         .name = mname, .type_name = mtype, .node = desc,
+         .name = mname, .type_name = mtype, .node = desc, .span = (unsigned)mspan,
       };
       ab->num_members = n + 1;
    }
@@ -1464,11 +1645,15 @@ translate_argument_buffer(struct air_ctx *c, const struct air_md *node, unsigned
    /* eight bytes per member is what MTLArgumentEncoder writes and what the
     * runtime's encodedLength has to answer; a set whose declared size is not
     * that is a layout this frontend has not seen */
-   if (size != 8ull * ab->num_members)
+   /* [M5c: an array member is its length's worth of them] */
+   uint64_t handles = 0;
+   for (unsigned i = 0; i < ab->num_members; i++)
+      handles += ab->members[i].span;
+   if (size != 8ull * handles)
       return air_error(c, "interface: the argument buffer %s is %u bytes with %u members, "
                           "and this frontend knows the eight-bytes-per-member layout "
                           "only", name ? name : "unnamed", (unsigned)size,
-                       ab->num_members);
+                       (unsigned)handles);
 
    struct air_ptr p = { .class = AIR_PTR_ARGBUF, .binding = c->num_argbufs++ };
    c->params[param] = air_val_ptr(c, p);
@@ -1506,14 +1691,14 @@ allocate_argbuf_indices(struct air_ctx *c)
       switch (r->kind) {
       case AIR_RESOURCE_CONSTANT_BUFFER:
       case AIR_RESOURCE_DEVICE_BUFFER:
-         next_buffer = MAX2(next_buffer, r->index + 1);
+         next_buffer = MAX2(next_buffer, r->index + r->array_size);
          break;
       case AIR_RESOURCE_TEXTURE:
       case AIR_RESOURCE_IMAGE:
-         next_texture = MAX2(next_texture, r->index + 1);
+         next_texture = MAX2(next_texture, r->index + r->array_size);
          break;
       case AIR_RESOURCE_SAMPLER:
-         next_sampler = MAX2(next_sampler, r->index + 1);
+         next_sampler = MAX2(next_sampler, r->index + r->array_size);
          break;
       default:
          break;
@@ -1527,14 +1712,17 @@ allocate_argbuf_indices(struct air_ctx *c)
          switch (m->kind) {
          case AIR_RESOURCE_CONSTANT_BUFFER:
          case AIR_RESOURCE_DEVICE_BUFFER:
-            m->index = next_buffer++;
+            m->index = next_buffer;
+            next_buffer += m->span;
             break;
          case AIR_RESOURCE_TEXTURE:
          case AIR_RESOURCE_IMAGE:
-            m->index = next_texture++;
+            m->index = next_texture;
+            next_texture += m->span;
             break;
          default:
-            m->index = next_sampler++;
+            m->index = next_sampler;
+            next_sampler += m->span;
             break;
          }
          struct air_resource *r = add_resource(c, m->kind, m->index, 0, m->read, m->write,
@@ -1543,8 +1731,72 @@ allocate_argbuf_indices(struct air_ctx *c)
             return;   /* add_resource has said why */
          r->argbuf_set = ab->metal_index;
          r->argbuf_id = m->metal_id;
+         r->array_size = m->span;
       }
    }
+}
+
+/* M5c: a byte offset into an array of descriptors as a constant, added to *constant, and the rest,
+ * or NULL when there is none. air_ptr_add builds it, so it is iadd and constants all the way. */
+static nir_def *
+split_offset(struct air_ctx *c, nir_def *off, uint64_t *constant)
+{
+   if (nir_src_is_const(nir_src_for_ssa(off))) {
+      *constant += nir_src_as_uint(nir_src_for_ssa(off));
+      return NULL;
+   }
+   if (off->parent_instr->type == nir_instr_type_alu &&
+       nir_instr_as_alu(off->parent_instr)->op == nir_op_iadd) {
+      nir_alu_instr *a = nir_instr_as_alu(off->parent_instr);
+      nir_def *x = split_offset(c, a->src[0].src.ssa, constant);
+      nir_def *y = split_offset(c, a->src[1].src.ssa, constant);
+      return !x ? y : !y ? x : nir_iadd(&c->b, x, y);
+   }
+   return off;
+}
+
+/* M5c: the element out of the non-constant part of a byte offset, or NULL when it is not one
+ * descriptor's eight bytes at a time: an array of structs of descriptors has no such form, and a
+ * flat counter per kind would have the wrong binding. */
+static nir_def *
+eighth_of(struct air_ctx *c, nir_def *rest)
+{
+   if (rest->parent_instr->type != nir_instr_type_alu)
+      return NULL;
+   nir_alu_instr *a = nir_instr_as_alu(rest->parent_instr);
+   if (a->op == nir_op_iadd) {
+      nir_def *x = eighth_of(c, a->src[0].src.ssa), *y = eighth_of(c, a->src[1].src.ssa);
+      return x && y ? nir_iadd(&c->b, x, y) : NULL;
+   }
+   if (a->op == nir_op_ishl && nir_src_is_const(a->src[1].src) &&
+       nir_src_as_uint(a->src[1].src) == 3)
+      return a->src[0].src.ssa;
+   if (a->op == nir_op_imul) {
+      for (unsigned i = 0; i < 2; i++)
+         if (nir_src_is_const(a->src[i].src) && nir_src_as_uint(a->src[i].src) == 8)
+            return a->src[1 - i].src.ssa;
+   }
+   return NULL;
+}
+
+/* M5c: a load through a direct array of descriptors (AIR_PTR_DESC_ARRAY), as argbuf_load below
+ * resolves one through an argument buffer: `getelementptr [3 x %struct.metal::texture2d], ptr %t,
+ * i64 0, i64 %i, i32 0` then `load ptr addrspace(1)`, which is what real Metal's compiler makes. */
+static struct air_val *
+desc_array_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type)
+{
+   uint64_t off = 0;
+   nir_def *chosen = ptr.offset ? split_offset(c, ptr.offset, &off) : NULL;
+   struct air_ptr p = { .class = ptr.desc_class, .binding = ptr.binding + (unsigned)(off / 8),
+                        .is_image = ptr.is_image, .pointee = type->elem };
+   if (chosen && !(p.element = eighth_of(c, chosen))) {
+      air_error(c, "instruction: a load out of a direct array of descriptors at a stride that is "
+                   "not one descriptor's eight bytes");
+      return NULL;
+   }
+   if (chosen)
+      c->info->indexed_descriptors = true;
+   return air_val_ptr(c, p);
 }
 
 /* A load through an argument-buffer pointer RESOLVES instead of loading: the
@@ -1564,20 +1816,20 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type)
    const char *abname = ab->name ? ab->name : "unnamed";
 
    uint64_t off = 0;
-   if (ptr.offset) {
-      if (!nir_src_is_const(nir_src_for_ssa(ptr.offset))) {
-         air_error(c, "instruction: a load through the argument buffer %s at an offset "
-                      "that is not constant, which is a descriptor chosen at run time",
-                   abname);
-         return NULL;
-      }
-      off = nir_src_as_uint(nir_src_for_ssa(ptr.offset));
-   }
+   nir_def *chosen = ptr.offset ? split_offset(c, ptr.offset, &off) : NULL;
 
+   /* [M5c: inside an array member, at a constant element or one chosen at run time] */
    const struct air_argbuf_member *m = NULL;
    for (unsigned i = 0; i < ab->num_members; i++)
-      if (ab->members[i].offset == off)
+      if (off >= ab->members[i].offset &&
+          off < ab->members[i].offset + (uint64_t)8 * ab->members[i].span)
          m = &ab->members[i];
+   if (chosen && (!m || m->span == 1)) {
+      air_error(c, "instruction: a load through the argument buffer %s at an offset "
+                   "that is not constant, which is a descriptor chosen at run time",
+                abname);
+      return NULL;
+   }
    if (!m) {
       air_error(c, "instruction: a load from byte %u of the argument buffer %s, which "
                    "declares no member there", (unsigned)off, abname);
@@ -1611,7 +1863,15 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type)
       return NULL;
    }
 
-   struct air_ptr p = { .binding = m->index, .pointee = type->elem };
+   struct air_ptr p = { .binding = m->index + (unsigned)((off - m->offset) / 8),
+                        .pointee = type->elem };
+   if (chosen && !(p.element = eighth_of(c, chosen))) {
+      air_error(c, "instruction: a load of member %s of the argument buffer %s at a stride that "
+                   "is not one descriptor's eight bytes", m->name ? m->name : "unnamed", abname);
+      return NULL;
+   }
+   if (chosen)
+      c->info->indexed_descriptors = true;
    switch (m->kind) {
    case AIR_RESOURCE_CONSTANT_BUFFER: p.class = AIR_PTR_UBO; break;
    case AIR_RESOURCE_DEVICE_BUFFER:   p.class = AIR_PTR_SSBO; break;
@@ -1691,8 +1951,15 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          .binding = index,
          .is_image = write,
       };
-      add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index, 0,
-                   sample || read, write, param, node);
+      struct air_resource *r = add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE,
+                                            index, 0, sample || read, write, param, node);
+      /* [M5c: `array<texture2d<float>, 3> t [[texture(0)]]`, a pointer to its handles] */
+      if (r)
+         r->array_size = location_span(node);
+      if (r && r->array_size > 1) {
+         p.class = AIR_PTR_DESC_ARRAY;
+         p.desc_class = AIR_PTR_TEXTURE;
+      }
       c->params[param] = air_val_ptr(c, p);
       return true;
    }
@@ -1701,7 +1968,14 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       uint64_t index = 0;
       md_key_int(node, "air.location_index", &index);
       struct air_ptr p = { .class = AIR_PTR_SAMPLER, .binding = index };
-      add_resource(c, AIR_RESOURCE_SAMPLER, index, 0, true, false, param, node);
+      struct air_resource *r = add_resource(c, AIR_RESOURCE_SAMPLER, index, 0, true, false, param,
+                                            node);
+      if (r)
+         r->array_size = location_span(node);
+      if (r && r->array_size > 1) {
+         p.class = AIR_PTR_DESC_ARRAY;
+         p.desc_class = AIR_PTR_SAMPLER;
+      }
       c->params[param] = air_val_ptr(c, p);
       return true;
    }
@@ -2060,6 +2334,12 @@ load_through_choice(struct air_ctx *c, struct air_val *v, const struct air_type 
       air_error(c, "instruction: a load through something that is not a pointer");
       return NULL;
    }
+   /* M5d: null on one side is a [[function_constant]] buffer (`has_luts ? luts : null`), and a load
+    * through null is reached only if the shader was going to do something undefined anyway */
+   if (v->elems[0]->kind == AIR_VAL_PTR && v->elems[0]->ptr.class == AIR_PTR_NONE)
+      return load_through_choice(c, v->elems[1], t, align);
+   if (v->elems[1]->kind == AIR_VAL_PTR && v->elems[1]->ptr.class == AIR_PTR_NONE)
+      return load_through_choice(c, v->elems[0], t, align);
    nir_def *a = load_through_choice(c, v->elems[0], t, align);
    nir_def *b = load_through_choice(c, v->elems[1], t, align);
    if (!a || !b)
@@ -2069,6 +2349,67 @@ load_through_choice(struct air_ctx *c, struct air_val *v, const struct air_type 
                "pointers -- so a side the pipeline left unbound is read anyway, and its "
                "value discarded");
    return nir_bcsel(&c->b, v->def, a, b);
+}
+
+/* An index as 32 bits. LLVM indexes a two-element vector with an i1 when that is all it takes (RenderBox's
+ * stroke_lines_fragment, `extractelement <2 x i1> %54, i1 %55`), and u2u32 of a one-bit value is
+ * what ir3 stops at: "invalid src bit size: 1", a trap in chronod (run 143243). */
+static nir_def *
+element_index(struct air_ctx *c, nir_def *index)
+{
+   return index->bit_size == 1 ? nir_b2i32(&c->b, index) : nir_u2u32(&c->b, index);
+}
+
+static bool pointer_in_a_local(const struct air_val *p);
+static struct air_pointer_slot *find_pointer_slot(struct air_ctx *c, uint64_t offset);
+static struct air_val *load_pointer_slot(struct air_ctx *c, uint64_t offset);
+
+/* A pointer loaded through a pointer chosen at run time (M5d). QuartzCore's fixed_frag_lph_* keep each
+ * sampler argument in a local and open with `has_image ? img_samp : unused_sampler`, a module constant
+ * holding a sampler of its own, and only ever use the result with `has_image ? image : null`: one
+ * function constant decides both, and without the image no sample is reached. So the choice between
+ * a local holding a texture or a sampler and a module constant has one place, the local's. Anything
+ * else there is no select for, and it is refused. */
+static struct air_val *
+load_pointer_through_choice(struct air_ctx *c, struct air_val *v)
+{
+   if (v->kind == AIR_VAL_PTR_SELECT) {
+      struct air_val *a = load_pointer_through_choice(c, v->elems[0]);
+      struct air_val *b = load_pointer_through_choice(c, v->elems[1]);
+      if (!a || !b)
+         return NULL;
+      if (a->ptr.class == AIR_PTR_NONE)
+         return b;
+      if (b->ptr.class == AIR_PTR_NONE || same_ptr(&a->ptr, &b->ptr))
+         return a;
+      air_error(c, "instruction: a pointer loaded through a choice between two places that each "
+                   "hold a different one");
+      return NULL;
+   }
+   if (v->kind != AIR_VAL_PTR) {
+      air_error(c, "instruction: a load through something that is not a pointer");
+      return NULL;
+   }
+   if (pointer_in_a_local(v)) {
+      uint64_t at = nir_src_as_uint(nir_src_for_ssa(v->ptr.offset));
+      /* a module variable holding a pointer is at a constant place in the same scratch space, and
+       * no store of this shader's was ever there: that is the module constant's side */
+      if (!find_pointer_slot(c, at))
+         return air_val_ptr(c, (struct air_ptr){ .class = AIR_PTR_NONE });
+      struct air_val *held = load_pointer_slot(c, at);
+      if (held && held->ptr.class != AIR_PTR_TEXTURE && held->ptr.class != AIR_PTR_SAMPLER) {
+         air_error(c, "instruction: a pointer of class %d loaded through a chosen pointer",
+                   held->ptr.class);
+         return NULL;
+      }
+      return held;
+   }
+   if (v->ptr.class == AIR_PTR_SCRATCH) {
+      air_error(c, "instruction: a pointer loaded through a chosen pointer at a computed place in "
+                   "a local");
+      return NULL;
+   }
+   return air_val_ptr(c, (struct air_ptr){ .class = AIR_PTR_NONE });
 }
 
 static bool
@@ -2123,7 +2464,7 @@ gep_into(struct air_ctx *c, struct air_val *base, const struct air_inst *in,
       } else if (t->kind == AIR_TYPE_ARRAY || t->kind == AIR_TYPE_VECTOR) {
          uint64_t es = t->kind == AIR_TYPE_ARRAY ? air_type_alloc_size(c->m, t->elem)
                                                  : MAX2(air_type_bit_size(t->elem) / 8, 1);
-         p = air_ptr_add(c, p, nir_imul_imm(&c->b, nir_u2u32(&c->b, idx), es));
+         p = air_ptr_add(c, p, nir_imul_imm(&c->b, element_index(c, idx), es));
          t = t->elem;
       } else {
          return air_error(c, "instruction: getelementptr into a scalar");
@@ -2150,6 +2491,11 @@ translate_gep(struct air_ctx *c, const struct air_inst *in)
 static bool
 translate_binop(struct air_ctx *c, const struct air_inst *in)
 {
+   /* M5c: an i2 to i7 has eight bits here, kept masked, and arithmetic would not keep it so */
+   const unsigned narrow = air_type_bit_size(air_type_scalar(in->base.type));
+   if (air_int_is_narrow(narrow) && !air_type_is_float(air_type_scalar(in->base.type)))
+      return air_error(c, "instruction: arithmetic on a %u-bit integer, which is a width NIR "
+                          "does not have", narrow);
    nir_def *x = air_get_ssa(c, in->operands[0]);
    nir_def *y = air_get_ssa(c, in->operands[1]);
    if (!x || !y)
@@ -2212,11 +2558,22 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
    switch (in->sub) {
    case AIR_CAST_TRUNC:
       res = bits == 1 ? nir_i2b(&c->b, nir_iand_imm(&c->b, x, 1)) : nir_u2uN(&c->b, x, bits);
+      /* M5c: a narrower integer than NIR has, kept masked */
+      if (air_int_is_narrow(air_type_bit_size(air_type_scalar(in->base.type))))
+         res = nir_iand_imm(&c->b, res,
+                            (1u << air_type_bit_size(air_type_scalar(in->base.type))) - 1);
       break;
    case AIR_CAST_ZEXT:
       res = x->bit_size == 1 ? nir_b2iN(&c->b, x, bits) : nir_u2uN(&c->b, x, bits);
       break;
    case AIR_CAST_SEXT:
+      /* M5d: from a narrow integer the sign is not the top bit of what holds it, and that
+       * holds it masked */
+      if (air_int_is_narrow(air_type_bit_size(air_type_scalar(in->operands[0]->type)))) {
+         unsigned from = air_type_bit_size(air_type_scalar(in->operands[0]->type));
+         nir_def *up = nir_ishl_imm(&c->b, x, x->bit_size - from);
+         x = nir_ishr_imm(&c->b, up, x->bit_size - from);
+      }
       res = x->bit_size == 1 ? nir_ineg(&c->b, nir_b2iN(&c->b, x, bits))
                              : nir_i2iN(&c->b, x, bits);
       break;
@@ -2290,6 +2647,13 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
          res = nir_unpack_32_2x16(&c->b, x);
       else if (sn == 2 && sb == 16 && dn == 1 && db == 32)
          res = nir_pack_32_2x16(&c->b, x);
+      /* [M5d: and any other of the same total, in the same little-endian order: VideoToolbox's scaler
+       * moves <4 x i16> and <2 x i32> into each other, and what this refused left it holding a
+       * specialized function with no pipeline, so that it fell back to nothing and the wallpaper never
+       * came (run 143926). This said "which is a repacking this frontend does not do".] */
+      else if (sn * sb == dn * db && (sb == 8 || sb == 16 || sb == 32 || sb == 64) &&
+               (db == 8 || db == 16 || db == 32 || db == 64))
+         res = nir_extract_bits(&c->b, &x, 1, 0, dn, db);
       else
          return air_error(c, "instruction: a bitcast from %u x %u bits to %u x %u bits, "
                              "which is a repacking this frontend does not do",
@@ -2341,6 +2705,138 @@ translate_cmp(struct air_ctx *c, const struct air_inst *in)
    }
    air_set(c, &in->base, air_val_ssa(c, res));
    return true;
+}
+
+/*
+ * POINTERS IN A LOCAL (M5c). A pointer has no bytes here (docs/air.md section 3), and C++ objects
+ * MPSImage keeps on the stack hold them all the same: `store ptr addrspace(1) %14, ptr %12`, into a
+ * field of an alloca, read back further on. A local is the one memory all of whose accesses are in
+ * this module, so the store can be answered while translating: this table says which pointer is
+ * kept at which byte of the scratch space, and a load of a pointer from there resolves to it. That is
+ * sound for what is kept once, which is what these are: objects assigned as they are made. So:
+ *
+ *   - A second store of a DIFFERENT pointer to one place is refused: which is there would depend on
+ *     the path, and this table has no paths.
+ *   - A load with nothing stored yet is refused. Blocks are walked in reverse post order, so
+ *     a store that dominates the load has been seen.
+ *   - A pointer with a value of a function's own in it (a computed offset) is refused in another
+ *     function, where that value does not exist; a constant offset is said again there.
+ *
+ * Only a constant place in scratch memory: an array of pointers indexed at run time has none.
+ *
+ * [M5e, Photos' grid (PXGMetalRenderer's fragment_main, an interpreter of opcodes in function constants, in which a refused
+ * pipeline is an uncaught exception, run 164610): two more shapes. A cursor into a constant buffer kept in a field and moved
+ * on 57 times and never read back: a second store is refused only if the place is read. And
+ * `memcpy(field, array<texture3d, 3> param, 24)`, read back at `field[i]` with i computed: the copy is
+ * remembered as a range of the local (air_copy_descriptors), and a load inside that range is a load out of the array itself.]
+ */
+static bool
+pointer_in_a_local(const struct air_val *p)
+{
+   return p->kind == AIR_VAL_PTR && p->ptr.class == AIR_PTR_SCRATCH && p->ptr.offset &&
+          nir_src_is_const(nir_src_for_ssa(p->ptr.offset));
+}
+
+static struct air_pointer_slot *
+find_pointer_slot(struct air_ctx *c, uint64_t offset)
+{
+   for (unsigned i = 0; i < c->num_pointer_slots; i++)
+      if (c->pointer_slots[i].offset == offset)
+         return &c->pointer_slots[i];
+   return NULL;
+}
+
+static bool
+store_pointer_slot(struct air_ctx *c, uint64_t offset, struct air_val *val)
+{
+   struct air_pointer_slot *s = find_pointer_slot(c, offset);
+   if (s) {
+      s->conflicted = s->conflicted || !same_ptr(&s->val->ptr, &val->ptr);
+      return true;
+   }
+   c->pointer_slots = reralloc(c->mem_ctx, c->pointer_slots, struct air_pointer_slot,
+                               c->num_pointer_slots + 1);
+   c->pointer_slots[c->num_pointer_slots++] = (struct air_pointer_slot){
+      .offset = offset, .val = val, .impl = c->b.impl,
+   };
+   return true;
+}
+
+static struct air_val *
+load_pointer_slot(struct air_ctx *c, uint64_t offset)
+{
+   const struct air_pointer_slot *s = find_pointer_slot(c, offset);
+   if (!s) {
+      air_error(c, "instruction: a pointer loaded from byte %u of a local before any was stored "
+                   "there", (unsigned)offset);
+      return NULL;
+   }
+   if (s->conflicted) {
+      air_error(c, "instruction: a pointer loaded from byte %u of a local where different ones were "
+                   "stored, so which one is there depends on the path", (unsigned)offset);
+      return NULL;
+   }
+   if (s->impl == c->b.impl)
+      return s->val;
+   struct air_ptr p = s->val->ptr;
+   if (p.element || (p.offset && !nir_src_is_const(nir_src_for_ssa(p.offset)))) {
+      air_error(c, "instruction: a pointer loaded from byte %u of a local in another function than "
+                   "stored it, with a computed offset of that function's in it", (unsigned)offset);
+      return NULL;
+   }
+   if (p.offset)
+      p.offset = nir_imm_int(&c->b, nir_src_as_uint(nir_src_for_ssa(p.offset)));
+   return air_val_ptr(c, p);
+}
+
+void
+air_copy_pointer_slots(struct air_ctx *c, struct air_ptr dst, struct air_ptr src, uint64_t bytes)
+{
+   if (src.class != AIR_PTR_SCRATCH || dst.class != AIR_PTR_SCRATCH || !src.offset || !dst.offset ||
+       !nir_src_is_const(nir_src_for_ssa(src.offset)) ||
+       !nir_src_is_const(nir_src_for_ssa(dst.offset)))
+      return;
+   const uint64_t from = nir_src_as_uint(nir_src_for_ssa(src.offset));
+   const uint64_t to = nir_src_as_uint(nir_src_for_ssa(dst.offset));
+   for (unsigned i = 0, n = c->num_pointer_slots; i < n; i++) {
+      const struct air_pointer_slot s = c->pointer_slots[i];
+      if (s.offset >= from && s.offset < from + bytes)
+         store_pointer_slot(c, to + (s.offset - from), s.val);
+   }
+}
+
+bool
+air_copy_descriptors(struct air_ctx *c, struct air_ptr dst, struct air_ptr src, uint64_t bytes)
+{
+   if (dst.class != AIR_PTR_SCRATCH || !dst.offset || !nir_src_is_const(nir_src_for_ssa(dst.offset)))
+      return air_error(c, "intrinsic: an array of descriptors copied somewhere other than a constant place in a local");
+   if (src.offset || src.element)
+      return air_error(c, "intrinsic: a part of an array of descriptors copied");
+   c->desc_copies = reralloc(c->mem_ctx, c->desc_copies, struct air_desc_copy, c->num_desc_copies + 1);
+   c->desc_copies[c->num_desc_copies++] = (struct air_desc_copy){
+      .start = nir_src_as_uint(nir_src_for_ssa(dst.offset)), .bytes = bytes, .array = src,
+   };
+   return true;
+}
+
+/* a pointer loaded from a place inside such a copy, or NULL with nothing said */
+static struct air_val *
+load_copied_descriptor(struct air_ctx *c, struct air_ptr place, const struct air_type *type)
+{
+   uint64_t off = 0;
+   if (!c->num_desc_copies || place.class != AIR_PTR_SCRATCH || !place.offset)
+      return NULL;
+   nir_def *chosen = split_offset(c, place.offset, &off);
+   for (unsigned i = 0; i < c->num_desc_copies; i++) {
+      const struct air_desc_copy *d = &c->desc_copies[i];
+      if (off < d->start || off >= d->start + d->bytes)
+         continue;
+      struct air_ptr element = d->array;
+      nir_def *within = nir_imm_int(&c->b, (int)(off - d->start));
+      element.offset = chosen ? nir_iadd(&c->b, chosen, within) : within;
+      return desc_array_load(c, element, type);
+   }
+   return NULL;
 }
 
 /* an aggregate value's field, by the index path of extract/insertvalue */
@@ -2489,7 +2985,7 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       nir_def *i = air_get_ssa(c, in->operands[1]);
       if (!v || !i)
          return false;
-      air_set(c, &in->base, air_val_ssa(c, nir_vector_extract(&c->b, v, nir_u2u32(&c->b, i))));
+      air_set(c, &in->base, air_val_ssa(c, nir_vector_extract(&c->b, v, element_index(c, i))));
       return true;
    }
    case AIR_OP_INSERTELT: {
@@ -2498,8 +2994,12 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       nir_def *i = air_get_ssa(c, in->operands[2]);
       if (!v || !x || !i)
          return false;
-      if (!nir_src_is_const(nir_src_for_ssa(i)))
-         return air_error(c, "instruction: insertelement at a run-time index");
+      /* [M5c: at a run-time index as well, which this refused by name until MPSImage's colour
+       * conversion kernels met it: NIR's form is one bcsel per component] */
+      if (!nir_src_is_const(nir_src_for_ssa(i))) {
+         air_set(c, &in->base, air_val_ssa(c, nir_vector_insert(&c->b, v, x, element_index(c, i))));
+         return true;
+      }
       air_set(c, &in->base,
               air_val_ssa(c, nir_vector_insert_imm(&c->b, v, x,
                                                    nir_src_as_uint(nir_src_for_ssa(i)))));
@@ -2622,6 +3122,13 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *p = air_get(c, in->operands[0]);
       if (!p)
          return false;
+      if (p->kind == AIR_VAL_PTR_SELECT && in->base.type->kind == AIR_TYPE_POINTER) {
+         struct air_val *res = load_pointer_through_choice(c, p);
+         if (!res)
+            return false;
+         air_set(c, &in->base, res);
+         return true;
+      }
       if (p->kind == AIR_VAL_PTR_SELECT) {
          nir_def *res = load_through_choice(c, p, in->base.type, in->align);
          if (!res)
@@ -2637,6 +3144,29 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
        */
       if (p->ptr.class == AIR_PTR_ARGBUF) {
          struct air_val *res = argbuf_load(c, p->ptr, in->base.type);
+         if (!res)
+            return false;
+         air_set(c, &in->base, res);
+         return true;
+      }
+      if (p->ptr.class == AIR_PTR_DESC_ARRAY) {
+         struct air_val *res = desc_array_load(c, p->ptr, in->base.type);
+         if (!res)
+            return false;
+         air_set(c, &in->base, res);
+         return true;
+      }
+      if (in->base.type->kind == AIR_TYPE_POINTER && p->kind == AIR_VAL_PTR) {
+         struct air_val *copied = load_copied_descriptor(c, p->ptr, in->base.type);
+         if (copied) {
+            air_set(c, &in->base, copied);
+            return true;
+         }
+         if (c->error[0])
+            return false;
+      }
+      if (in->base.type->kind == AIR_TYPE_POINTER && pointer_in_a_local(p)) {
+         struct air_val *res = load_pointer_slot(c, nir_src_as_uint(nir_src_for_ssa(p->ptr.offset)));
          if (!res)
             return false;
          air_set(c, &in->base, res);
@@ -2662,6 +3192,8 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *sv = air_get(c, in->operands[0]);
       if (!sv)
          return false;
+      if (sv->kind == AIR_VAL_PTR && pointer_in_a_local(p))
+         return store_pointer_slot(c, nir_src_as_uint(nir_src_for_ssa(p->ptr.offset)), sv);
       if (val_is_pointerish(sv))
          return air_error(c, "instruction: a store of a pointer into memory, which this "
                              "frontend has no address to write");
@@ -2838,6 +3370,65 @@ val_holds_ptr(const struct air_val *v)
    return false;
 }
 
+/* M5c: the numbers inside an aggregate, in tree order: how many, and into `out` when it is given. A
+ * leaf nothing was put in (an undef field) is not one. */
+static unsigned
+ssa_leaves(const struct air_val *v, nir_def **out, unsigned n)
+{
+   if (!v)
+      return n;
+   if (v->kind == AIR_VAL_SSA) {
+      if (out)
+         out[n] = v->def;
+      return n + 1;
+   }
+   if (v->kind == AIR_VAL_AGG) {
+      for (unsigned i = 0; i < v->num_elems; i++)
+         n = ssa_leaves(v->elems[i], out, n);
+   }
+   return n;
+}
+
+/* ... and the callee's side: the same walk, each leaf now its parameter. */
+static unsigned
+ssa_leaves_from_params(struct air_ctx *c, struct air_val *v, unsigned param)
+{
+   if (!v)
+      return param;
+   if (v->kind == AIR_VAL_SSA) {
+      v->def = nir_load_param(&c->b, param);
+      return param + 1;
+   }
+   if (v->kind == AIR_VAL_AGG) {
+      for (unsigned i = 0; i < v->num_elems; i++)
+         param = ssa_leaves_from_params(c, v->elems[i], param);
+   }
+   return param;
+}
+
+/* M5c: whether a struct argument holds a pointer with a def of the caller's in it: nothing here says
+ * it again on the callee's side, so a call with one is refused. The handles of a metal::texture2d
+ * and a metal::sampler have neither, and a direct pointer argument is not this: its offset has its
+ * own way across. */
+static bool
+val_holds_caller_def(const struct air_val *v)
+{
+   if (!v)
+      return false;
+   if (v->kind == AIR_VAL_PTR)
+      return v->ptr.element != NULL;
+   if (v->kind != AIR_VAL_AGG)
+      return false;
+   for (unsigned i = 0; i < v->num_elems; i++) {
+      const struct air_val *e = v->elems[i];
+      if (e && e->kind == AIR_VAL_PTR && e->ptr.offset)
+         return true;
+      if (val_holds_caller_def(e))
+         return true;
+   }
+   return false;
+}
+
 /* A function of the module, translated as a nir_function so that
  * nir_inline_functions can fold it into its callers afterwards.
  *
@@ -2856,7 +3447,7 @@ val_holds_ptr(const struct air_val *v)
  */
 static nir_function *
 translate_callee(struct air_ctx *c, const struct air_function *f,
-                 struct air_val **argv, bool *is_param)
+                 struct air_val **argv, bool *is_param, bool *offset_param)
 {
    /* A texture, sampler or buffer argument is not a value in this frontend: it
     * is resolved at translation time into a binding, and tex_handle wants an
@@ -2867,7 +3458,13 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
     *
     * A pointer carrying a byte offset is refused instead: that offset is an
     * nir_def of the CALLER's impl, and using it here would be the same
-    * cross-function def/use that the globals used to cause.
+    * cross-function def/use that the globals used to cause. [M5c: not refused now, and it is
+    * the commonest shape in MPSImage: a pointer to the caller's alloca, or to a threadgroup array
+    * at a computed element. The offset is what the callee cannot see, so a constant one is made
+    * again here and any other comes in as a parameter of its own, after the others
+    * (offset_param): what it points at, scratch or threadgroup memory or a buffer, is the
+    * shader's and not the function's, so it is the same memory on both sides of the call.
+    * The element of an array of descriptors is the same kind of value, and is still refused.]
     */
    bool specialised = false;
    for (unsigned i = 0; i < f->num_args; i++) {
@@ -2878,11 +3475,30 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
        * it then takes extractvalue of, and extractvalue of a value that is not
        * an aggregate here is exactly the error this used to produce.
        */
+      /* M5d: `has_weights ? weights : null` is a [[function_constant]] buffer (QuartzCore's
+       * fixed_frag_lph_* to their asg77_sample), and the callee is only reached under that constant:
+       * the buffer is the one place. Null is the only side this may drop. */
+      if (argv && argv[i] && argv[i]->kind == AIR_VAL_PTR_SELECT) {
+         struct air_val *x = argv[i]->elems[0], *y = argv[i]->elems[1];
+         if (x->kind == AIR_VAL_PTR && x->ptr.class == AIR_PTR_NONE && y->kind == AIR_VAL_PTR)
+            argv[i] = y;
+         else if (y->kind == AIR_VAL_PTR && y->ptr.class == AIR_PTR_NONE && x->kind == AIR_VAL_PTR)
+            argv[i] = x;
+      }
       bool ptr = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR ||
                                      val_holds_ptr(argv[i]));
-      if (ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset) {
+      if (ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset && !offset_param) {
          air_error(c, "intrinsic: a call passing a pointer at a computed offset as "
                       "argument %u, which would use the caller's own value here", i);
+         return NULL;
+      }
+      if (offset_param)
+         offset_param[i] = ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset &&
+                           !nir_src_is_const(nir_src_for_ssa(argv[i]->ptr.offset));
+      if (ptr && val_holds_caller_def(argv[i])) {
+         air_error(c, "intrinsic: a call passing a pointer inside argument %u with a value of the "
+                      "caller's in it: an element chosen at run time or a computed offset",
+                   i);
          return NULL;
       }
       /* The same reason, for the two pointers that are values: a chosen
@@ -2894,8 +3510,13 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
                       "argument %u", i);
          return NULL;
       }
-      is_param[i] = !ptr;
-      specialised |= ptr;
+      /* [M5c: an aggregate of numbers has no NIR type a parameter could be, and a struct holding a
+       * pointer and numbers has defs of the caller's in it. Each number becomes a parameter of its
+       * own, after the offsets (ssa_leaves), and the callee is given the tree back with those in
+       * its leaves. MPSImage's `[4 x float]` is this: pqToneMap_kernel.] */
+      const bool agg = offset_param && argv && argv[i] && argv[i]->kind == AIR_VAL_AGG;
+      is_param[i] = !ptr && !agg;
+      specialised |= ptr || agg;
    }
 
    struct hash_entry *e = specialised ? NULL : _mesa_hash_table_search(c->fns, f);
@@ -2925,7 +3546,11 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    } else if (has_ret) {
       nret = 1;
    }
-   unsigned nparams = f->num_args + nret;
+   unsigned leaves = 0;
+   for (unsigned i = 0; offset_param && argv && i < f->num_args; i++)
+      if (argv[i] && argv[i]->kind == AIR_VAL_AGG)
+         leaves += ssa_leaves(argv[i], NULL, 0);
+   unsigned nparams = f->num_args * 2 + nret + leaves;   /* (an offset of its own for any of them) */
    nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
    fn->num_params = nparams;
    fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
@@ -2961,6 +3586,22 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
          .num_components = (uint8_t)air_nir_components(at),
          .bit_size = (uint8_t)air_nir_bit_size(c, at),
       };
+   }
+   /* M5c: and each computed byte offset, which is a uint */
+   for (unsigned i = 0; offset_param && i < f->num_args; i++) {
+      if (offset_param[i])
+         fn->params[idx++] = (nir_parameter){ .num_components = 1, .bit_size = 32 };
+   }
+   /* M5c: and each number inside an aggregate */
+   for (unsigned i = 0; offset_param && argv && i < f->num_args; i++) {
+      if (!argv[i] || argv[i]->kind != AIR_VAL_AGG)
+         continue;
+      nir_def **defs = rzalloc_array(c->mem_ctx, nir_def *, ssa_leaves(argv[i], NULL, 0) + 1);
+      unsigned n = ssa_leaves(argv[i], defs, 0);
+      for (unsigned k = 0; k < n; k++)
+         fn->params[idx++] = (nir_parameter){
+            .num_components = defs[k]->num_components, .bit_size = defs[k]->bit_size,
+         };
    }
    fn->num_params = idx;   /* the pointers took no parameter */
 
@@ -3025,9 +3666,29 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
                                           nir_var_function_temp, ret_glsl, 0);
    }
    unsigned pidx = nret;
+   unsigned oidx = nret;
+   for (unsigned i = 0; i < f->num_args; i++)
+      oidx += is_param[i];
+   unsigned lidx = oidx;
+   for (unsigned i = 0; offset_param && i < f->num_args; i++)
+      lidx += offset_param[i];
    for (unsigned i = 0; i < f->num_args && ok; i++) {
       if (!is_param[i]) {
-         air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
+         /* the caller's own resolution, and M5c: with its offset said in this function */
+         if (offset_param && argv[i] && argv[i]->kind == AIR_VAL_AGG) {
+            struct air_val *tree = clone_val(c, argv[i]);
+            lidx = ssa_leaves_from_params(c, tree, lidx);
+            air_set(c, &f->args[i], tree);
+         } else if (argv[i] && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset) {
+            struct air_ptr p = argv[i]->ptr;
+            p.offset = offset_param && offset_param[i]
+                          ? nir_load_param(&c->b, oidx++)
+                          : nir_imm_int(&c->b,
+                                        nir_src_as_uint(nir_src_for_ssa(argv[i]->ptr.offset)));
+            air_set(c, &f->args[i], air_val_ptr(c, p));
+         } else {
+            air_set(c, &f->args[i], argv[i]);
+         }
          continue;
       }
       air_set(c, &f->args[i], air_val_ssa(c, nir_load_param(&c->b, pidx++)));
@@ -3081,13 +3742,14 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *,
                                          MAX2(f->num_args, 1));
    bool *is_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
+   bool *offset_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
    for (unsigned i = 0; i < f->num_args; i++) {
       argv[i] = air_get(c, in->operands[i + 1]);
       if (!argv[i])
          return false;
    }
 
-   nir_function *fn = translate_callee(c, f, argv, is_param);
+   nir_function *fn = translate_callee(c, f, argv, is_param, offset_param);
    if (!fn)
       return false;   /* translate_callee has said why */
 
@@ -3128,6 +3790,20 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
          return air_error(c, "intrinsic: argument %u of %s is not a value this can pass",
                           i, name);
       call->params[idx++] = nir_src_for_ssa(a);
+   }
+   /* M5c: and each computed byte offset, after them, as translate_callee declared them */
+   for (unsigned i = 0; i < f->num_args; i++) {
+      if (offset_param[i])
+         call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
+   }
+   /* ... and each number inside an aggregate */
+   for (unsigned i = 0; i < f->num_args; i++) {
+      if (argv[i]->kind != AIR_VAL_AGG)
+         continue;
+      nir_def **defs = rzalloc_array(c->mem_ctx, nir_def *, ssa_leaves(argv[i], NULL, 0) + 1);
+      unsigned n = ssa_leaves(argv[i], defs, 0);
+      for (unsigned k = 0; k < n; k++)
+         call->params[idx++] = nir_src_for_ssa(defs[k]);
    }
    nir_builder_instr_insert(&c->b, &call->instr);
 
@@ -3292,7 +3968,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
                re->kind != AIR_TYPE_INT))
       return air_error(c, "library: the return value is neither a scalar nor a vector");
 
-   nir_function *fn = translate_callee(c, f, argv, is_param);
+   nir_function *fn = translate_callee(c, f, argv, is_param, NULL);
    if (!fn)
       return false;   /* translate_callee has said why */
 
@@ -3357,30 +4033,77 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
 static bool
 resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
 {
-   struct air_val *first = NULL;
+   /* [M5c: this refused an operand over a loop edge ("so which resource it is depends on the
+    * iteration"), and two operands at different byte offsets of one resource ("a phi between
+    * pointers that name different places"), which MPSImage's walks along a buffer are: LLVM's
+    * `phi ptr addrspace(2) [ %3, %47 ], [ %456, %126 ]`. WHICH RESOURCE is what has no bits, and
+    * it has to be one resource still. The byte offset is a number, so it has a register like any
+    * other phi, stored at the end of each predecessor by translate_body, which also checks an
+    * operand this could not see yet against what is said here. A phi whose operands are all known
+    * and all one place stays what it was, with no register read.] */
+   /* [M5d: air.get_null_texture on one side is no second place. QuartzCore's fixed_frag_lph_* open
+    * with fifteen of `has_attachment_N ? attachment_N : null`, which is what a [[function_constant]]
+    * texture compiles to; the texture is the one place, and an attachment the constant says is
+    * absent is read only under that same constant. Refusing it took backboardd with it, in a loop
+    * (run 125405): CoreAnimation aborts on the second failure to build a pipeline.] */
+   struct air_val *first = NULL, *null_texture = NULL;
+   bool one_place = true;
    for (unsigned k = 0; k < in->num_operands; k++) {
       if (!in->targets[k] || !reachable[in->targets[k]->index])
          continue;
       struct hash_entry *e = _mesa_hash_table_search(c->values, in->operands[k]);
-      if (!e)
-         return air_error(c, "instruction: a phi of pointers whose operand comes in over "
-                             "a loop edge, so which resource it is depends on the "
-                             "iteration");
-      struct air_val *v = e->data;
+      struct air_val *v = e ? e->data : NULL;
+      if (!e && in->operands[k]->kind != AIR_VALUE_INSTRUCTION) {
+         v = air_get(c, in->operands[k]);   /* a constant has no entry until it is asked for */
+         if (!v)
+            return false;
+      } else if (!e) {
+         one_place = false;   /* over a loop edge */
+         continue;
+      }
       if (!v || v->kind != AIR_VAL_PTR)
          return air_error(c, "instruction: a phi of pointers one of whose operands is "
                              "%s", v && v->kind == AIR_VAL_PTR_SELECT
                                       ? "itself a pointer chosen at run time"
                                       : "not a resolved pointer");
-      if (!first)
+      if (v->ptr.class == AIR_PTR_NONE)
+         continue;
+      if (v->ptr.class == AIR_PTR_TEXTURE && v->ptr.binding == ~0u) {
+         null_texture = v;
+         continue;
+      }
+      if (!first) {
          first = v;
-      else if (!same_ptr(&first->ptr, &v->ptr))
-         return air_error(c, "instruction: a phi between pointers that name different "
-                             "places, which would have to be chosen at run time");
+      } else if (!same_ptr(&first->ptr, &v->ptr)) {
+         if (first->ptr.class != v->ptr.class || first->ptr.binding != v->ptr.binding ||
+             first->ptr.is_image != v->ptr.is_image || first->ptr.element != v->ptr.element)
+            return air_error(c, "instruction: a phi between pointers that name different "
+                                "places, which would have to be chosen at run time (class %d "
+                                "binding %u image %d element %p and class %d binding %u image %d "
+                                "element %p)", first->ptr.class, first->ptr.binding,
+                             first->ptr.is_image, (void *)first->ptr.element, v->ptr.class,
+                             v->ptr.binding, v->ptr.is_image, (void *)v->ptr.element);
+         one_place = false;
+      }
    }
+   if (!first && null_texture)
+      first = null_texture, null_texture = NULL;
    if (!first)
       return air_error(c, "instruction: a phi of pointers with no reachable operand");
-   air_set(c, &in->base, first);
+   if (one_place) {
+      if (null_texture) {
+         struct air_ptr p = first->ptr;
+         p.maybe_null = true;
+         air_set(c, &in->base, air_val_ptr(c, p));
+      } else {
+         air_set(c, &in->base, first);
+      }
+      return true;
+   }
+   struct hash_entry *re = _mesa_hash_table_search(c->phi_regs, in);
+   struct air_ptr p = first->ptr;
+   p.offset = nir_load_reg(&c->b, re->data);
+   air_set(c, &in->base, air_val_ptr(c, p));
    return true;
 }
 
@@ -3401,8 +4124,14 @@ translate_body(struct air_ctx *c)
       const struct air_block *blk = &f->blocks[bi];
       for (unsigned i = 0; i < blk->num_insts; i++) {
          const struct air_inst *in = blk->insts[i];
-         if (in->op != AIR_OP_PHI || in->base.type->kind == AIR_TYPE_POINTER)
+         if (in->op != AIR_OP_PHI)
             continue;
+         /* [M5c: a pointer's byte offset, which is a number, for resolve_pointer_phi; it costs
+          * nothing where it is not read] */
+         if (in->base.type->kind == AIR_TYPE_POINTER) {
+            _mesa_hash_table_insert(c->phi_regs, in, nir_decl_reg(&entry, 1, 32, 0));
+            continue;
+         }
          /* A phi of an AGGREGATE, named here rather than by whatever notices
           * the consequence further down. A struct is a tree of values in this
           * translator and never a NIR value, so there is no register to carry
@@ -3570,12 +4299,34 @@ translate_body(struct air_ctx *c)
             continue;
          struct hash_entry *re = _mesa_hash_table_search(c->phi_regs, in);
          if (!re)
-            continue; /* a phi in an unreachable block, or one of pointers */
+            continue; /* a phi in an unreachable block */
          for (unsigned k = 0; k < in->num_operands; k++) {
             struct hash_entry *ce = _mesa_hash_table_search(c->phi_cursors, in->targets[k]);
             if (!ce)
                continue; /* an edge from a block the entry cannot reach */
             c->b.cursor = *(nir_cursor *)ce->data;
+            /* M5c: a phi of pointers carries its byte offset (resolve_pointer_phi), and this is
+             * where an operand that came in over a loop edge is first seen: it has to be the
+             * same resource as the one the phi already said it was. */
+            if (in->base.type->kind == AIR_TYPE_POINTER) {
+               struct hash_entry *pe = _mesa_hash_table_search(c->values, in);
+               struct air_val *pv = air_get(c, in->operands[k]);
+               if (!pv)
+                  return false;
+               if (!pe || pv->kind != AIR_VAL_PTR || pv->ptr.class == AIR_PTR_NONE)
+                  continue;
+               if (pv->ptr.class == AIR_PTR_TEXTURE && pv->ptr.binding == ~0u)
+                  continue;
+               const struct air_ptr *was = &((struct air_val *)pe->data)->ptr;
+               if (was->class != pv->ptr.class || was->binding != pv->ptr.binding ||
+                   was->is_image != pv->ptr.is_image || was->element != pv->ptr.element)
+                  return air_error(c, "instruction: a phi between pointers that name different "
+                                      "places, which would have to be chosen at run time");
+               nir_store_reg(&c->b, pv->ptr.offset ? pv->ptr.offset : nir_imm_int(&c->b, 0),
+                             re->data);
+               *(nir_cursor *)ce->data = c->b.cursor;
+               continue;
+            }
             nir_def *val = air_get_ssa(c, in->operands[k]);
             if (!val)
                return false;
@@ -3704,6 +4455,9 @@ plan_globals(struct air_ctx *c)
              * argbuf_set as "member 0 of the set at Metal index 0" */
             .raster_order_group = -1,
             .argbuf_set = ~0u, .argbuf_id = ~0u,
+            /* (one, as add_resource says: this was left out in the first M5c build, and run 122910's
+             * sampler-own-* rows came back "which it does not declare" on vk) */
+            .array_size = 1,
          };
       } else if (g->addrspace == 3) {
          /* a static threadgroup array */
@@ -3751,6 +4505,202 @@ materialise_globals(struct air_ctx *c)
    }
 }
 
+/*
+ * THE MODULE'S VARIABLES, FOLDED (M5d).
+ *
+ * A [[function_constant]] reaches a shader through memory: the air.static_init constructor reads the
+ * constant, works out what depends on it (with branches: QuartzCore's fixed_frag_lph_* decide 58 of
+ * them in it, with a switch) and stores each into a program-scope variable, and the body loads that.
+ * The variables are scratch here (plan_globals), and NIR folds no load of scratch, so every branch
+ * on a constant stayed a branch at run time: 52,000 lines of NIR for what the constants leave as a
+ * few hundred, every texture of the fifteen "used", and three reads of render targets the pipeline
+ * has not got. Which is the whole point of function constants, and what real Metal's compiler does.
+ *
+ * So this is what constant propagation would do if it could see through the scratch: a store of a
+ * constant, in a block every later instruction runs after (at the top level of the function), to a
+ * variable nothing else writes, answers every load of the same bytes after it. Then what that
+ * lets fold is folded, and it goes round again, because the constructor's own branches read earlier
+ * variables. A store somewhere this cannot tell is past the variables ends the pass, as a shader
+ * whose constants still run: slower and not wrong.
+ *
+ * A store left with no load is removed, which keeps ir3 from giving the shader private memory for
+ * variables it no longer has.
+ */
+static bool
+place_is_past(nir_def *place, unsigned end)
+{
+   if (nir_src_is_const(nir_src_for_ssa(place)))
+      return nir_src_as_uint(nir_src_for_ssa(place)) >= end;
+   if (place->parent_instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(place->parent_instr);
+   if (alu->op != nir_op_iadd)
+      return false;
+   return place_is_past(alu->src[0].src.ssa, end) || place_is_past(alu->src[1].src.ssa, end);
+}
+
+static bool
+forward_module_variables(struct air_ctx *c)
+{
+   const unsigned end = c->variables_end;
+   nir_function_impl *impl = nir_shader_get_entrypoint(c->nir);
+   uint8_t *written = rzalloc_array(c->mem_ctx, uint8_t, end);
+   uint8_t *read = rzalloc_array(c->mem_ctx, uint8_t, end);
+   nir_intrinsic_instr **known = rzalloc_array(c->mem_ctx, nir_intrinsic_instr *, end);
+   bool progress = false;
+   bool computed_read = false;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic != nir_intrinsic_store_scratch)
+            continue;
+         nir_def *place = in->src[1].ssa;
+         if (!nir_src_is_const(in->src[1])) {
+            if (!place_is_past(place, end))
+               return false;
+            continue;
+         }
+         unsigned at = nir_src_as_uint(in->src[1]);
+         unsigned bytes = in->src[0].ssa->num_components * in->src[0].ssa->bit_size / 8;
+         for (unsigned k = at; k < at + bytes && k < end; k++)
+            written[k] = MIN2(written[k] + 1, 2);
+      }
+   }
+
+   nir_builder b = nir_builder_create(impl);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic == nir_intrinsic_store_scratch) {
+            if (block->cf_node.parent != &impl->cf_node || !nir_src_is_const(in->src[1]) ||
+                !nir_src_is_const(in->src[0]) ||
+                nir_intrinsic_write_mask(in) != nir_component_mask(in->src[0].ssa->num_components))
+               continue;
+            unsigned at = nir_src_as_uint(in->src[1]);
+            unsigned bytes = in->src[0].ssa->num_components * in->src[0].ssa->bit_size / 8;
+            bool alone = at + bytes <= end;
+            for (unsigned k = at; alone && k < at + bytes; k++)
+               alone = written[k] == 1;
+            if (alone)
+               known[at] = in;
+         } else if (in->intrinsic == nir_intrinsic_load_scratch) {
+            if (!nir_src_is_const(in->src[0]))
+               continue;
+            unsigned at = nir_src_as_uint(in->src[0]);
+            nir_intrinsic_instr *store = at < end ? known[at] : NULL;
+            if (!store || store->src[0].ssa->num_components != in->def.num_components ||
+                store->src[0].ssa->bit_size != in->def.bit_size)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_def_rewrite_uses(&in->def,
+                                 nir_build_imm(&b, in->def.num_components, in->def.bit_size,
+                                               nir_src_as_const_value(store->src[0])));
+            nir_instr_remove(instr);
+            progress = true;
+         }
+      }
+   }
+
+   /* what the constructor left in the variables that are resources' indices */
+   for (unsigned i = 0; attr_learning && i < c->m->num_globals; i++) {
+      const struct air_global *g = c->m->globals[i];
+      const struct air_global_plan *pl = &c->global_plan[i];
+      if (pl->skip || !pl->has_offset || pl->offset >= end || !known[pl->offset] || !g->base.name ||
+          !strstr(g->base.name, "__metal_implicit_attr_int_expr") ||
+          attr_learning->count == AIR_MAX_ATTR_VALUES)
+         continue;
+      attr_learning->name[attr_learning->count] = ralloc_strdup(attr_learning, g->base.name);
+      attr_learning->value[attr_learning->count++] =
+         (uint32_t)nir_src_as_uint(known[pl->offset]->src[0]);
+   }
+
+   /* what still loads what, and the stores nothing does */
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic != nir_intrinsic_load_scratch)
+            continue;
+         if (!nir_src_is_const(in->src[0])) {
+            computed_read = computed_read || !place_is_past(in->src[0].ssa, end);
+            continue;
+         }
+         unsigned at = nir_src_as_uint(in->src[0]);
+         unsigned bytes = in->def.num_components * in->def.bit_size / 8;
+         for (unsigned k = at; k < at + bytes && k < end; k++)
+            read[k] = 1;
+      }
+   }
+   if (!computed_read) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic != nir_intrinsic_store_scratch || !nir_src_is_const(in->src[1]))
+               continue;
+            unsigned at = nir_src_as_uint(in->src[1]);
+            unsigned bytes = in->src[0].ssa->num_components * in->src[0].ssa->bit_size / 8;
+            bool unread = at + bytes <= end;
+            for (unsigned k = at; unread && k < at + bytes; k++)
+               unread = !read[k];
+            if (unread) {
+               nir_instr_remove(instr);
+               progress = true;
+            }
+         }
+      }
+   }
+   if (progress)
+      nir_metadata_preserve(impl, nir_metadata_none);
+   return progress;
+}
+
+static void
+fold_module_variables(struct air_ctx *c)
+{
+   if (!c->variables_end)
+      return;
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, c->nir, nir_copy_prop);
+      NIR_PASS(progress, c->nir, nir_opt_constant_folding);
+      NIR_PASS(progress, c->nir, nir_opt_algebraic);   /* bcsel(true, x, y), which is not all constant */
+      NIR_PASS(progress, c->nir, nir_opt_remove_phis);
+      NIR_PASS(progress, c->nir, nir_opt_dead_cf);
+      NIR_PASS(progress, c->nir, nir_opt_dce);
+      progress |= forward_module_variables(c);
+   } while (progress);
+
+   /* What the constants left: an argument for a target nothing reads now is no framebuffer fetch.
+    * The frontend said so as it made them (the [[color(n)]] argument), before any of this. */
+   unsigned fetched = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(c->nir)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic == nir_intrinsic_load_output && nir_intrinsic_io_semantics(in).fb_fetch_output)
+            fetched |= 1u << (nir_intrinsic_io_semantics(in).location - FRAG_RESULT_DATA0);
+      }
+   }
+   if (c->nir->info.stage == MESA_SHADER_FRAGMENT && c->info && c->info->fbfetch_targets != fetched) {
+      c->nir->info.outputs_read &= ~((uint64_t)(c->info->fbfetch_targets & ~fetched) << FRAG_RESULT_DATA0);
+      c->info->fbfetch_targets = fetched;
+      if (!fetched) {
+         c->nir->info.fs.uses_fbfetch_output = false;
+         c->nir->info.fs.fbfetch_coherent = false;
+      }
+   }
+}
+
 /* The functions of @llvm.global_ctors, inlined at the top of the entry point:
  * this is where a function constant turns into the program-scope variable the
  * body reads (AV1SW computes kPixelShift from kBitDepth that way).
@@ -3782,7 +4732,7 @@ run_static_initializers(struct air_ctx *c)
           * also why this could not be reached before the reader learnt to read
           * one.
           */
-         nir_function *fn = translate_callee(c, f, NULL, NULL);
+         nir_function *fn = translate_callee(c, f, NULL, NULL, NULL);
          if (!fn)
             return;   /* translate_callee has said why */
          nir_builder_instr_insert(&c->b, &nir_call_instr_create(c->nir, fn)->instr);
@@ -3802,11 +4752,298 @@ run_static_initializers(struct air_ctx *c)
 
 /* -- the entry point ---------------------------------------------------- */
 
+static nir_shader *
+translate_module(void *mem_ctx, const void *bitcode, size_t size, const char *entry_point,
+                 const struct air_to_nir_options *options,
+                 const nir_shader_compiler_options *nir_options,
+                 struct air_shader_info *info, const char **error);
+
+/*
+ * A TRANSLATION KEPT ON DISK (M5e). Apple's pipelines come out of a precompiled library in milliseconds, and iOS is written
+ * for that. Here VideoToolbox's one function takes 2 to 3 s (464 KB of bitcode with every format it knows, 202 constants), and
+ * an application extension that decodes a picture on its way up is killed at 5 s for hanging on launch (CollectionsPoster,
+ * the wallpaper: 23 times in run 163230, a new process each time, starting again from nothing). So what the frontend made
+ * is kept, by a hash of all it was given. A process that is killed leaves behind what it had finished and the next one goes
+ * on from there.
+ *
+ * The key has the library's own size and date in it, so a rebuilt frontend finds nothing. A file is written under another
+ * name and renamed, so a reader sees all of it or none. A directory that cannot be written (a read-only /var, RAM runs
+ * of the kept volume) only means the work is done every time; nothing depends on this. AIR_CACHE_DIR: another directory,
+ * or a word that is no directory to turn it off. Not on the host's tools unless asked.
+ */
+#ifdef __APPLE__
+#define AIR_CACHE_DEFAULT "/var/tmp/hk-air"
+#else
+#define AIR_CACHE_DEFAULT NULL
+#endif
+#define AIR_CACHE_MAGIC 0x41495231u
+
+static const char *
+air_cache_dir(void)
+{
+   static const char *dir;
+   static bool looked;
+   if (!looked) {
+      const char *given = getenv("AIR_CACHE_DIR");
+      dir = given ? given : AIR_CACHE_DEFAULT;
+      if (dir) {
+         /* (for every user: the extensions run as mobile, the daemons as root) */
+         if (mkdir(dir, 0777) == 0)
+            chmod(dir, 01777);
+      }
+      looked = true;
+   }
+   return dir;
+}
+
+bool
+air_cache_path(const uint8_t key[20], const char *suffix, char *path, size_t path_size)
+{
+   const char *dir = air_cache_dir();
+   char hex[41];
+   if (!dir)
+      return false;
+   _mesa_sha1_format(hex, key);
+   return (size_t)snprintf(path, path_size, "%s/%s%s", dir, hex, suffix) < path_size;
+}
+
+void *
+air_cache_read(const char *path, size_t *size)
+{
+   int fd = open(path, O_RDONLY);
+   struct stat st;
+   void *bytes = NULL;
+   if (fd < 0)
+      return NULL;
+   if (fstat(fd, &st) == 0 && st.st_size > 0 && (bytes = malloc((size_t)st.st_size)) != NULL) {
+      if (read(fd, bytes, (size_t)st.st_size) != st.st_size) {
+         free(bytes);
+         bytes = NULL;
+      } else {
+         *size = (size_t)st.st_size;
+      }
+   }
+   close(fd);
+   return bytes;
+}
+
+void
+air_cache_write(const char *path, const void *bytes, size_t size)
+{
+   char temporary[300];
+   if ((size_t)snprintf(temporary, sizeof(temporary), "%s.%d.%p", path, (int)getpid(), (const void *)&temporary) >=
+       sizeof(temporary))
+      return;
+   int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL, 0644);
+   if (fd < 0)
+      return;
+   const bool whole = write(fd, bytes, size) == (ssize_t)size;
+   close(fd);
+   if (!whole || rename(temporary, path) != 0)
+      unlink(temporary);
+}
+
+static bool
+air_cache_key(const void *bitcode, size_t size, const char *entry_point, const struct air_to_nir_options *options,
+              uint8_t key[20])
+{
+   struct mesa_sha1 sha;
+   Dl_info self;
+   struct stat st = { 0 };
+   const uint32_t magic = AIR_CACHE_MAGIC;
+   if (!air_cache_dir())
+      return false;
+   if (dladdr((const void *)air_cache_key, &self) && self.dli_fname)
+      stat(self.dli_fname, &st);
+   _mesa_sha1_init(&sha);
+   _mesa_sha1_update(&sha, &magic, sizeof(magic));
+   _mesa_sha1_update(&sha, &st.st_size, sizeof(st.st_size));
+   _mesa_sha1_update(&sha, &st.st_mtime, sizeof(st.st_mtime));
+   _mesa_sha1_update(&sha, entry_point ? entry_point : "", strlen(entry_point ? entry_point : ""));
+   if (options) {
+      const uint32_t flags = (options->partial_constants ? 1 : 0) | (options->library_wrapper ? 2 : 0);
+      _mesa_sha1_update(&sha, &flags, sizeof(flags));
+      _mesa_sha1_update(&sha, &options->num_constants, sizeof(options->num_constants));
+      for (unsigned i = 0; i < options->num_constants; i++) {
+         _mesa_sha1_update(&sha, &options->constants[i].index, sizeof(options->constants[i].index));
+         _mesa_sha1_update(&sha, &options->constants[i].bits, sizeof(options->constants[i].bits));
+         _mesa_sha1_update(&sha, &options->constants[i].bits_hi, sizeof(options->constants[i].bits_hi));
+      }
+   }
+   _mesa_sha1_update(&sha, bitcode, size);
+   _mesa_sha1_final(&sha, key);
+   return true;
+}
+
+static void
+blob_write_text(struct blob *b, const char *text)
+{
+   blob_write_uint8(b, text != NULL);
+   if (text)
+      blob_write_string(b, text);
+}
+
+static const char *
+blob_read_text(struct blob_reader *r, void *mem_ctx)
+{
+   if (!blob_read_uint8(r))
+      return NULL;
+   const char *text = blob_read_string(r);
+   return text ? ralloc_strdup(mem_ctx, text) : NULL;
+}
+
+static void
+air_info_write(struct blob *b, const struct air_shader_info *info)
+{
+   blob_write_bytes(b, info, sizeof(*info));
+   blob_write_text(b, info->entry_point);
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      blob_write_bytes(b, &info->resources[i], sizeof(info->resources[i]));
+      blob_write_text(b, info->resources[i].name);
+      blob_write_text(b, info->resources[i].type_name);
+   }
+   for (unsigned i = 0; i < info->num_varyings; i++) {
+      blob_write_bytes(b, &info->varyings[i], sizeof(info->varyings[i]));
+      blob_write_text(b, info->varyings[i].name);
+   }
+   for (unsigned i = 0; i < info->num_vertex_attributes; i++) {
+      blob_write_bytes(b, &info->vertex_attributes[i], sizeof(info->vertex_attributes[i]));
+      blob_write_text(b, info->vertex_attributes[i].name);
+      blob_write_text(b, info->vertex_attributes[i].type_name);
+      blob_write_text(b, info->vertex_attributes[i].function_constant);
+   }
+   for (unsigned i = 0; i < info->num_notes; i++)
+      blob_write_text(b, info->notes[i]);
+}
+
+static bool
+air_info_read(struct blob_reader *r, void *mem_ctx, struct air_shader_info *info)
+{
+   blob_copy_bytes(r, info, sizeof(*info));
+   if (r->overrun)
+      return false;
+   info->entry_point = blob_read_text(r, mem_ctx);
+   info->resources = info->num_resources ? ralloc_array(mem_ctx, struct air_resource, info->num_resources) : NULL;
+   for (unsigned i = 0; i < info->num_resources && !r->overrun; i++) {
+      blob_copy_bytes(r, &info->resources[i], sizeof(info->resources[i]));
+      info->resources[i].name = blob_read_text(r, mem_ctx);
+      info->resources[i].type_name = blob_read_text(r, mem_ctx);
+   }
+   info->varyings = info->num_varyings ? ralloc_array(mem_ctx, struct air_varying, info->num_varyings) : NULL;
+   for (unsigned i = 0; i < info->num_varyings && !r->overrun; i++) {
+      blob_copy_bytes(r, &info->varyings[i], sizeof(info->varyings[i]));
+      info->varyings[i].name = blob_read_text(r, mem_ctx);
+   }
+   info->vertex_attributes = info->num_vertex_attributes
+      ? ralloc_array(mem_ctx, struct air_vertex_attribute, info->num_vertex_attributes) : NULL;
+   for (unsigned i = 0; i < info->num_vertex_attributes && !r->overrun; i++) {
+      blob_copy_bytes(r, &info->vertex_attributes[i], sizeof(info->vertex_attributes[i]));
+      info->vertex_attributes[i].name = blob_read_text(r, mem_ctx);
+      info->vertex_attributes[i].type_name = blob_read_text(r, mem_ctx);
+      info->vertex_attributes[i].function_constant = blob_read_text(r, mem_ctx);
+   }
+   info->notes = info->num_notes ? ralloc_array(mem_ctx, const char *, info->num_notes) : NULL;
+   for (unsigned i = 0; i < info->num_notes && !r->overrun; i++)
+      info->notes[i] = blob_read_text(r, mem_ctx);
+   return !r->overrun;
+}
+
+static nir_shader *
+air_cache_load(void *mem_ctx, const char *path, const nir_shader_compiler_options *nir_options,
+               struct air_shader_info *info)
+{
+   size_t size = 0;
+   void *bytes = air_cache_read(path, &size);
+   nir_shader *nir = NULL;
+   if (!bytes)
+      return NULL;
+   struct blob_reader r;
+   blob_reader_init(&r, bytes, size);
+   if (blob_read_uint32(&r) == AIR_CACHE_MAGIC && air_info_read(&r, mem_ctx, info)) {
+      nir = nir_deserialize(mem_ctx, nir_options, &r);
+      if (r.overrun && nir) {
+         ralloc_free(nir);
+         nir = NULL;
+      }
+   }
+   free(bytes);
+   return nir;
+}
+
+static void
+air_cache_store(const char *path, const nir_shader *nir, const struct air_shader_info *info)
+{
+   struct blob b;
+   blob_init(&b);
+   blob_write_uint32(&b, AIR_CACHE_MAGIC);
+   air_info_write(&b, info);
+   nir_serialize(&b, nir, false);
+   if (!b.out_of_memory)
+      air_cache_write(path, b.data, b.size);
+   blob_finish(&b);
+}
+
+/* (the bitcode's string table holds names as plain text) */
+static bool
+air_bitcode_names(const void *bitcode, size_t size, const char *name)
+{
+   const size_t n = strlen(name);
+   const char *at = bitcode, *end = at + size;
+   while (at + n <= end && (at = memchr(at, name[0], (size_t)(end - at - (ptrdiff_t)n + 1))) != NULL) {
+      if (memcmp(at, name, n) == 0)
+         return true;
+      at++;
+   }
+   return false;
+}
+
 nir_shader *
 air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_point,
            const struct air_to_nir_options *options,
            const nir_shader_compiler_options *nir_options,
            struct air_shader_info *info, const char **error)
+{
+   uint8_t key[20];
+   char path[256];
+   const bool cached = info && air_cache_key(bitcode, size, entry_point, options, key) &&
+                       air_cache_path(key, "", path, sizeof(path));
+   if (cached) {
+      nir_shader *found = air_cache_load(mem_ctx, path, nir_options, info);
+      if (found)
+         return found;
+   }
+
+   /* (A RESOURCE'S INDEX THAT IS A FUNCTION CONSTANT'S) The first time through learns what the constructor leaves, and
+    * it needs nothing of the body for that: the body is what takes the time (M5e). A module with no such index goes through
+    * once. One whose name was missed in the bitcode is still asked for below. */
+   const bool expected = air_bitcode_names(bitcode, size, "__metal_implicit_attr_int_expr");
+   struct air_attr_table *table = rzalloc(NULL, struct air_attr_table);
+   attr_answers = NULL;
+   attr_learning = table;
+   attr_asked = false;
+   attr_interface_only = expected;
+   nir_shader *nir = translate_module(mem_ctx, bitcode, size, entry_point, options, nir_options, info, error);
+   attr_learning = NULL;
+   attr_interface_only = false;
+   if (nir && (expected || attr_asked)) {
+      ralloc_free(nir);
+      attr_answers = table;
+      nir = translate_module(mem_ctx, bitcode, size, entry_point, options, nir_options, info, error);
+      attr_answers = NULL;
+   }
+   ralloc_free(table);
+   if (cached && nir) {
+      memcpy(info->cache_key, key, sizeof(key));
+      air_cache_store(path, nir, info);
+   }
+   return nir;
+}
+
+static nir_shader *
+translate_module(void *mem_ctx, const void *bitcode, size_t size, const char *entry_point,
+                 const struct air_to_nir_options *options,
+                 const nir_shader_compiler_options *nir_options,
+                 struct air_shader_info *info, const char **error)
 {
    void *ctx = ralloc_context(mem_ctx);
    struct air_shader_info local_info = { 0 };
@@ -3878,6 +5115,11 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    c.nir = nir_shader_create(mem_ctx, stage, nir_options, NULL);
    c.nir->info.name = ralloc_strdup(c.nir, fn->base.name ? fn->base.name : "air");
    c.nir->info.internal = false;
+   /* [[early_fragment_tests]] is one more string in the function's node, after the outputs and
+    * the arguments: !{ptr @f, !outs, !args, !"early_fragment_tests"}. Without it a fragment shader
+    * with a store runs before it is tested after (the rows store-early-tests-*). */
+   if (stage == MESA_SHADER_FRAGMENT && !wrap && md_key(entry, "early_fragment_tests") >= 0)
+      c.nir->info.fs.early_fragment_tests = true;
    c.fns = _mesa_pointer_hash_table_create(ctx);
    nir_function *main = nir_function_create(c.nir, "main");
    main->is_entrypoint = true;
@@ -3947,6 +5189,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
 
    if (!c.error[0])
       plan_globals(&c);
+      c.variables_end = c.scratch_size;
    if (!c.error[0])
       materialise_globals(&c);
    if (!c.error[0])
@@ -3961,8 +5204,10 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
          wrap_library_function(&c, rn && rn->num_ops ? rn->ops[0] : NULL,
                                entry->num_ops > 2 ? entry->ops[2] : NULL);
       }
-      else
+      else if (!attr_interface_only)
          translate_body(&c);
+      else
+         nir_jump(&c.b, nir_jump_return);   /* (what ends the constructor's code, as the body would) */
    }
 
    if (c.error[0]) {
@@ -3979,6 +5224,8 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
     */
    for (unsigned i = 0; i < c.info->num_resources; i++) {
       const struct air_resource *r = &c.info->resources[i];
+      if (r->index == ~0u)   /* (A RESOURCE'S INDEX THAT IS A FUNCTION CONSTANT'S): not in this one */
+         continue;
       switch (r->kind) {
       case AIR_RESOURCE_CONSTANT_BUFFER:
          c.nir->info.num_ubos = MAX2(c.nir->info.num_ubos, r->index + 1);
@@ -4028,6 +5275,8 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       NIR_PASS(_, c.nir, nir_lower_vars_to_ssa);
       NIR_PASS(_, c.nir, nir_opt_dce);
    }
+
+   fold_module_variables(&c);
 
    nir_index_ssa_defs(nir_shader_get_entrypoint(c.nir));
 

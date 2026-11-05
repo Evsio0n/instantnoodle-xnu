@@ -64,6 +64,7 @@
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -265,6 +266,8 @@ struct eagl {
 	int blended;                    /* blending is off for such a draw, to be put back after it */
 	bool no_vibrant;                /* the first of the two could not be made */
 	GLint vibrant_matrix, vibrant_colours, masking_matrix, masking_colours;
+	GLuint edr;                     /* CoreAnimation's EDR step (function 61), in place: see edr_fragment */
+	GLint edr_matrix, edr_numbers;
 	GLbitfield unclear;             /* a glClear put off until the next draw (clear_now()), and what it was to be made with */
 	GLint unclear_box[4];
 	GLfloat unclear_colour[4];
@@ -340,7 +343,15 @@ static int trace_listed;                        /* the draw at hand is one of th
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
-static struct eagl *contexts[8];
+/*
+ * The contexts of this process, under contexts_lock: CoreImage makes them on threads of its own, two at once in Photos
+ * (two HDR gain maps decoded side by side, run 230437) -- a place is taken under the lock before the slow part of
+ * making one, or both threads took the same one and one context was not found again (its -API 0, its
+ * -getMacroContextPrivate NULL: CI::GLContext::init called address 0). A place whose context is still being made has
+ * no object yet and matches none.
+ */
+static struct eagl *contexts[32];
+static pthread_mutex_t contexts_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t slot_calls[SLOTS];
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
@@ -440,12 +451,16 @@ eagl_missing(void *context, unsigned offset)
 static struct eagl *
 context_of(id object)
 {
-	for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+	struct eagl *found = NULL;
+
+	pthread_mutex_lock(&contexts_lock);
+	for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]) && found == NULL; i++) {
 		if (contexts[i] != NULL && contexts[i]->object == object) {
-			return contexts[i];
+			found = contexts[i];
 		}
 	}
-	return NULL;
+	pthread_mutex_unlock(&contexts_lock);
+	return found;
 }
 
 /* ---- what CoreAnimation asks for: kept for the summary ------------------------------------------- */
@@ -718,6 +733,33 @@ surface_to_texture(struct eagl *e, struct image *image)
 			}
 		}
 		base = flipped;
+	}
+	if (planar && IOSurfaceGetPlaneCount(surface) == 2) {
+		/*
+		 * The first planes of two-plane (YCbCr) pictures: their bytes, from the lowest to the highest and on average (a
+		 * sample of each 61st), so that a picture shown without colour (Photos' full-size HDR photo, run 231531, its
+		 * thumbnails in colour) says whether its chroma plane had any (128 for both: none) or the colour was lost after
+		 */
+		static unsigned told;
+
+		if (told < 12) {
+			size_t size = row * (size_t)(image->height - 1) + (size_t)image->width * pixel;
+			unsigned low = 255, high = 0;
+			uint64_t sum = 0, samples = 0;
+
+			for (size_t at = 0; at < size; at += 61) {
+				low = base[at] < low ? base[at] : low;
+				high = base[at] > high ? base[at] : high;
+				sum += base[at];
+				samples++;
+			}
+			told++;
+			say("hk-gl: a two-plane surface %u ('%.4s' %zu x %zu), plane %u (%d x %d, %u a pixel): bytes %u to %u, on "
+			    "average %llu\n", IOSurfaceGetID(surface),
+			    (const char *)&(uint32_t){ __builtin_bswap32((uint32_t)IOSurfaceGetPixelFormat(surface)) },
+			    IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), image->plane, image->width, image->height, pixel,
+			    low, high, (unsigned long long)(samples != 0 ? sum / samples : 0));
+		}
 	}
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
@@ -1877,6 +1919,30 @@ static const char vibrant_fragment[] =
     "  s.rgb = clamp(s.rgb * s.a, 0., 1.);\n"
     "  result = s * layer.a + behind * (1. - s.a * layer.a);\n"
     "}\n";
+/*
+ * CoreAnimation's EDR step (function 61, "edr"; QuartzCore's Metal function edr_scale): the whole picture, in linear
+ * light, times the display's EDR factor -- its second number, 1 / the headroom: [inf 1 0 0] with none, [inf 0.5 0 0]
+ * with CA_DISPLAY_EDR_HEADROOM=2 (run 202252) -- so that SDR's white sits under the panel's peak and what is brighter
+ * than it has room there (backlog item 17). In place, by framebuffer fetch (the picture is the very texture it is
+ * given), through the sRGB curves, with a dither of a quarter of an 8-bit step (QuartzCore's adds noise from a
+ * texture). A factor of 1 changes nothing and is not drawn, as before; boot-arg gledr=0: never drawn.
+ */
+#define FUNCTION_EDR                    61
+static int edr_on = 1;
+static const char edr_fragment[] =
+    "#version 300 es\n"
+    "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+    "uniform highp vec4 numbers;\n"
+    "layout(location = 0) inout highp vec4 result;\n"
+    "highp vec3 to_linear(highp vec3 c) { return mix(c / 12.92, pow((c + .055) / 1.055, vec3(2.4)), step(.04045, c)); }\n"
+    "highp vec3 to_gamma(highp vec3 l) { return mix(l * 12.92, 1.055 * pow(l, vec3(1. / 2.4)) - .055, step(.0031308, l)); }\n"
+    "void main() {\n"
+    "  highp vec4 c = result;\n"
+    "  highp vec3 rgb = clamp(c.rgb / max(c.a, .00001), 0., 1.);\n"
+    "  highp float noise = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - .5;\n"
+    "  rgb = to_gamma(to_linear(rgb) * clamp(numbers.y, 0., 1.)) + noise * (.5 / 255.);\n"
+    "  result = vec4(clamp(rgb, 0., 1.) * c.a, c.a);\n"
+    "}\n";
 static const char masking_fragment[] =
     "#version 300 es\n"
     "uniform lowp sampler2D texture0;\n"
@@ -2364,7 +2430,7 @@ plain_program(const char *fragment, const char *what)
  * count of each since the start.
  */
 enum { CENSUS_NOT_DRAWN, CENSUS_PLAIN, CENSUS_TABLE, CENSUS_VIBRANT, CENSUS_MASKING, CENSUS_BOX, CENSUS_BLUR4, CENSUS_LEVEL,
-       CENSUS_VBLUR, CENSUS_KINDS };
+       CENSUS_VBLUR, CENSUS_EDR, CENSUS_KINDS };
 static const char *const census_kinds[CENSUS_KINDS] = {
 	"NOT DRAWN (no program, and no texture, or nothing of ours to draw it with, or it would read what it writes)", "drawn as the picture it is given (colour times texture)",
 	"drawn through a table (ours, for the home indicator)", "drawn with our program for a colour matrix over what is behind",
@@ -2373,6 +2439,7 @@ static const char *const census_kinds[CENSUS_KINDS] = {
 	"drawn with our program that averages four samples around a point (a shadow's blur)",
 	"made into a level of ours, half the size of the one before (a blur whose radius varies)",
 	"drawn with our program that reads the levels by the mask (a blur whose radius varies)",
+	"drawn with our program that scales the picture in linear light by the display's EDR factor, in place",
 };
 static int census_on;
 static struct census {
@@ -3012,6 +3079,50 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		}
 		return false;
 	}
+	if (function == FUNCTION_EDR && edr_on && fetch_offered && plain_draws != 3 && function_given[function] >= 2 &&
+	    function_values[FUNCTION_EDR][1] > 0 && function_values[FUNCTION_EDR][1] < .999f) {
+		static unsigned edr_said;
+		static float edr_last;
+		float factor = function_values[FUNCTION_EDR][1];
+		GLint good = 0;
+
+		if (e->edr == 0) {
+			e->edr = plain_program(edr_fragment, "the picture times the display's EDR factor");
+			glGetProgramiv(e->edr, GL_LINK_STATUS, &good);
+			if (!good) {
+				edr_on = 0;             /* (a library without the extension: as before, not drawn) */
+			}
+			e->edr_matrix = glGetUniformLocation(e->edr, "vertex_matrix");
+			e->edr_numbers = glGetUniformLocation(e->edr, "numbers");
+		}
+		if (edr_on) {
+			e->blended = 0;
+			/* the first four, then each move of the factor by 0.005 or more (96 lines at most), with the time (the
+			   microseconds of rwtouch's t-mark, over 1000): libEDR ramps it, and where it stops is the headroom the
+			   display was given (run 225450: 0.993 then 0.999 in 50 ms, Photos gone just after) */
+			if (edr_said < 4 || (edr_said < 96 && (factor - edr_last >= .005f || edr_last - factor >= .005f))) {
+				edr_said++;
+				edr_last = factor;
+				say("hk-gl: the EDR step drawn: the picture times %.3f in linear light (at %llu ms)\n",
+				    (double)factor, (unsigned long long)(now_us() / 1000));
+			}
+			census_draw(e, function, CENSUS_EDR);
+			glUseProgram(e->edr);
+			glUniformMatrix4fv(e->edr_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
+			glUniform4fv(e->edr_numbers, 1, function_values[FUNCTION_EDR]);
+			if (glIsEnabled(GL_BLEND)) {
+				e->blended = 1;         /* (it writes the picture over itself: no blending) */
+				glDisable(GL_BLEND);
+			}
+			for (GLuint i = 0; i < 3; i++) {
+				glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
+				if (!enabled[i]) {
+					glEnableVertexAttribArray(i);
+				}
+			}
+			return true;
+		}
+	}
 	/*
 	 * Nor is any other draw with no program that would read the very texture it draws into. The
 	 * window server's snapshots end with one: function 61 ("edr", by its numbers the display's
@@ -3210,6 +3321,27 @@ my_glActiveTexture(void *context, GLenum unit)
 	e->unit = unit - 0x84c0;
 	glActiveTexture(unit);
 	EAGL_LEAVE(e, 0xab8);
+}
+
+/* CoreAnimation's YCbCr-to-RGB matrix (its shaders' ycbcr_matrix, a mat3) arrives here: the first few are written down */
+static void
+my_glUniformMatrix3fv(void *context, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
+{
+	struct eagl *e = context;
+	static unsigned told;
+
+	EAGL_ENTER(e, 0x1360);
+	if (eagl_tracing) {
+		eagl_trace("glUniformMatrix3fv(%d, %d, %d, %p)\n", location, count, transpose, (const void *)value);
+		eagl_trace_floats(value, 9);
+	}
+	if (value != NULL && told++ < 12) {
+		say("hk-gl: glUniformMatrix3fv(%d, %d, %d): [%g %g %g] [%g %g %g] [%g %g %g]\n", location, count, transpose,
+		    (double)value[0], (double)value[1], (double)value[2], (double)value[3], (double)value[4], (double)value[5],
+		    (double)value[6], (double)value[7], (double)value[8]);
+	}
+	glUniformMatrix3fv(location, count, transpose, value);
+	EAGL_LEAVE(e, 0x1360);
 }
 
 static void
@@ -3919,6 +4051,14 @@ my_glCompileShader(void *context, GLuint shader)
 	} else if ((e->shaders <= 2 || all_shaders) && e->sources[shader % 256] != NULL) {
 		say("hk-gl: shader %u:\n", shader);
 		say_long(all_shaders ? "a shader" : "the first shaders, for the record", e->sources[shader % 256]);
+	} else if (e->sources[shader % 256] != NULL && strstr(e->sources[shader % 256], "ycbcr_matrix") != NULL) {
+		static unsigned ycbcr_said;
+
+		/* (the first two of CoreAnimation's YCbCr-to-RGB shaders: run 231531's photo without colour) */
+		if (ycbcr_said++ < 2) {
+			say("hk-gl: shader %u:\n", shader);
+			say_long("a shader that turns YCbCr into RGB", e->sources[shader % 256]);
+		}
 	}
 	EAGL_LEAVE(e, 0x12a8);
 }
@@ -3972,23 +4112,37 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 
 	(void)selector;
 	(void)properties;
+	if (api < 2 || api > 3 || (e = calloc(1, sizeof(*e))) == NULL) {
+		say("hk-gl: no context of API %lu\n", api);
+		return nil;
+	}
+	pthread_mutex_lock(&contexts_lock);
 	for (place = 0; place < sizeof(contexts) / sizeof(contexts[0]) && contexts[place] != NULL; place++) {
 	}
-	if (api < 2 || api > 3 || place == sizeof(contexts) / sizeof(contexts[0]) || (e = calloc(1, sizeof(*e))) == NULL) {
-		say("hk-gl: no context of API %lu\n", api);
+	if (place < sizeof(contexts) / sizeof(contexts[0])) {
+		contexts[place] = e;            /* (taken; no object yet) */
+	}
+	pthread_mutex_unlock(&contexts_lock);
+	if (place == sizeof(contexts) / sizeof(contexts[0])) {
+		say("hk-gl: no context of API %lu: all %zu places taken\n", api, sizeof(contexts) / sizeof(contexts[0]));
+		free(e);
 		return nil;
 	}
 	if ((e->gl = hk_gl_create((int)api)) == NULL || !hk_gl_make_current(e->gl)) {
 		say("hk-gl: %s gives no OpenGL ES %lu context\n", hk_gl_library(), api);
+		pthread_mutex_lock(&contexts_lock);
+		contexts[place] = NULL;
+		pthread_mutex_unlock(&contexts_lock);
 		free(e);
 		return nil;
 	}
 	current = e;
-	e->object = self;
 	e->api = api;
 	e->table[0] = e;
 	eagl_fill_table(e->table);
-	contexts[place] = e;
+	pthread_mutex_lock(&contexts_lock);
+	e->object = self;
+	pthread_mutex_unlock(&contexts_lock);
 	say("hk-gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, hk_gl_library(),
 	    (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
 	    (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
@@ -4169,16 +4323,38 @@ my_dealloc(id self, SEL selector)
 	if (e != NULL) {
 		say("hk-gl: the context goes\n");
 		summary(e);
+		pthread_mutex_lock(&contexts_lock);
 		for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
 			if (contexts[i] == e) {
 				contexts[i] = NULL;
 			}
 		}
+		pthread_mutex_unlock(&contexts_lock);
+		/*
+		 * Outside the window server the Mesa context is kept, not destroyed: CoreImage's release of the EAGLContext it
+		 * made over ours crashed in OSMesaDestroyContext (metal_test ci-eagl and assetsd importing a picture, runs
+		 * 223900 and 224410: a pointer such as 0x?000000000000038 read in Mesa's teardown; made current first or not;
+		 * glClientWaitSync/glDeleteSync on it gave GL_INVALID_VALUE just before -- something it shares is already
+		 * gone). CoreImage makes a few contexts in a process's life, so keeping them costs little; the cause is to be
+		 * found with a Mesa of debug build. backboardd destroys as before.
+		 */
+		static int compositor = -1;
+		static unsigned kept;
+
+		if (compositor < 0) {
+			const char *name = getprogname();
+
+			compositor = name != NULL && strcmp(name, "backboardd") == 0;
+		}
 		if (current == e) {
 			hk_gl_make_current(NULL);
 			current = NULL;
 		}
-		hk_gl_destroy(e->gl);
+		if (compositor) {
+			hk_gl_destroy(e->gl);
+		} else if (kept++ < 8) {
+			say("hk-gl: the context's Mesa context is kept, not destroyed (%u so far)\n", kept);
+		}
 		free(e);
 	}
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
@@ -4256,6 +4432,7 @@ install(void)
 			trace_corners = (GLsizei)strtol(argument + 16, NULL, 10);
 		}
 		fetch_offered = strstr(arguments, "glfetch=0") == NULL;
+		edr_on = strstr(arguments, "gledr=0") == NULL;
 		group_vibrant_on = strstr(arguments, "glgroup=0") == NULL;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
 			char *end = (char *)argument + 14;

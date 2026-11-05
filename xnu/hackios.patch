@@ -79,10 +79,10 @@ index 4b83160780c3..d6bb1edb1aae 100644
  
  #
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..fb8bb8d968e4 100644
+index 44274016a4cf..083c12a3f741 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,53 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,54 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -108,6 +108,7 @@ index 44274016a4cf..fb8bb8d968e4 100644
 +bsd/dev/hk_perfctl.c	standard
 +bsd/dev/hk_sched_check.c	standard
 +bsd/dev/hk_thermal.c	standard
++bsd/dev/hk_hbm.c	standard
 +bsd/dev/hk_power.c	standard
 +bsd/dev/hk_display.c	standard
 +bsd/dev/hk_board.c	standard
@@ -136,7 +137,7 @@ index 44274016a4cf..fb8bb8d968e4 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +202,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +203,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -192,7 +193,7 @@ index 44274016a4cf..fb8bb8d968e4 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +457,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +458,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -200,7 +201,7 @@ index 44274016a4cf..fb8bb8d968e4 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +480,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +481,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -208,7 +209,7 @@ index 44274016a4cf..fb8bb8d968e4 100644
  bsd/kern/kern_event.c			standard
  bsd/kern/kern_control.c			optional networking
  bsd/kern/kern_exec.c			standard
-@@ -594,3 +692,5 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
+@@ -594,3 +693,5 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
  bsd/skywalk/packet/pbufpool.c			optional skywalk
  bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
  bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
@@ -1009,6 +1010,24 @@ index ae4a5f33df1e..986b517dfd18 100644
  	struct uthread *uth;
  
  	target_act = (thread_t)port_name_to_thread(uap->thread_port,
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 9ba4ffbfef03..85918111a642 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2164,10 +2164,10 @@ sysctl_sysctl_bootargs
+ (__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+ {
+ 	int error;
+-	char buf[BOOT_LINE_LENGTH];
++	char buf[BOOT_LINE_LENGTH + 128];   /* (THE BOARD'S DEFAULTS, pe_bootargs.c) */
+ 
+-	strlcpy(buf, PE_boot_args(), BOOT_LINE_LENGTH);
+-	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 0, NULL);
++	strlcpy(buf, PE_boot_args(), sizeof(buf));
++	error = sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
+ 	return error;
+ }
+ 
 diff --git a/bsd/kern/kpi_socket.c b/bsd/kern/kpi_socket.c
 index 003cfb074a99..c597065f24f1 100644
 --- a/bsd/kern/kpi_socket.c
@@ -2294,6 +2313,39 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
+diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
+index 18ef2f02122f..e80a946fcd02 100644
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,9 +62,17 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/*
++ * HackiOS: 64 MB, not Apple's 8. Our drivers map their registers with ml_io_map() directly (TLMM tiles of 1 MB,
++ * GCC, the DSPs, the camera's blocks, the microphones', PCIe), not through IOKit, and all of it comes out of this
++ * submap with KMA_NOFAIL: the sound and the camera together ran it out -- "kmem_alloc(..., 1048576, ...): failed
++ * with 3" from instantnoodle_gpio_cfg() (run 184851, 2026-11-04).
++ */
++#define IO_MAP_SIZE            (64ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
++/* HackiOS: what has been taken of io_submap so far (loader_return.c says it on the way out; ml_io_unmap() not counted) */
++uint64_t io_map_submap_bytes;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
+ KMEM_RANGE_REGISTER_STATIC(io_submap, &io_range, IO_MAP_SIZE);
+ 
+@@ -127,6 +135,9 @@ io_map(
+ 
+ 		kmem_alloc(unmappable ? kernel_map : io_submap,
+ 		    &start, alloc_size, kmaflags, VM_KERN_MEMORY_IOKIT);
++		if (!unmappable) {
++			__atomic_fetch_add(&io_map_submap_bytes, alloc_size, __ATOMIC_RELAXED);
++		}
+ 		pmap_map(start, phys_addr, phys_addr + alloc_size, prot, flags);
+ 	}
+ 	return start + start_offset;
 diff --git a/osfmk/arm/machine_routines.h b/osfmk/arm/machine_routines.h
 index d04ecfa99982..d2bea7dd56ee 100644
 --- a/osfmk/arm/machine_routines.h
@@ -4025,6 +4077,121 @@ index 8b46efb05c86..e161ca426b1a 100644
  extern kern_return_t
  kern_work_interval_set_workload_id(mach_port_name_t port_name,
      struct kern_work_interval_workload_id_args *workload_id_args);
+diff --git a/pexpert/arm/pe_bootargs.c b/pexpert/arm/pe_bootargs.c
+index c6b87b081d2f..25659a54afec 100644
+--- a/pexpert/arm/pe_bootargs.c
++++ b/pexpert/arm/pe_bootargs.c
+@@ -4,9 +4,109 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/boot.h>
+ 
++/*
++ * THE BOARD'S DEFAULTS (the owner, 2026-11-05: 「之前成功的不进内核参数但是默认enable」, 「这些不用加入内核参数因为默认工作，
++ * 直接启用OK吗」). What has been proven on the OnePlus 8 is on with no argument, and arg=0 turns it off. They are added to the one
++ * line everybody reads rather than in each driver: the drivers read it through PE_parse_boot_argn and user space through
++ * kern.bootargs (init.c, inject_media.c, camera_device.c, net_test.m ask it for cam= and wifi=), and this way the two cannot
++ * disagree. An argument that is given wins. Another board has nothing added. The loader's 607 bytes limit what is given, and this
++ * line may be longer (kern_sysctl.c's copy is as long as this).
++ *
++ * Wi-Fi with the phone's own board data, the audio DSP, iOS's sound through it with the amplifiers allowed, the vibration
++ * motor, the cameras for iOS. Touch is on by itself (instantnoodle_touch.c). Not here: anything not yet proven.
++ */
++#define HK_BOARD_DEFAULTS "wifi=1 wifi_bdf_native=1 adsp=1 sound=4 sound_amps=1 haptic=5 cam=5 cam_after=10"
++#define HK_BOARD_LINE     (BOOT_LINE_LENGTH + 128)
++
++static char hk_board_line[HK_BOARD_LINE];
++static bool hk_board_line_made;
++
++/* `word` (of `length` bytes, up to its '=') as the name of an argument in `line` */
++static bool
++hk_line_names(const char *line, const char *word, unsigned length)
++{
++	for (const char *at = line; *at != 0;) {
++		unsigned same = 0;
++
++		while (same < length && at[same] == word[same] && at[same] != 0) {
++			same++;
++		}
++		if (same == length && (at[same] == '=' || at[same] == ' ' || at[same] == 0)) {
++			return true;
++		}
++		while (*at != 0 && *at != ' ') {
++			at++;
++		}
++		while (*at == ' ') {
++			at++;
++		}
++	}
++	return false;
++}
++
++/* board=instantnoodle among them */
++static bool
++hk_line_names_board(const char *line)
++{
++	static const char board[] = "board=instantnoodle";
++
++	for (const char *at = line; *at != 0;) {
++		unsigned same = 0;
++
++		while (board[same] != 0 && at[same] == board[same]) {
++			same++;
++		}
++		if (board[same] == 0 && (at[same] == ' ' || at[same] == 0)) {
++			return true;
++		}
++		while (*at != 0 && *at != ' ') {
++			at++;
++		}
++		while (*at == ' ') {
++			at++;
++		}
++	}
++	return false;
++}
++
+ char *
+ PE_boot_args(
+ 	void)
+ {
+-	return (char *)((boot_args *)PE_state.bootArgs)->CommandLine;
++	char *given = (char *)((boot_args *)PE_state.bootArgs)->CommandLine;
++
++	if (!hk_board_line_made) {
++		static const char defaults[] = HK_BOARD_DEFAULTS;
++		unsigned used = 0;
++
++		for (; given[used] != 0 && used < BOOT_LINE_LENGTH - 1; used++) {
++			hk_board_line[used] = given[used];
++		}
++		hk_board_line[used] = 0;
++		if (hk_line_names_board(given)) {
++			for (const char *word = defaults; *word != 0;) {
++				unsigned name = 0, all = 0;
++
++				while (word[name] != 0 && word[name] != '=') {
++					name++;
++				}
++				while (word[all] != 0 && word[all] != ' ') {
++					all++;
++				}
++				if (!hk_line_names(given, word, name) && used + all + 2 < HK_BOARD_LINE) {
++					hk_board_line[used++] = ' ';
++					for (unsigned i = 0; i < all; i++) {
++						hk_board_line[used++] = word[i];
++					}
++					hk_board_line[used] = 0;
++				}
++				word += all;
++				while (*word == ' ') {
++					word++;
++				}
++			}
++		}
++		hk_board_line_made = true;
++	}
++	return hk_board_line;
+ }
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index 3ad743fc3efb..ce036c5a2c26 100644
 --- a/pexpert/arm/pe_fiq.c

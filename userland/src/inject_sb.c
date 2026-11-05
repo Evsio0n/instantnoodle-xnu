@@ -38,6 +38,7 @@
 #include <CoreGraphics/CGGeometry.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
@@ -1125,6 +1126,79 @@ web_views(id view, int depth)
 	}
 }
 
+/*
+ * com.hackios.photos.import: every file in PHOTOS_IMPORT put into the photo library the way an application adds a
+ * picture (PhotoKit, from SpringBoard, which may: its screenshots go there), for tests that need pictures in Photos --
+ * a file left in DCIM is not imported (run 205635). First use: the owner's HDR photos for backlog item 17, in a RAM
+ * test only: the files come from our image, the library they go into is a RAM run's. Only with boot-arg
+ * photos_import=1. Each file's result is said by number, not by name (the owner's photos).
+ */
+#define PHOTOS_IMPORT   "/hackios/import"
+
+static void
+photos_import(void)
+{
+	Class library, request, url;
+	DIR *dir;
+	struct dirent *entry;
+
+	dlopen("/System/Library/Frameworks/Photos.framework/Photos", RTLD_NOW);
+	library = objc_getClass("PHPhotoLibrary");
+	request = objc_getClass("PHAssetCreationRequest");
+	url = objc_getClass("NSURL");
+	if (library == NULL || request == NULL || url == NULL || (dir = opendir(PHOTOS_IMPORT)) == NULL) {
+		say("redwood: photos: nothing to import (%s)\n", library == NULL || request == NULL ? "no PhotoKit" : PHOTOS_IMPORT);
+		return;
+	}
+	while ((entry = readdir(dir)) != NULL) {
+		char path[512], *name;
+		CFStringRef text;
+		id file, photos;
+
+		if (entry->d_name[0] == '.') {
+			continue;
+		}
+		snprintf(path, sizeof(path), PHOTOS_IMPORT "/%s", entry->d_name);
+		name = malloc(16);
+		if (name != NULL) {
+			static unsigned files;
+
+			snprintf(name, 16, "file %u", ++files);
+		}
+		text = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
+		file = ((id (*)(Class, SEL, CFStringRef))objc_msgSend)(url, sel_registerName("fileURLWithPath:"), text);
+		CFRelease(text);
+		if (file == NULL || name == NULL) {
+			free(name);
+			continue;
+		}
+		CFRetain((CFTypeRef)file);              /* (the blocks run later, on PhotoKit's queue) */
+		photos = ((id (*)(Class, SEL))objc_msgSend)(library, sel_registerName("sharedPhotoLibrary"));
+		((void (*)(id, SEL, void (^)(void), void (^)(BOOL, id)))objc_msgSend)(photos,
+		    sel_registerName("performChanges:completionHandler:"), ^{
+			id made = ((id (*)(Class, SEL))objc_msgSend)(request, sel_registerName("creationRequestForAsset"));
+
+			/* (PHAssetResourceTypePhoto = 1) */
+			((void (*)(id, SEL, long, id, id))objc_msgSend)(made, sel_registerName("addResourceWithType:fileURL:options:"),
+			    1L, file, NULL);
+		}, ^(BOOL ok, id error) {
+			char why[256] = "";
+
+			if (!ok && error != NULL) {
+				CFStringRef d = (CFStringRef)((id (*)(id, SEL))objc_msgSend)(error, sel_registerName("description"));
+
+				if (d != NULL) {
+					CFStringGetCString(d, why, sizeof(why), kCFStringEncodingUTF8);
+				}
+			}
+			say("redwood: photos: %s %s%s%s\n", name, ok ? "imported" : "NOT imported", why[0] ? ": " : "", why);
+			CFRelease((CFTypeRef)file);
+			free(name);
+		});
+	}
+	closedir(dir);
+}
+
 static void
 layers(void)
 {
@@ -1490,7 +1564,7 @@ ca_fps_start(void)
 /* ---- the status bar's clock, clear of a camera hole -------------------------------------------- */
 
 /*
- * Boot-arg sb_clock=N (points of the 375 x 812 the display reports; default 0, off): the status bar's left
+ * Boot-arg sb_clock=N (points of the 375 x 812 the display reports; default 0, off; 28 with board=instantnoodle): the status bar's left
  * region -- on the iPhone X, which iOS takes this phone for, only the clock is in it -- is centred N points
  * further right, so that the camera hole in the OnePlus 8's top left corner (instantnoodle.conf) does not
  * cover the clock. iOS itself lays the status bar out that way: the clock is where UIKit puts it, and it
@@ -1518,11 +1592,17 @@ statusbar_clock(void)
 	size_t size = sizeof(args) - 1;
 	const char *arg;
 
-	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (arg = strstr(args, "sb_clock=")) == NULL ||
-	    (arg != args && arg[-1] != ' ')) {
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
 		return;
 	}
-	sb_clock = atof(arg + 9);
+	if ((arg = strstr(args, "sb_clock=")) != NULL && (arg == args || arg[-1] == ' ')) {
+		sb_clock = atof(arg + 9);
+	} else if ((arg = strstr(args, "board=instantnoodle")) != NULL && (arg == args || arg[-1] == ' ') &&
+	    (arg[19] == 0 || arg[19] == ' ')) {
+		sb_clock = 28;          /* the OnePlus 8's camera hole: the owner's choice (2026-11-04), a default of the board's */
+	} else {
+		return;
+	}
 	if (sb_clock <= 0 || sb_clock > 100) {
 		return;
 	}
@@ -1709,6 +1789,17 @@ hk_springboard_init(void)
 	notify_register_dispatch("com.hackios.switcher", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		switcher();
 	});
+	{
+		/* only with photos_import=1 among the kernel's arguments: a test's (any program may post the notification) */
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "photos_import=1") != NULL) {
+			notify_register_dispatch("com.hackios.photos.import", &token, dispatch_get_main_queue(), ^(__unused int t) {
+				photos_import();
+			});
+		}
+	}
 	/* com.hackios.brightness.NN: the brightness set to NN per cent as Settings sets it (BackBoardServices, in a program
 	   backboardd listens to), for tests (tools/t brightness); the name carries the number because a notification has none */
 	{

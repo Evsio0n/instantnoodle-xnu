@@ -194,6 +194,19 @@ struct rwa_texture *rwd_texture_for_surface(struct rwa_device *mesa_device, void
  * decides whether a drawable can exist in this boot. Said once, by the first caller. */
 int rwd_import_available(void);
 
+/*
+ * WHICH compiler library the import call is looked up in: the one the caller dlopened and
+ * made `mesa_device` with. src/hkmetal.m passes its handle, which is libhackiosair.dylib
+ * (Metal over Gallium) or libvulkan_freedreno.dylib (Metal over Vulkan, metal_backend=vk or
+ * HK_METAL_BACKEND=vk); both export rwa_texture_from_surface under the same name, and a
+ * device of one handed to the other's import would be read as the wrong structure. Without
+ * this call the lookup is what it always was, libhackiosair.dylib if this process has it
+ * loaded (RTLD_NOLOAD), which is the same handle Gallium's driver passes here -- so on
+ * Gallium nothing changes. Call it before the first import; a later call is ignored, since
+ * the lookup is made once.
+ */
+void rwd_use_library(void *handle);
+
 #ifdef __cplusplus
 }
 #endif

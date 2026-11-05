@@ -529,6 +529,31 @@ fb_install(const uint8_t *data, uint64_t len)
 	return NULL;
 }
 
+/* the SHA-256 of a whole partition in hex (the first 16 digits are what `oem flashpart` checks); NULL or why not */
+static const char *
+fb_part_sha(efi_block_io *bio, char hex[65])
+{
+	struct sha256 h;
+	uint8_t sum[32];
+	uint64_t bs = bio->media->block_size, size = (bio->media->last_block + 1) * bs;
+
+	sha256_init(&h);
+	for (uint64_t at = 0; at < size; at += sizeof(ufs_buffer)) {
+		uint64_t n = size - at < sizeof(ufs_buffer) ? size - at : sizeof(ufs_buffer);
+		if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, at / bs, n, ufs_buffer))) {
+			return "read error";
+		}
+		sha256_add(&h, ufs_buffer, n);
+	}
+	sha256_end(&h, sum);
+	for (int i = 0; i < 32; i++) {
+		hex[2 * i] = "0123456789abcdef"[sum[i] >> 4];
+		hex[2 * i + 1] = "0123456789abcdef"[sum[i] & 15];
+	}
+	hex[64] = 0;
+	return NULL;
+}
+
 /*
  * A boot image into boot_a or boot_b, from the loader -- the stock bootloader's fastboot does the same, but
  * reaching it means a reset, after which it does not come back on USB with the cable in. Only a boot image
@@ -540,9 +565,8 @@ static const char *
 fb_flash_boot(const char *name, const char *want_hex, const uint8_t *img, uint64_t len)
 {
 	efi_block_io *bio = part_bio(name);
-	struct sha256 h;
-	uint8_t sum[32];
-	char hex[17];
+	const char *why;
+	char hex[65];
 	uint64_t bs, size;
 
 	if (bio == NULL) {
@@ -553,18 +577,8 @@ fb_flash_boot(const char *name, const char *want_hex, const uint8_t *img, uint64
 	if (len < 4096 || memcmp(img, "ANDROID!", 8) != 0 || len > size) {
 		return "not a boot image that fits";
 	}
-	sha256_init(&h);
-	for (uint64_t at = 0; at < size; at += sizeof(ufs_buffer)) {
-		uint64_t n = size - at < sizeof(ufs_buffer) ? size - at : sizeof(ufs_buffer);
-		if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, at / bs, n, ufs_buffer))) {
-			return "read error";
-		}
-		sha256_add(&h, ufs_buffer, n);
-	}
-	sha256_end(&h, sum);
-	for (int i = 0; i < 8; i++) {
-		hex[2 * i] = "0123456789abcdef"[sum[i] >> 4];
-		hex[2 * i + 1] = "0123456789abcdef"[sum[i] & 15];
+	if ((why = fb_part_sha(bio, hex)) != NULL) {
+		return why;
 	}
 	hex[16] = 0;
 	print("flash: %s now: sha256 %s...\n", name, hex);
@@ -953,6 +967,8 @@ fb_boot(int s)
 		struct payload_info pi;
 		int timed = 0;
 
+		print("time: %d ms since power-on: the bundle read and checked\n", ms_since_power_on());
+
 		/* a test bundle (loader_return_after= on its command line): after it, the USB link, not a reset */
 		parse_payload(&pi, 0);
 		for (const char *c = pi.cmdline; *c; c++) {
@@ -973,14 +989,25 @@ fb_boot(int s)
 	fb.ok[s] = 0;
 }
 
-/* The boot of an installed device: the menu, then what was chosen. Does not return. */
+/*
+ * The boot of an installed device: the menu, then what was chosen. Does not return.
+ * The screen has the menu and a line on what was started, not the log of the boot (the slots' scan, the
+ * bundle's checks, the kernel's device tree: some 300 lines, each drawn by the firmware's text console with a
+ * scroll of the whole 1080x2400 screen -- the slow boot from the flash, the owner 2026-11-04); the log is kept
+ * as ever (logdump: xl lastlog), with the time since power-on at each step.
+ */
 static void
 fb_standalone(void)
 {
 	int have[MENU_ITEMS] = { 0, 0, 0, 1 };
+	int quiet = GOP != NULL;                /* (a screen: QEMU's serial console has the log as before) */
 
+	screen_flush();
+	screen_quiet = quiet;
 	fb_scan();
 	fb_offmode();
+	print("time: %d ms since power-on: the menu\n", ms_since_power_on());
+	screen_quiet = 0;
 	have[MENU_ANDROID] = !PLAT->no_android && ab_available();
 	/* the phone's own modes, by the reason in its PMIC (reboot_to()): never the countdown's choice */
 	have[MENU_RECOVERY] = have[MENU_BOOTLOADER] = have[MENU_POWER_OFF] = PLAT == &platform_instantnoodle;
@@ -1006,7 +1033,15 @@ fb_standalone(void)
 		choice = fb_menu(have, dflt, &by_hand);
 		print("menu: %s%s\n", menu_names[choice], by_hand ? "" : " (countdown)");
 		if (choice == MENU_HACKIOS || choice == MENU_PREVIOUS) {
-			fb_boot(choice == MENU_HACKIOS ? fb.newest : fb.older);
+			int s = choice == MENU_HACKIOS ? fb.newest : fb.older;
+
+			print("  starting %s\n", fb.hdr[s].label);
+			screen_flush();
+			screen_quiet = quiet;
+			print("time: %d ms since power-on: %s chosen\n", ms_since_power_on(), menu_names[choice]);
+			fb_boot(s);
+			screen_quiet = 0;               /* (it came back: the bundle did not load) */
+			print("  %s did not start (xl lastlog says why)\n", fb.hdr[s].label);
 		} else if (choice == MENU_ANDROID) {
 			if (fb.bio != NULL && !(fb.st.flags & FB_LAST_ANDROID)) {
 				fb.st.flags |= FB_LAST_ANDROID;         /* (before the switch: a write to darwin after it is never needed) */

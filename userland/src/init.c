@@ -1244,6 +1244,27 @@ camera_answers(void)
 	    "the camera stamp (no MobileGestalt cache to move)");
 }
 
+/*
+ * The clock set over the network (backlog item 6, 2026-11-04): timed fetches NTP from time.apple.com only with
+ * TMAutomaticTimeEnabled in /private/var/db/timed/com.apple.timed.plist -- what Setup Assistant turns on, which this
+ * system skips: without it Settings had no "Set Automatically" and the clock stayed seconds behind (the PMIC's
+ * clock counts whole seconds). A new volume gets the file from the skeleton (userland/var/db/timed/); a kept one, made
+ * before, gets it once, only when it has none (whatever timed or the user wrote stays).
+ */
+#define TIMED_PREFS     "/private/var/db/timed/com.apple.timed.plist"
+
+static void
+timed_prefs(void)
+{
+	struct stat st;
+
+	if (data_volume != 1 || stat(TIMED_PREFS, &st) == 0 || stat(in_image("/var/db/timed/com.apple.timed.plist"), &st) != 0) {
+		return;
+	}
+	check(copy_file(in_image("/var/db/timed/com.apple.timed.plist"), TIMED_PREFS, 0644, 266, 266),
+	    "timed's \"Set Automatically\" on a kept data volume (" TIMED_PREFS ")");
+}
+
 static int
 count_entries(const char *path)
 {
@@ -1687,6 +1708,7 @@ main(int argc, char **argv, char **envp)
 	mount_writable();
 	restore_var();
 	camera_answers();
+	timed_prefs();
 	test_files();
 	test_writable();
 	test_memory();

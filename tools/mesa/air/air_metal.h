@@ -94,6 +94,37 @@ struct rwa_compute *rwa_compute_create(struct rwa_device *device, const void *bi
 void rwa_compute_destroy(struct rwa_compute *compute);
 
 /*
+ * M5c: FUNCTION CONSTANTS, the application's. One value, as the bits of its type: a memcpy of it,
+ * component i of a vector at bit i * width, the second word for what passes 64 bits (a float4).
+ */
+struct rwa_function_constant {
+	unsigned index;
+	uint64_t bits;
+	uint64_t bits_hi;
+};
+
+/* rwa_compute_create with the values MTLFunctionConstantValues gave (rwa_render_shape has the
+ * render stages' own): what is not on the list is not defined. */
+struct rwa_compute *rwa_compute_create_constants(struct rwa_device *device, const void *bitcode,
+						 size_t size, const char *entry,
+						 const struct rwa_function_constant *constants,
+						 unsigned constant_count,
+						 struct rwa_compute_info *info, char *why,
+						 size_t why_size);
+
+/* What a module declares, which is what turns -setConstantValue:type:withName: into an index and
+ * a required constant left out into a refusal. Returns 0 and fills `out`, or -1 and a sentence. */
+struct rwa_function_constant_decl {
+	unsigned index;
+	unsigned required;
+	char type[24];
+	char name[72];
+};
+int rwa_module_function_constants(struct rwa_device *device, const void *bitcode, size_t size,
+				  struct rwa_function_constant_decl *out, unsigned max,
+				  unsigned *count, char *why, size_t why_size);
+
+/*
  * A texture. The shape comes from Metal's own descriptor, in Metal's own terms, because that
  * is what a driver has in its hand when newTextureWithDescriptor: is called; translating it
  * into Gallium's terms is this library's job, and a format it cannot translate must be
@@ -139,6 +170,50 @@ struct rwa_texture *rwa_texture_create(struct rwa_device *device,
 				       const struct rwa_texture_shape *shape,
 				       char *why, size_t why_size);
 void rwa_texture_destroy(struct rwa_texture *texture);
+
+/*
+ * A TEXTURE VIEW (M5b): -newTextureViewWithPixelFormat:, and its textureType:levels:slices: and
+ * swizzle: forms, which is a second texture over the first one's memory.
+ *
+ * What the view says, in Metal's words: another format of the same texel size, another type of
+ * the same family, a window of levels and slices of the parent, and which source channel each of
+ * the view's four reads. All four fields of `swizzle` are MTLTextureSwizzle (Zero 0, One 1, Red 2,
+ * Green 3, Blue 4, Alpha 5), and all four ZERO is read as the identity: a struct filled in only as
+ * far as its caller cared about would otherwise be a view that reads nothing, and a view of four
+ * zeros is not something anything asks for.
+ *
+ * `level_count` and `slice_count` of 0 are read as "to the end of the parent". The view numbers its
+ * own levels and slices from 0, as Metal's does, so level 0 of a view of level 2 of a parent is that
+ * parent's level 2, in every call that takes a texture: rwa_texture_read and _write, the blits, the
+ * clears, rwa_render_draw's attachments and a shader's binding.
+ *
+ * rwa_texture_destroy destroys one. Either of the two may go first: the memory goes with the last,
+ * which Metal's own object model promises too (a view retains its parent) and which this library
+ * keeps whether a driver does or not.
+ *
+ * ONE MORE CALL THROUGH IT: a window of ONE level and ONE slice is how a driver says "this level
+ * and this slice" to a call that takes no level and no slice -- rwa_clear_color and
+ * rwa_clear_depth_stencil, which clear the base level of what they are given, and
+ * rwa_resolve_texture. And for a pass's clear of one depth plane of a 3D texture, `type`
+ * MTLTextureType2D with a one-slice window on a 3D parent is a view of that plane, which Metal has
+ * no name for and a pass has (depthPlane); it is allowed on a parent made a render target and on
+ * nothing else.
+ *
+ * A NEW SYMBOL, the one this milestone adds. The Gallium library has no such call and a driver's
+ * dlsym finds none there, which is how hkmetal.m tells: a view is nil on that back end, as it has
+ * always been, and says so.
+ */
+struct rwa_texture_view_shape {
+	unsigned pixel_format;     /* MTLPixelFormat, or the parent's own */
+	unsigned type;             /* MTLTextureType */
+	unsigned base_level, level_count;
+	unsigned base_slice, slice_count;
+	unsigned swizzle[4];       /* MTLTextureSwizzle, for red, green, blue, alpha */
+};
+
+struct rwa_texture *rwa_texture_view_create(struct rwa_texture *parent,
+					    const struct rwa_texture_view_shape *shape,
+					    char *why, size_t why_size);
 
 /*
  * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
@@ -233,6 +308,8 @@ int rwa_generate_mipmaps(struct rwa_texture *texture, char *why, size_t why_size
  * What a render pass does besides its draws: its clear when it draws nothing (a pass with
  * draws clears in the first of them, rwa_draw.clear_color), and its multisample resolve at
  * the end (MTLStoreActionMultisampleResolve, resolveTexture). Level 0, every slice of it.
+ * [M5b: level 0 of what they are given, and a view of one level and one slice is how another
+ * one is said (rwa_texture_view_create).]
  *   rwa_clear_color          MTLLoadActionClear of a colour attachment: rgba as Metal's
  *                            clearColor, converted for an integer format as Metal does
  *   rwa_clear_depth_stencil  either aspect, NULL for one that keeps its contents
@@ -364,6 +441,24 @@ struct rwa_sampler_state {
 	unsigned max_anisotropy;
 	unsigned normalized_coordinates;   /* 0: in pixels, as Metal's unnormalized sampler */
 	float lod_min, lod_max;
+	/*
+	 * M5b: MTLSamplerDescriptor.borderColor, MTLSamplerBorderColor: TransparentBlack 0,
+	 * OpaqueBlack 1, OpaqueWhite 2. What MTLSamplerAddressModeClampToBorderColor reads, and
+	 * nothing else does: clamp_to_zero's value is its own, transparent black where the format
+	 * has an alpha and opaque black where it has none (Apple's MTLSampler.h, in those words).
+	 * Zero is Metal's own default, so a caller filled in only as far as it cared about is
+	 * what a fresh descriptor means.
+	 *
+	 * APPENDED, as M5a's fields of rwa_draw were: air_metal.c was built against the shorter
+	 * struct and reads none of this, so what it samples does not change -- its border is
+	 * transparent black always, which it says at sampler_state_from_metal. hkmetal.m fills it
+	 * on both back ends and says once when the Gallium one is asked for another. The other
+	 * two properties of the descriptor have no field and need none: lodAverage is "a
+	 * performance hint. An implementation is free to ignore this property" in Apple's header,
+	 * and this one does; and it has no LOD bias, which Metal puts in the shader (bias(x)) and
+	 * so reaches both back ends through the module.
+	 */
+	unsigned border_color;
 };
 
 struct rwa_sampler *rwa_sampler_create(struct rwa_device *device,
@@ -930,6 +1025,21 @@ struct rwa_render_shape {
 	 */
 	struct rwa_color_blend color_blend[8];
 	unsigned color_blend_count;
+
+	/*
+	 * M5c, appended: what MTLFunctionConstantValues said of each stage, for the pipeline to
+	 * specialize with. `_given` of 0 is what every caller before this means: no values at
+	 * all, every constant is taken as defined and zero. Otherwise the list is what the
+	 * application set: a constant not on it is not defined, which a shader may ask. A library
+	 * older than this reads the fields above only: hkmetal.m looks rwa_module_function_constants
+	 * up, and has no specialized function on a library without it.
+	 */
+	const struct rwa_function_constant *vertex_constants;
+	const struct rwa_function_constant *fragment_constants;
+	unsigned vertex_constant_count;
+	unsigned fragment_constant_count;
+	unsigned vertex_constants_given;
+	unsigned fragment_constants_given;
 };
 
 /*
@@ -1379,6 +1489,80 @@ struct rwa_draw {
 	unsigned vertex_buffer_table_count;
 	const struct rwa_buffer_bind *fragment_buffer_table;
 	unsigned fragment_buffer_table_count;
+
+	/*
+	 * M5a: THE ENCODER'S OWN STATE, which until now went nowhere: hkmetal.m's setters for
+	 * these were stubs and this struct had no field for them, so a culled draw, a
+	 * viewport with an origin and a scissored draw all came back as the whole unculled
+	 * attachment -- a picture, wrong in a way nothing could report. Every one of them is
+	 * Metal's own number, and a zeroed or NULL field is Metal's own default, so a caller
+	 * filled in only as far as it cared about is exactly what -drawPrimitives: on a fresh
+	 * encoder means:
+	 *
+	 *   `blend_color`     -setBlendColorRed:green:blue:alpha:. NULL is (0, 0, 0, 0).
+	 *   `cull_mode`       MTLCullMode: None 0, Front 1, Back 2.
+	 *   `front_winding`   MTLWinding: Clockwise 0 (Metal's default), CounterClockwise 1,
+	 *                     as it is seen on the attachment, row 0 on top.
+	 *   `viewport`        { originX, originY, width, height } of -setViewport:, in pixels
+	 *                     from the attachment's top left. NULL is the whole attachment.
+	 *                     Its z half stays `depth_range` above, where it always was.
+	 *   `scissor`         { x, y, width, height } of -setScissorRect:. NULL is the whole
+	 *                     attachment, which is Metal's default whatever the viewport is.
+	 *   `color_clears`    per attachment, the clear colour Metal keeps per attachment, and
+	 *   `color_clear_mask` which of them clear: bit i set is MTLLoadActionClear on
+	 *                     attachment i with color_clears[i], clear is keep. With
+	 *                     `color_clears` NULL the one `clear_color` above applies to every
+	 *                     attachment, as it always has, which is why a pass whose
+	 *                     attachments clear differently could not be said at all.
+	 *
+	 * APPENDED, for the reason every other field down here was, and the Gallium library
+	 * (air_metal.c) reads NONE of these: it was built against the shorter struct and sees
+	 * only that prefix, so what it draws does not change. air_vk.c (M5a) honours them
+	 * all. hkmetal.m fills them on both back ends and still fills `clear_color`, so one
+	 * driver binary tells each library what that library understands.
+	 *
+	 * What Metal's encoder has and this still does not carry, because Gallium has none of
+	 * it and so there is no reference to compare a picture with: -setDepthBias:, the clamp
+	 * half of -setDepthClipMode:, -setTriangleFillMode: and the indirect draws
+	 * (air_vk.c's M5a section lists them). Primitive restart needs no field: Metal has it
+	 * always on for the two strip types and off for the rest, so the primitive type says.
+	 * [That sentence corrects the paragraph above: air_vk.c follows Metal here, and
+	 * air_metal.c still draws 0xFFFF as an ordinary index, which it says in its own words.]
+	 */
+	const float *blend_color;
+	unsigned cull_mode;
+	unsigned front_winding;
+	const float *viewport;
+	const unsigned *scissor;
+	const float (*color_clears)[4];
+	unsigned color_clear_mask;
+
+	/*
+	 * M5b: WHERE IN EACH ATTACHMENT, which MTLRenderPassAttachmentDescriptor has always said
+	 * (level, slice, depthPlane) and this struct had no field for, so a pass into level 1 of a
+	 * texture drew into level 0 and read as a result.
+	 *
+	 *   `color_level`, `color_slice`  NULL, or one entry per colour attachment. A slice is
+	 *                                 Metal's slice: a face of a cube (6 * cube + face of a
+	 *                                 cube array), or a depth plane of a 3D texture, of which
+	 *                                 Metal has a field of its own and which is one number here
+	 *                                 because the type says which it is
+	 *   `depth_level`, `depth_slice`  the same of the depth/stencil attachment
+	 *
+	 * NULL and zero are level 0 and slice 0, which is Metal's default and everything a caller
+	 * before this field meant.
+	 *
+	 * APPENDED, for the reason every field down here was, and the Gallium library reads NONE of
+	 * these: its attachment is a whole 2D texture (attachment_shape_fits), at level 0 and slice
+	 * 0 whatever this says. hkmetal.m fills them on both back ends and says once when the
+	 * Gallium one is given another. Layered rendering, [[render_target_array_index]] over
+	 * renderTargetArrayLength, is not here: nothing in either back end reads it, and the
+	 * driver says so.
+	 */
+	const unsigned *color_level;
+	const unsigned *color_slice;
+	unsigned depth_level;
+	unsigned depth_slice;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,

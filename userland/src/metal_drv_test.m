@@ -40,6 +40,33 @@
  * With --time [REPEATS] it measures what all of that COSTS -- a compile, a draw at the
  * panel's own size, a texture, a command buffer, a frame on the screen -- which no mode
  * above it has ever done. See time_path below; RC_JOBS=rc.jobs.metalperf runs it.
+ *
+ * With --draw-msaa [N] it draws one pass of N samples and reads back its resolve (M3c-3,
+ * msaa_path, the msaa-result line); with --draw-one NAME it is --draw-all over the one
+ * fragment function of that name (the drawall-result line).
+ *
+ * A FUNCTION dispatched ends in a compute-result line (M3d, compute_dispatch), and with
+ * --compute-all [FROM COUNT] every kernel of the library is dispatched that way in one
+ * process (compute_every), with a compute-summary line; both join on the kernel's name
+ * across --backend gallium and --backend vk.
+ *
+ * M4 (TODO T38 (12)): what Metal COSTS on each back end, in "drvtest: cost ..." lines (the
+ * section WHAT A WORKLOAD COSTS below says what is in one and how it is measured). --time
+ * ends in one for the whole mode (W1); --draw-all and --compute-all with --quiet print no
+ * per-shader line, only their summaries and one (W2, W3); --frames N owned|surface draws N
+ * frames of one full-screen draw each into a 1080x2400 BGRA8 target, a texture of the
+ * driver's own or an IOSurface made here, and prints the per-frame median and p90 (W4,
+ * frames_path). --vk-noseen sets AIR_VK_NOSEEN=1 before Metal starts (air_vk.c then does
+ * not map an imported surface once, so the kernel does not clean it at every submission).
+ *
+ * With --burst [N] (M4-1) it commits N empty command buffers and N small ones without waiting
+ * for any, releasing what the small ones used right after each -commit, and then checks a
+ * pixel of real work: the shape of run 071937's GPU faults, in a few seconds (burst_test, the
+ * burst-result line). Every mode ends in "drvtest: exit BACKEND pending-pairs N in-flight M".
+ *
+ * With --order [METALLIB] (M4-1, the cost part) it checks the orders Metal promises around
+ * -replaceRegion:, -getBytes: and a destroy, which air_vk.c no longer buys with a wait at each of
+ * them (order_test, the order-result line).
  */
 
 #import <Foundation/Foundation.h>
@@ -47,10 +74,19 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <IOKit/IOKitLib.h>
+/* --frames N surface (M4, W4) draws into an IOSurface this program makes itself; linked
+ * with -framework IOSurface -framework CoreFoundation */
+#include <IOSurface/IOSurfaceRef.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <sys/ucontext.h>
+#include <sys/sysctl.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -58,6 +94,13 @@
 #include <string.h>
 #include <time.h>
 #include <mach/mach_time.h>
+#include <stdatomic.h>
+/* what every --pixels case must have drawn (M5a): the same model air_metal_test --pixels has */
+#include "../../tools/mesa/air/draw_model.h"
+#include "../../tools/mesa/air/tex_model.h"
+#include "../../tools/mesa/air/adreno_srgb.h"
+static int ca_fill(id<MTLDevice> dev);   /* --ca-fill, at the end of this file */
+#include "../../tools/air/m5c_rows.h"   /* --m5c, the same rows real Metal runs (tools/air/mtlref) */
 
 #define MTL_CREATE_DEVICE_UNSLID 0x181a34b3cUL
 #define MTL_ADD_DEVICE_UNSLID    0x181a1875cUL
@@ -133,6 +176,1017 @@ argbuf_records(id<MTLBuffer> buffer, size_t offset)
 	return b != NULL ? rwa_argbuf_encoded_members(b, offset) : 0;
 }
 
+/*
+ * WHICH compiler library the driver loaded, by the driver's own rule (hkmetal.m,
+ * mesa_available): HK_METAL_BACKEND=vk|gallium in the environment, else the boot-arg
+ * metal_backend=vk, else Gallium's. The two libraries implement one contract under the same
+ * rwa_* names, and the `struct rwa_device` -mesaDevice hands out belongs to exactly one of
+ * them: asking the other library about it would read a Vulkan device as a Gallium screen.
+ * So the query below must open the library the driver opened, and it opens it by this same
+ * rule rather than by a fixed path. --backend (main) sets the variable before any device
+ * exists, which is what lets one boot run this test once per back end.
+ */
+static bool
+backend_is_vk(void)
+{
+	const char *env = getenv("HK_METAL_BACKEND");
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+
+	if (env != NULL && (strcmp(env, "vk") == 0 || strcmp(env, "gallium") == 0)) {
+		return strcmp(env, "vk") == 0;
+	}
+	return sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
+	       strstr(args, "metal_backend=vk") != NULL;
+}
+
+static const char *
+compiler_library(void)
+{
+	return backend_is_vk() ? "/hackios/lib/libvulkan_freedreno.dylib"
+			       : "/hackios/lib/libhackiosair.dylib";
+}
+
+/*
+ * What the Vulkan back end still holds, by its own count (tools/mesa/air/air_vk.c,
+ * rwa_vk_counts -- not part of air_metal.h): command buffers and fences out of its pool,
+ * buffers and images alive. Printed only on that back end, after the draw and again after
+ * this program has released what it made, so that "nothing leaked" is a pair of numbers
+ * and not the absence of a crash. RTLD_NOLOAD: the driver has the library open already,
+ * and if it has not, there is nothing to count.
+ */
+/* The same line, and the four numbers handed back in n[] for a caller that keeps a
+ * running maximum (draw_every). False, with n[] left zero, when there is nothing to count:
+ * another back end, or a library without rwa_vk_counts. */
+static bool
+print_vk_counts_into(const char *when, unsigned n[4])
+{
+	n[0] = n[1] = n[2] = n[3] = 0;
+	if (!backend_is_vk()) {
+		return false;
+	}
+	void *lib = dlopen("/hackios/lib/libvulkan_freedreno.dylib", RTLD_NOW | RTLD_NOLOAD);
+	void (*counts)(unsigned[4]) = lib != NULL ?
+	    (void (*)(unsigned[4]))dlsym(lib, "rwa_vk_counts") : NULL;
+
+	if (counts == NULL) {
+		printf("drvtest: vk counts %s: the Vulkan library is not loaded or has no "
+		       "rwa_vk_counts\n", when);
+		return false;
+	}
+	counts(n);
+	printf("drvtest: vk counts %s: %u command buffers, %u fences, %u buffers, %u images "
+	       "in use\n", when, n[0], n[1], n[2], n[3]);
+	fflush(stdout);
+	return true;
+}
+
+static void
+print_vk_counts(const char *when)
+{
+	unsigned n[4];
+
+	(void)print_vk_counts_into(when, n);
+}
+
+/*
+ * ==========================================================================================
+ * M4: WHAT A WORKLOAD COSTS, ON EACH BACK END (TODO T38 (12))
+ * ==========================================================================================
+ *
+ * The owner wants the GPU's cost of Metal minimal, and both implementations of the compiler
+ * library's contract (tools/mesa/air/air_metal.h) are right on the phone now: Gallium
+ * (air_metal.c, libhackiosair) and Vulkan (air_vk.c, inside libvulkan_freedreno). So a
+ * workload is run on each and priced, in ONE line per workload and back end:
+ *
+ *   drvtest: cost BACKEND WN WHAT: wall U us, cpu user U sys U us, gpu U us on S submissions
+ *     (baseline gpu U/U us), pipelines U us, per-submission gpu U us; net gpu ...; UNITS N:
+ *     ...; setup ...; backboardd frames ...; 0x7d read ...
+ *
+ * W1 is --time (time_path), W2 --draw-all --quiet, W3 --compute-all --quiet, W4 --frames.
+ * Beside it, at the workload's start and end, one cost-env line each:
+ *
+ *   drvtest: cost-env BACKEND WN start|end at U us: soc T C, gpu T C, gpu clock M MHz
+ *     (level L), backboardd frames F [(+N in M ms, R a second)] [THROTTLE-RISK ...]
+ *
+ * WHAT EACH NUMBER IS
+ *
+ *   wall        CLOCK_MONOTONIC across the workload (tm_now_ns).
+ *   cpu         getrusage(RUSAGE_SELF) across it, user and system apart: every thread of the
+ *               process, the driver's completion queue and the keeper below included. System
+ *               time is where the kernel's work for us lands -- the submissions, the cache
+ *               cleans of a surface at each of them (HKGPU.cpp submit), the waits.
+ *   gpu         the 3D core's own time off CP_ALWAYS_ON_COUNTER, and how many submissions it
+ *               timed: request kHKGPUWorked (0x7d) on HKGPU (iokit/Kernel/HKGPU.cpp, the
+ *               case near its end; bsd/dev/hk_adreno.c hk_gpu_worked). RAW: everything the
+ *               core finished in the workload's time, whoever submitted it (THE PRECONDITION).
+ *   baseline    the same counter over an idle window right before the workload and one right
+ *               after it, each scaled to the workload's wall time; their MEAN is subtracted.
+ *   pipelines   the wall time spent making pipeline states inside the workload, apart from
+ *               the steady-state draws and dispatches (cost_phase, COST_PIPELINE).
+ *   per-submission gpu   (raw - mean baseline) / (raw submissions - mean baseline
+ *               submissions): the core's time per submission of OURS.
+ *   after the semicolon: the same net, the windows' own numbers, then THE PHASES' work part
+ *               (UNITS: draws, dispatches, frames) with its core time and submissions per
+ *               unit, the other phases' wall, backboardd's frame rate in the workload and in
+ *               both windows, and what this instrument itself cost (reads of 0x7d).
+ *   soc, gpu    tenths of a degree out of kern.hackios.thermal's table (bsd/dev/hk_thermal.c,
+ *               read every 250 ms by the thermal service, which cpufreq=1 starts): the hottest
+ *               of all its zones, and the hotter of gpuss-0/gpuss-1 -- the reading the GPU's
+ *               speed policy holds the core low by (HKGPU.cpp gpuSpeed, hk_gpu_temperature).
+ *               At or above gpu_hot (boot-arg, 850 = 85.0 C by default) at the END the line
+ *               says THROTTLE-RISK: the next workload may run at the lowest level.
+ *   gpu clock   msm's GET_PARAM MAX_FREQ (0x40, param 4) on the same connection, which
+ *               hk_gpu_parameter answers with core_khz -- the level hk_gpu_set_level last
+ *               gave the GMU (gpu_dcvs moves it every 50 ms): 305/400/525 MHz are levels 1/2/3
+ *               on the OnePlus 8 (315/450/550 on the redwood).
+ *   frames      kern.hackios.frames: the window server's swap number at the panel's last push
+ *               (MiniIOMobileFramebuffer.cpp hk_display_frames, bsd/dev/hk_power.c; what
+ *               rwtouch's `frames` step reads). Its difference over a period is backboardd's
+ *               frames in it. `at U us` is rwtouch's t-mark clock, so the kernel's own
+ *               "MiniIOMobileFramebuffer: N frames in M ms" lines can be put beside it.
+ *
+ * THE PRECONDITION: CAN THE CORE'S TIME BE TOLD APART PER CLIENT? NO -- so (b), a baseline.
+ * Read 2026-11-05 in xnu-src: hk_gpu_submit has the core write CP_ALWAYS_ON_COUNTER into the
+ * scratch page at both ends of every submission (ring_time: 64 slots at GPU_TIMES_AT, by
+ * fence), and gpu_times() adds them into ONE pair of counters for the whole core (gpu_ticks,
+ * gpu_timed_count): no client, submit queue or task is kept beside them, and hk_gpu_worked()
+ * hands that pair out and zeroes it. The scratch page is the kernel's (PTE_PRIVILEGED under
+ * gpu_pt) and no request maps it or answers one fence's times; MSM_SUBMITQUEUE_QUERY answers
+ * 0 and MSM_PARAM_TIMESTAMP is mach_absolute_time, not the GPU's. gpu_log=1 prints every
+ * submission's fence and time ("tl: Q", "tl: q"), but into the log, which a program cannot
+ * read, and the Metal driver never sees its own fences. So the time is the WHOLE core's,
+ * and on the home screen backboardd draws through it all the time (about 30 frames a
+ * second, about 0.5 ms each). Hence the windows: COST_PRE_MS before (a fixed second,
+ * because a workload's length is not known until it has run) and one after as long as the
+ * workload was (up to COST_POST_MAX_MS), each scaled to the workload's length, both printed,
+ * their mean subtracted. What that cannot see is backboardd drawing differently WHILE we use
+ * the GPU, so its frames are counted over the workload and over both windows and printed
+ * beside them: a rate in the workload far from the windows' says by how much of
+ * backboardd's work the subtraction is off.
+ *
+ * WHY A KEEPER THREAD READS 0x7d EVERY 20 ms, AND WHY EVERY READ GOES THROUGH ONE PLACE.
+ * hk_gpu_worked() RESETS the counters, and the kernel calls it too: HKGPU.cpp submit()'s
+ * five-second report ("the GPU worked N us on each of M") takes and zeroes them whenever
+ * five seconds of anybody's submissions have passed. A bracket of two reads that spans one
+ * of those reports silently loses everything before it, and in a two-second window that is
+ * likely, not rare. So while a workload or a window is measured, a thread of this program
+ * reads every COST_KEEP_US that nothing else has read in, and adds what it got to this
+ * process's running totals (cost_total); a report can then take at most 20 ms of counts. Every read of 0x7d in this
+ * program goes through cost_worked_call, --time's own brackets included (tm_gpu_worked),
+ * and a bracket is the difference of two snapshots of the totals -- so a read by the keeper
+ * or by another bracket inside this one takes nothing away from anybody. The kernel's own
+ * five-second report has gaps meanwhile; expected. The keeper costs a read (one ioctl under
+ * the kernel's GPU lock) every 20 ms on another core; how many reads and how long they took
+ * is the last field of the cost line.
+ *
+ * THE PHASES. Inside a workload the wall time is split four ways (cost_phase): setup (making
+ * textures and buffers, filling them), pipelines, work (from -commandBuffer to
+ * -waitUntilCompleted of the draw, dispatch or frame being priced) and readback (-getBytes:,
+ * digests). 0x7d is read at both ends of every work phase, so the work's own core time and
+ * submissions are known apart from the setup's and the readback's -- which differ between
+ * the back ends for reasons that are not the draw's: on Vulkan every -replaceRegion: and
+ * -getBytes: is a submission and a wait of its own (air_vk.c, ONE COMMAND BUFFER AT A TIME),
+ * on Gallium a transfer map. That is what makes the unit costs comparable: a draw is one
+ * Metal command buffer on both, and the cost line says per draw (dispatch, frame) how much
+ * core time and how many submissions it took, as well as per submission. [Neither back end
+ * flushes and waits per DRAW any more unless the boot has metal_sync=1: hkmetal.m asks both
+ * libraries for rwa_device_defer_waits(1), so a Metal command buffer is one rwa_flush on
+ * both (docs/air.md 9.3). How many kernel submissions that becomes is each back end's
+ * business, and is what the "submissions each" field measures.]
+ *
+ * --quiet: A TIMED WORKLOAD'S OUTPUT IS HELD IN MEMORY. A sweep prints per shader, and so
+ * does the driver (hkmetal.m: a line per pipeline, 272 in --draw-all), and every line to the
+ * console is a write, a lock and the kernel's log: system time inside the measurement, and
+ * about 45 KB of log per sweep, which a boot of twenty sweeps cannot hold. So with --quiet
+ * stdout is pointed at an in-memory stream while the workload runs (cost_capture_start:
+ * `stdout` is libc's __stdoutp, which printf reads at every call, the driver's rw_print
+ * included) and digested after it (cost_replay): this test's own per-shader lines are
+ * counted and dropped, its summaries printed as they were, and the driver's lines printed
+ * once each with how many times they came. A signal meanwhile prints the held tail first
+ * (fault, cost_capture_rescue).
+ */
+enum {
+	COST_PRE_MS = 1000,             /* the idle window before a workload */
+	COST_POST_MAX_MS = 3000,        /* ... and after it: as long as the workload, this at most */
+	COST_POST_MIN_MS = 200,
+	COST_KEEP_US = 20000,           /* how often the keeper reads 0x7d */
+	COST_HELD_SHOWN = 24,           /* distinct held lines of the driver's printed, */
+	COST_HELD_KINDS = 256,          /* ... and told apart */
+	COST_HELD_KEPT = 64,            /* summaries replayed */
+	COST_INVALID = -32768,          /* bsd/sys/hk_thermal.h THERMAL_INVALID: no reading */
+};
+
+struct cost_worked {                    /* iokit/Kernel/HKGPU.cpp struct hk_worked: 0x7d's answer */
+	uint64_t microseconds;
+	uint32_t submissions;
+	uint32_t by[7];
+};
+
+/* The running totals, as a bracket marks them (cost_worked_since). */
+struct cost_mark {
+	uint64_t us, subs, by[7];
+};
+
+static uint64_t tm_now_ns(void);        /* the --time section's clock, below */
+
+static pthread_mutex_t cost_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+	struct cost_mark sum;           /* everything 0x7d has answered this process */
+	unsigned reads;
+	uint64_t read_ns;
+	uint64_t last_ns;               /* when the last read ended (the keeper skips a read after one) */
+} cost_total;                           /* (cost_lock) */
+static io_connect_t cost_connection;    /* our own HKGPU client: 0x7d and GET_PARAM */
+static int cost_state;                  /* 0 not asked yet, 1 0x7d answers, -1 it cannot (cost_why) */
+static char cost_why[200];
+static bool cost_quiet;                 /* --quiet */
+
+/* One request 0x7d on `c`, and what it answered added to the totals. */
+static kern_return_t
+cost_worked_call(io_connect_t c, struct cost_worked *out, size_t *size)
+{
+	struct cost_worked in = { 0, 0, { 0 } };
+	uint64_t t0 = tm_now_ns();
+	kern_return_t kr;
+
+	pthread_mutex_lock(&cost_lock);
+	kr = IOConnectCallStructMethod(c, 0x7d, &in, sizeof(in), out, size);
+	if (kr == KERN_SUCCESS && *size >= sizeof(*out)) {
+		cost_total.sum.us += out->microseconds;
+		cost_total.sum.subs += out->submissions;
+		for (int i = 0; i < 7; i++) {
+			cost_total.sum.by[i] += out->by[i];
+		}
+	}
+	cost_total.reads++;
+	cost_total.last_ns = tm_now_ns();
+	cost_total.read_ns += cost_total.last_ns - t0;
+	pthread_mutex_unlock(&cost_lock);
+	return kr;
+}
+
+/*
+ * The same request, answered as "since this bracket's previous read" (`mark`), out of the
+ * totals: what --time's tm_gpu_worked has always returned, without the keeper's reads in
+ * between taking anything from it.
+ */
+static kern_return_t
+cost_worked_since(io_connect_t c, struct cost_mark *mark, struct cost_worked *out, size_t *size)
+{
+	kern_return_t kr = cost_worked_call(c, out, size);
+
+	if (kr != KERN_SUCCESS || *size < sizeof(*out)) {
+		return kr;
+	}
+	pthread_mutex_lock(&cost_lock);
+	out->microseconds = cost_total.sum.us - mark->us;
+	out->submissions = (uint32_t)(cost_total.sum.subs - mark->subs);
+	for (int i = 0; i < 7; i++) {
+		out->by[i] = (uint32_t)(cost_total.sum.by[i] - mark->by[i]);
+	}
+	*mark = cost_total.sum;
+	pthread_mutex_unlock(&cost_lock);
+	return kr;
+}
+
+static void
+cost_totals(uint64_t *us, uint64_t *subs)
+{
+	pthread_mutex_lock(&cost_lock);
+	*us = cost_total.sum.us;
+	*subs = cost_total.sum.subs;
+	pthread_mutex_unlock(&cost_lock);
+}
+
+static bool
+cost_open(void)
+{
+	if (cost_connection != 0) {
+		return true;
+	}
+	io_service_t s = IOServiceGetMatchingService(0, IOServiceMatching("HKGPU"));
+	kern_return_t kr = s != 0 ? IOServiceOpen(s, mach_task_self(), 0, &cost_connection)
+				  : KERN_FAILURE;
+
+	if (s != 0) {
+		IOObjectRelease(s);
+	}
+	if (kr != KERN_SUCCESS) {
+		cost_connection = 0;
+		cost_state = -1;
+		snprintf(cost_why, sizeof(cost_why), "no HKGPU client could be opened (%#x)", kr);
+		return false;
+	}
+	return true;
+}
+
+/* Everything the core has finished so far, into the totals. False when 0x7d cannot answer. */
+static bool
+cost_gpu_sync(void)
+{
+	struct cost_worked w;
+	size_t size = sizeof(w);
+
+	if (cost_state < 0 || !cost_open()) {
+		return false;
+	}
+	kern_return_t kr = cost_worked_call(cost_connection, &w, &size);
+
+	if (kr != KERN_SUCCESS || size < sizeof(w)) {
+		cost_state = -1;
+		snprintf(cost_why, sizeof(cost_why), "request 0x7d answered %#x with %zu of %zu "
+			 "bytes (0xe00002c7: a kernel without it, 0xe00002d8: its GPU not started)",
+			 kr, size, sizeof(w));
+		return false;
+	}
+	cost_state = 1;
+	return true;
+}
+
+/*
+ * THE KEEPER (the comment above): a read every COST_KEEP_US while something is measured --
+ * but none when anything else has read within that time (the sweeps' phases read at every
+ * draw), and none at all while it is paused (cost_keeper_pause: --frames' frame loop, which
+ * reads at both ends of every frame itself, so that no wake of this thread lands in a
+ * frame's own CPU time).
+ */
+static pthread_mutex_t cost_keeper_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cost_keeper_cond = PTHREAD_COND_INITIALIZER;
+static bool cost_keeping, cost_keeper_paused;   /* (cost_keeper_mutex) */
+static pthread_t cost_keeper_thread;
+
+static void *
+cost_keeper(void *unused)
+{
+	(void)unused;
+	pthread_mutex_lock(&cost_keeper_mutex);
+	while (cost_keeping) {
+		struct timespec period = { 0, COST_KEEP_US * 1000L };
+		uint64_t last;
+
+		if (cost_keeper_paused) {
+			pthread_cond_wait(&cost_keeper_cond, &cost_keeper_mutex);
+			continue;
+		}
+		pthread_cond_timedwait_relative_np(&cost_keeper_cond, &cost_keeper_mutex, &period);
+		if (!cost_keeping || cost_keeper_paused) {
+			continue;
+		}
+		pthread_mutex_unlock(&cost_keeper_mutex);
+		pthread_mutex_lock(&cost_lock);
+		last = cost_total.last_ns;
+		pthread_mutex_unlock(&cost_lock);
+		if (tm_now_ns() - last >= COST_KEEP_US * 1000ull) {
+			(void)cost_gpu_sync();
+		}
+		pthread_mutex_lock(&cost_keeper_mutex);
+	}
+	pthread_mutex_unlock(&cost_keeper_mutex);
+	return NULL;
+}
+
+static void
+cost_keeper_start(void)
+{
+	if (cost_keeping || cost_state <= 0) {
+		return;
+	}
+	cost_keeping = true;
+	cost_keeper_paused = false;
+	if (pthread_create(&cost_keeper_thread, NULL, cost_keeper, NULL) != 0) {
+		cost_keeping = false;
+		printf("drvtest: cost: no keeper thread, so a five-second report of the kernel's "
+		       "inside a bracket can take that bracket's counts\n");
+	}
+}
+
+static void
+cost_keeper_pause(bool pause)
+{
+	pthread_mutex_lock(&cost_keeper_mutex);
+	cost_keeper_paused = pause;
+	pthread_cond_signal(&cost_keeper_cond);
+	pthread_mutex_unlock(&cost_keeper_mutex);
+}
+
+static void
+cost_keeper_stop(void)
+{
+	pthread_mutex_lock(&cost_keeper_mutex);
+	if (!cost_keeping) {
+		pthread_mutex_unlock(&cost_keeper_mutex);
+		return;
+	}
+	cost_keeping = false;
+	pthread_cond_signal(&cost_keeper_cond);
+	pthread_mutex_unlock(&cost_keeper_mutex);
+	pthread_join(cost_keeper_thread, NULL);
+}
+
+/* rwtouch's t-mark clock, to the formula: (mach_absolute_time * numer / denom) / 1000 */
+static uint64_t
+cost_mark_us(void)
+{
+	static mach_timebase_info_data_t base;
+
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	return (mach_absolute_time() * base.numer / base.denom) / 1000;
+}
+
+/* kern.hackios.frames, the window server's swap number; -1 without the sysctl */
+static int
+cost_frames(void)
+{
+	int frames = 0;
+	size_t size = sizeof(frames);
+
+	return sysctlbyname("kern.hackios.frames", &frames, &size, NULL, 0) == 0 ? frames : -1;
+}
+
+/*
+ * The hottest zone of the thermal service's table and the hotter of the GPU's two, in
+ * tenths: rows "NAME tsensB/S T C   limit ..., stop ..." (hk_thermal.c write_text), T "-"
+ * for a sensor with no reading. COST_INVALID for both when the service does not run
+ * (thermal=0, or no cpufreq=1: the table then says so in words and has no rows).
+ */
+static void
+cost_temperatures(int *soc, int *gpu)
+{
+	static char text[4096];
+	size_t size = sizeof(text) - 1;
+
+	*soc = *gpu = COST_INVALID;
+	if (sysctlbyname("kern.hackios.thermal", text, &size, NULL, 0) != 0) {
+		return;
+	}
+	text[size < sizeof(text) ? size : sizeof(text) - 1] = '\0';
+	for (char *line = text, *next; line != NULL && *line != '\0'; line = next) {
+		char name[16], value[16];
+		unsigned block, sensor;
+
+		next = strchr(line, '\n');
+		if (next != NULL) {
+			*next++ = '\0';
+		}
+		if (sscanf(line, "%15s tsens%u/%u %15s", name, &block, &sensor, value) != 4 ||
+		    strcmp(value, "-") == 0) {
+			continue;
+		}
+		double c = strtod(value, NULL);
+		int tenths = (int)(c * 10.0 + (c < 0 ? -0.5 : 0.5));
+
+		if (*soc == COST_INVALID || tenths > *soc) {
+			*soc = tenths;
+		}
+		if (strncmp(name, "gpuss-", 6) == 0 && (*gpu == COST_INVALID || tenths > *gpu)) {
+			*gpu = tenths;
+		}
+	}
+}
+
+/* The 3D core's clock as the kernel last set it (GET_PARAM MAX_FREQ), MHz; 0 not known. */
+static unsigned
+cost_gpu_mhz(void)
+{
+	struct {
+		uint32_t pipe, param;
+		uint64_t value;
+		uint32_t len, pad;
+	} in = { 1, 0x04, 0, 0, 0 }, out = { 0, 0, 0, 0, 0 };     /* MSM_PIPE_3D0, MSM_PARAM_MAX_FREQ */
+	size_t size = sizeof(out);
+
+	if (!cost_open() ||
+	    IOConnectCallStructMethod(cost_connection, 0x40, &in, sizeof(in), &out, &size) !=
+	    KERN_SUCCESS || size < sizeof(out)) {
+		return 0;
+	}
+	return (unsigned)(out.value / 1000000);
+}
+
+/* hk_adreno.c hk_gpu_level_khz: 1-3 are 305/400/525 MHz (SM8250), 315/450/550 (SM7325) */
+static unsigned
+cost_level(unsigned mhz)
+{
+	return mhz == 305 || mhz == 315 ? 1 : mhz == 400 || mhz == 450 ? 2 :
+	       mhz == 525 || mhz == 550 ? 3 : 0;
+}
+
+/* boot-arg gpu_hot (tenths), 850 unless the boot says otherwise (hk_adreno.c) */
+static int
+cost_gpu_hot(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	const char *at;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
+	    (at = strstr(args, "gpu_hot=")) != NULL) {
+		return atoi(at + 8);
+	}
+	return 850;
+}
+
+static const char *
+cost_tenths(int t, char *buf, size_t size)
+{
+	if (t == COST_INVALID) {
+		snprintf(buf, size, "-");
+	} else {
+		snprintf(buf, size, "%s%d.%d", t < 0 ? "-" : "", (t < 0 ? -t : t) / 10,
+			 (t < 0 ? -t : t) % 10);
+	}
+	return buf;
+}
+
+/* A library's name in a cost line: the file's, or its bundle's for a default.metallib. */
+static const char *
+cost_library_name(const char *path, char *buf, size_t size)
+{
+	const char *slash = strrchr(path, '/'), *base = slash != NULL ? slash + 1 : path;
+
+	if (strcmp(base, "default.metallib") == 0 && slash != NULL) {
+		const char *p = slash;
+
+		while (p > path && p[-1] != '/') {
+			p--;
+		}
+		snprintf(buf, size, "%.*s", (int)(slash - p), p);
+	} else {
+		snprintf(buf, size, "%s", base);
+	}
+	return buf;
+}
+
+/* What the machine is doing around a workload: the cost-env line's numbers. */
+struct cost_env {
+	uint64_t at_us;                 /* the t-mark clock */
+	int soc, gpu;                   /* tenths */
+	unsigned mhz;
+	int frames;
+};
+
+static void
+cost_env_take(struct cost_env *e)
+{
+	e->at_us = cost_mark_us();
+	cost_temperatures(&e->soc, &e->gpu);
+	e->mhz = cost_gpu_mhz();
+	e->frames = cost_frames();
+}
+
+/* A point of a bracket. */
+struct cost_snap {
+	uint64_t ns;
+	struct rusage ru;
+	uint64_t us, subs;
+	int frames;
+};
+
+static void
+cost_snap_take(struct cost_snap *s)
+{
+	(void)cost_gpu_sync();
+	s->ns = tm_now_ns();
+	getrusage(RUSAGE_SELF, &s->ru);
+	cost_totals(&s->us, &s->subs);
+	s->frames = cost_frames();
+}
+
+/* An idle window: the core's time and backboardd's frames while this process sleeps. */
+struct cost_window {
+	uint64_t ns, us, subs;
+	int frames;
+};
+
+static void
+cost_idle(unsigned ms, struct cost_window *w)
+{
+	struct cost_snap a, b;
+	struct timespec left = { ms / 1000, (long)(ms % 1000) * 1000000L };
+
+	cost_snap_take(&a);
+	while (nanosleep(&left, &left) != 0 && errno == EINTR) {
+	}
+	cost_snap_take(&b);
+	w->ns = b.ns - a.ns;
+	w->us = b.us - a.us;
+	w->subs = b.subs - a.subs;
+	w->frames = a.frames >= 0 && b.frames >= 0 ? b.frames - a.frames : -1;
+}
+
+/* THE PHASES (the comment above). */
+enum { COST_SETUP, COST_PIPELINE, COST_WORK, COST_READBACK, COST_PHASES };
+
+static struct {
+	bool active;
+	int phase;
+	uint64_t since_ns;              /* when the phase began */
+	uint64_t work_us0, work_subs0;  /* the totals when the work phase began */
+	uint64_t ns[COST_PHASES];
+	uint64_t work_us, work_subs;    /* raw, over every work phase */
+	uint64_t last_us, last_subs;    /* the last work phase's (a frame's, W4) */
+	unsigned units;                 /* work phases */
+	uint64_t pipeline_ns;           /* pipelines timed by their own code (--time's) */
+} cost_run;
+
+/*
+ * Into `phase`. A read of 0x7d at both ends of a work phase, ordered so the read is not
+ * inside it: read then clock going in, clock then read coming out. No-op outside a bracket,
+ * so the sweeps call it unconditionally.
+ */
+static void
+cost_phase(int phase)
+{
+	uint64_t now;
+
+	if (!cost_run.active || phase == cost_run.phase) {
+		return;
+	}
+	if (phase == COST_WORK) {
+		(void)cost_gpu_sync();
+		now = tm_now_ns();
+		cost_totals(&cost_run.work_us0, &cost_run.work_subs0);
+		cost_run.units++;
+	} else if (cost_run.phase == COST_WORK) {
+		uint64_t us, subs;
+
+		now = tm_now_ns();
+		(void)cost_gpu_sync();
+		cost_totals(&us, &subs);
+		cost_run.last_us = us - cost_run.work_us0;
+		cost_run.last_subs = subs - cost_run.work_subs0;
+		cost_run.work_us += cost_run.last_us;
+		cost_run.work_subs += cost_run.last_subs;
+	} else {
+		now = tm_now_ns();
+	}
+	cost_run.ns[cost_run.phase] += now - cost_run.since_ns;
+	cost_run.phase = phase;
+	cost_run.since_ns = now;
+}
+
+/* A pipeline timed by its own code (--time's tm_make_pipeline), into the pipelines field */
+static void
+cost_pipeline_add(uint64_t ns)
+{
+	if (cost_run.active) {
+		cost_run.pipeline_ns += ns;
+	}
+}
+
+/* --quiet's capture (the comment above) */
+static FILE *cost_real_stdout;
+static FILE *volatile cost_held;        /* the in-memory stream stdout points at meanwhile */
+static char *cost_held_bytes;           /* ... its bytes as of its last flush (open_memstream) */
+static size_t cost_held_size;
+
+static void
+cost_capture_start(void)
+{
+	FILE *ms;
+
+	fflush(stdout);
+	ms = open_memstream(&cost_held_bytes, &cost_held_size);
+	if (ms == NULL) {
+		printf("drvtest: cost: no in-memory stream (errno %d), so this workload's output "
+		       "goes to the console and is timed with it\n", errno);
+		fflush(stdout);
+		return;
+	}
+	cost_real_stdout = stdout;
+	cost_held = ms;
+	stdout = ms;
+}
+
+/*
+ * Back to the console, and a copy of what was held, which the caller frees. The stream is
+ * NOT closed: a thread of the driver's that read `stdout` a moment before the switch may
+ * still be writing into it, and closing it would free the buffer under that thread. It is
+ * a few hundred kilobytes for the rest of a short process.
+ */
+static char *
+cost_capture_stop(size_t *length)
+{
+	FILE *ms = cost_held;
+	char *copy;
+
+	*length = 0;
+	if (ms == NULL) {
+		return NULL;
+	}
+	flockfile(ms);
+	fflush(ms);
+	copy = malloc(cost_held_size + 1);
+	if (copy != NULL) {
+		if (cost_held_size > 0 && cost_held_bytes != NULL) {
+			memcpy(copy, cost_held_bytes, cost_held_size);
+		}
+		copy[cost_held_size] = '\0';
+		*length = cost_held_size;
+	}
+	stdout = cost_real_stdout;
+	cost_held = NULL;
+	funlockfile(ms);
+	return copy;
+}
+
+/* From the signal handler: the console back, and the held output's last 8 KB on it. */
+static void
+cost_capture_rescue(void)
+{
+	FILE *ms = cost_held;
+	static const char say[] = "drvtest: cost: a signal while this workload's output was "
+				  "held in memory (--quiet); its last bytes follow\n";
+
+	if (ms == NULL) {
+		return;
+	}
+	cost_held = NULL;
+	stdout = cost_real_stdout;
+	fflush(stdout);
+	fflush(ms);
+	if (cost_held_bytes != NULL && cost_held_size > 0) {
+		size_t from = cost_held_size > 8192 ? cost_held_size - 8192 : 0;
+
+		(void)write(1, say, sizeof(say) - 1);
+		(void)write(1, cost_held_bytes + from, cost_held_size - from);
+		(void)write(1, "\n", 1);
+	}
+}
+
+/*
+ * The held output, digested: this test's own lines dropped (counted) but for the
+ * summaries, which are printed as they were and LAST, so a sweep still ends in them;
+ * the driver's and the libraries' lines once each, with their counts.
+ */
+static const char *const cost_kept[] = {
+	"drvtest: drawall-summary", "drvtest: drawall-depth", "drvtest: drawall: ",
+	"drvtest: compute-summary", "drvtest: compute-all:", "drvtest: vk counts",
+	"drvtest: cost", "drvtest: SIGNAL",
+};
+
+static void
+cost_replay(const char *backend, const char *tag, char *held, size_t length)
+{
+	struct {
+		const char *text;
+		unsigned count;
+	} kinds[COST_HELD_KINDS];
+	const char *kept[COST_HELD_KEPT];
+	unsigned nkinds = 0, nkept = 0, lines = 0, ours = 0, driver = 0, untold = 0;
+
+	if (held == NULL) {
+		return;
+	}
+	for (char *line = held, *next; *line != '\0'; line = next) {
+		bool keep = false;
+
+		next = strchr(line, '\n');
+		if (next != NULL) {
+			*next++ = '\0';
+		} else {
+			next = line + strlen(line);
+		}
+		if (*line == '\0') {
+			continue;
+		}
+		lines++;
+		if (strncmp(line, "drvtest: ", 9) == 0) {
+			for (size_t k = 0; k < sizeof(cost_kept) / sizeof(cost_kept[0]); k++) {
+				keep = keep || strncmp(line, cost_kept[k], strlen(cost_kept[k])) == 0;
+			}
+			if (keep && nkept < COST_HELD_KEPT) {
+				kept[nkept++] = line;
+			} else {
+				ours++;
+			}
+			continue;
+		}
+		driver++;
+		unsigned k;
+
+		for (k = 0; k < nkinds && strcmp(kinds[k].text, line) != 0; k++) {
+		}
+		if (k < nkinds) {
+			kinds[k].count++;
+		} else if (nkinds < COST_HELD_KINDS) {
+			kinds[nkinds].text = line;
+			kinds[nkinds++].count = 1;
+		} else {
+			untold++;
+		}
+	}
+	printf("drvtest: cost-held %s %s: %u lines (%zu bytes) were printed while the workload "
+	       "ran and were held in memory: %u of this test's own, dropped; %u of the driver's "
+	       "and the libraries', in %u%s distinct texts, each below once with its count; %u "
+	       "summaries, last\n", backend, tag, lines, length, ours, driver, nkinds,
+	       untold != 0 ? "+" : "", nkept);
+	for (unsigned k = 0; k < nkinds && k < COST_HELD_SHOWN; k++) {
+		printf("drvtest: cost-held %ux %.220s\n", kinds[k].count, kinds[k].text);
+	}
+	if (nkinds > COST_HELD_SHOWN || untold != 0) {
+		unsigned more = untold;
+
+		for (unsigned k = COST_HELD_SHOWN; k < nkinds; k++) {
+			more += kinds[k].count;
+		}
+		printf("drvtest: cost-held ... and %u more lines in %u%s more distinct texts, not "
+		       "shown\n", more, nkinds > COST_HELD_SHOWN ? nkinds - COST_HELD_SHOWN : 0,
+		       untold != 0 ? "+" : "");
+	}
+	for (unsigned k = 0; k < nkept; k++) {
+		printf("%s\n", kept[k]);
+	}
+	fflush(stdout);
+}
+
+/* The workload being measured: its two ends, its windows and the machine around it. */
+static struct {
+	char tag[8];
+	struct cost_window pre, post;
+	struct cost_snap a, b;
+	struct cost_env start, end;
+	unsigned reads0;
+	uint64_t read_ns0;
+} cost_cur;
+
+static void
+cost_env_say(const char *when, const struct cost_env *e, const struct cost_env *from)
+{
+	char soc[16], gpu[16], level[8] = "?";
+	int hot = cost_gpu_hot();
+
+	if (cost_level(e->mhz) != 0) {
+		snprintf(level, sizeof(level), "%u", cost_level(e->mhz));
+	}
+	printf("drvtest: cost-env %s %s %s at %llu us: soc %s C, gpu %s C, gpu clock %u MHz "
+	       "(level %s), backboardd frames %d", backend_is_vk() ? "vk" : "gallium",
+	       cost_cur.tag, when, (unsigned long long)e->at_us,
+	       cost_tenths(e->soc, soc, sizeof(soc)), cost_tenths(e->gpu, gpu, sizeof(gpu)),
+	       e->mhz, level, e->frames);
+	if (from != NULL && e->frames >= 0 && from->frames >= 0 && e->at_us > from->at_us) {
+		double ms = (double)(e->at_us - from->at_us) / 1000.0;
+
+		printf(" (+%d in %.0f ms, %.1f a second)", e->frames - from->frames, ms,
+		       (e->frames - from->frames) * 1000.0 / ms);
+	}
+	if (from != NULL && e->gpu != COST_INVALID && e->gpu >= hot) {
+		printf(" THROTTLE-RISK (gpu_hot %d.%d C: the core may be held at its lowest level)",
+		       hot / 10, hot % 10);
+	}
+	printf("\n");
+	fflush(stdout);
+}
+
+/*
+ * The start of workload `tag`: the window before it, the machine, the capture (--quiet),
+ * the first point. Everything up to cost_end is the workload.
+ */
+static void
+cost_begin(const char *tag)
+{
+	memset(&cost_cur, 0, sizeof(cost_cur));
+	memset(&cost_run, 0, sizeof(cost_run));
+	snprintf(cost_cur.tag, sizeof(cost_cur.tag), "%s", tag);
+	if (!cost_gpu_sync()) {
+		printf("drvtest: cost %s %s: the core's own time is NOT measured: %s\n",
+		       backend_is_vk() ? "vk" : "gallium", tag, cost_why);
+	}
+	pthread_mutex_lock(&cost_lock);
+	cost_cur.reads0 = cost_total.reads;
+	cost_cur.read_ns0 = cost_total.read_ns;
+	pthread_mutex_unlock(&cost_lock);
+	cost_keeper_start();
+	cost_idle(COST_PRE_MS, &cost_cur.pre);
+	cost_env_take(&cost_cur.start);
+	cost_env_say("start", &cost_cur.start, NULL);
+	if (cost_quiet) {
+		printf("drvtest: cost %s %s: the workload's output is held in memory from here "
+		       "until it ends (--quiet); a silence after this line is inside it\n",
+		       backend_is_vk() ? "vk" : "gallium", tag);
+		cost_capture_start();
+	}
+	cost_run.active = true;
+	cost_run.phase = COST_SETUP;
+	cost_snap_take(&cost_cur.a);
+	cost_run.since_ns = cost_cur.a.ns;
+}
+
+static uint64_t
+cost_tv_us(struct timeval t)
+{
+	return (uint64_t)t.tv_sec * 1000000ull + (uint64_t)t.tv_usec;
+}
+
+/*
+ * The end of the workload, and its cost line. `units`/`unit` name the work phases (draws,
+ * dispatches, frames; NULL when the workload has none, --time); `fmt` says what it was.
+ */
+static void
+cost_end(const char *units, const char *unit, const char *fmt, ...)
+	__attribute__((format(printf, 3, 4)));
+
+static void
+cost_end(const char *units, const char *unit, const char *fmt, ...)
+{
+	const char *backend = backend_is_vk() ? "vk" : "gallium";
+	char what[160];
+	va_list ap;
+	size_t held_length = 0;
+	char *held;
+
+	if (!cost_run.active) {
+		return;
+	}
+	va_start(ap, fmt);
+	vsnprintf(what, sizeof(what), fmt, ap);
+	va_end(ap);
+	cost_phase(COST_SETUP);                 /* a work phase still open is closed */
+	cost_snap_take(&cost_cur.b);
+	cost_run.ns[cost_run.phase] += cost_cur.b.ns - cost_run.since_ns;
+	cost_run.active = false;
+	held = cost_capture_stop(&held_length);
+	cost_env_take(&cost_cur.end);
+	cost_env_say("end", &cost_cur.end, &cost_cur.start);
+	cost_replay(backend, cost_cur.tag, held, held_length);
+	free(held);
+
+	const struct cost_snap *a = &cost_cur.a, *b = &cost_cur.b;
+	uint64_t wall = b->ns - a->ns;
+	uint64_t post_ms = wall / 1000000;
+
+	post_ms = post_ms < COST_POST_MIN_MS ? COST_POST_MIN_MS :
+		  post_ms > COST_POST_MAX_MS ? COST_POST_MAX_MS : post_ms;
+	cost_idle((unsigned)post_ms, &cost_cur.post);
+	cost_keeper_stop();
+
+	const struct cost_window *w1 = &cost_cur.pre, *w2 = &cost_cur.post;
+	uint64_t user = cost_tv_us(b->ru.ru_utime) - cost_tv_us(a->ru.ru_utime);
+	uint64_t sys = cost_tv_us(b->ru.ru_stime) - cost_tv_us(a->ru.ru_stime);
+	uint64_t raw_us = b->us - a->us, raw_subs = b->subs - a->subs;
+	/* the windows' rates, per nanosecond, and each scaled to the workload's length */
+	double r1 = w1->ns ? (double)w1->us / w1->ns : 0, r2 = w2->ns ? (double)w2->us / w2->ns : 0;
+	double q1 = w1->ns ? (double)w1->subs / w1->ns : 0;
+	double q2 = w2->ns ? (double)w2->subs / w2->ns : 0;
+	double b1 = r1 * wall, b2 = r2 * wall, s1 = q1 * wall, s2 = q2 * wall;
+	double net_us = raw_us - (b1 + b2) / 2, net_subs = raw_subs - (s1 + s2) / 2;
+	uint64_t pipelines = cost_run.ns[COST_PIPELINE] + cost_run.pipeline_ns;
+	char per[32] = "-";
+	unsigned reads;
+	uint64_t read_ns;
+
+	pthread_mutex_lock(&cost_lock);
+	reads = cost_total.reads - cost_cur.reads0;
+	read_ns = cost_total.read_ns - cost_cur.read_ns0;
+	pthread_mutex_unlock(&cost_lock);
+	if (cost_state <= 0) {
+		printf("drvtest: cost %s %s %s: wall %llu us, cpu user %llu sys %llu us, gpu - us on "
+		       "- submissions (baseline gpu -/- us), pipelines %llu us, per-submission gpu - "
+		       "us; the core's own time NOT MEASURED: %s\n", backend, cost_cur.tag, what,
+		       (unsigned long long)(wall / 1000), (unsigned long long)user,
+		       (unsigned long long)sys, (unsigned long long)(pipelines / 1000), cost_why);
+		fflush(stdout);
+		return;
+	}
+	if (net_subs >= 0.5) {
+		snprintf(per, sizeof(per), "%.1f", net_us / net_subs);
+	}
+	printf("drvtest: cost %s %s %s: wall %llu us, cpu user %llu sys %llu us, gpu %llu us on "
+	       "%llu submissions (baseline gpu %.0f/%.0f us), pipelines %llu us, per-submission "
+	       "gpu %s us; net gpu %.0f us on %.1f submissions, baseline submissions %.1f/%.1f, "
+	       "windows %.0f/%.0f ms", backend, cost_cur.tag, what,
+	       (unsigned long long)(wall / 1000), (unsigned long long)user,
+	       (unsigned long long)sys, (unsigned long long)raw_us, (unsigned long long)raw_subs,
+	       b1, b2, (unsigned long long)(pipelines / 1000), per, net_us, net_subs, s1, s2,
+	       w1->ns / 1e6, w2->ns / 1e6);
+	if (units != NULL && cost_run.units > 0) {
+		double work = (double)cost_run.ns[COST_WORK];
+		double wnet_us = cost_run.work_us - (r1 + r2) / 2 * work;
+		double wnet_subs = cost_run.work_subs - (q1 + q2) / 2 * work;
+		unsigned n = cost_run.units;
+
+		printf("; %s %u: wall %.0f us, gpu %llu us on %llu submissions (net %.0f on %.1f), "
+		       "per %s gpu %.1f us and wall %.1f us, %.2f submissions each", units, n,
+		       work / 1000, (unsigned long long)cost_run.work_us,
+		       (unsigned long long)cost_run.work_subs, wnet_us, wnet_subs, unit,
+		       wnet_us / n, work / 1000 / n, wnet_subs / n);
+	}
+	printf("; setup %.0f us, readback %.0f us", cost_run.ns[COST_SETUP] / 1000.0,
+	       cost_run.ns[COST_READBACK] / 1000.0);
+	if (a->frames >= 0 && b->frames >= 0 && w1->frames >= 0 && w2->frames >= 0 && wall > 0) {
+		printf("; backboardd frames %d in the workload (%.1f a second), %.1f/%.1f a second "
+		       "in the windows", b->frames - a->frames, (b->frames - a->frames) * 1e9 / wall,
+		       w1->ns ? w1->frames * 1e9 / w1->ns : 0, w2->ns ? w2->frames * 1e9 / w2->ns : 0);
+	}
+	printf("; 0x7d read %u times in %.0f us%s\n", reads, read_ns / 1000.0,
+	       cost_cur.end.gpu != COST_INVALID && cost_cur.end.gpu >= cost_gpu_hot() ?
+	       " THROTTLE-RISK" : "");
+	fflush(stdout);
+}
+
 /* Both halves of the query, or neither: a table filled from a device that is not the
  * driver's would describe a shader nobody is about to draw. Prints what is missing and
  * leaves the sweep to its old single binding, which is a smaller measurement and not a
@@ -140,7 +1194,7 @@ argbuf_records(id<MTLBuffer> buffer, size_t offset)
 static void
 load_texture_query(id<MTLDevice> dev)
 {
-	void *lib = dlopen("/hackios/lib/libhackiosair.dylib", RTLD_NOW);
+	void *lib = dlopen(compiler_library(), RTLD_NOW);
 
 	if (lib == NULL) {
 		printf("drvtest: no compiler library to ask what a shader declares: %s\n",
@@ -586,6 +1640,64 @@ texture_descriptor(MTLPixelFormat format, MTLTextureUsage usage)
 	return td;
 }
 
+/*
+ * THE RESULT LINE of a dispatch (M3d), one per kernel and back end in one shape whatever
+ * happened, so the two runs of one boot (--backend gallium and --backend vk) can be joined
+ * on the name the way --draw-all's drawall-result lines are:
+ *
+ *     drvtest: compute-result BACKEND NAME ran bN HEX ... tN HEX ...
+ *     drvtest: compute-result BACKEND NAME ran unchanged
+ *     drvtest: compute-result BACKEND NAME no-pipeline REASON
+ *     drvtest: compute-result BACKEND NAME no-texture REASON
+ *     drvtest: compute-result BACKEND NAME no-dispatch REASON
+ *     drvtest: compute-result BACKEND NAME refused-dispatch status S: REASON
+ *     drvtest: compute-result BACKEND NAME not-dispatched REASON
+ *
+ * `ran` lists every OUTPUT: each of the sixteen buffers that is no longer all zeros (bN,
+ * FNV-1a over its 4096 bytes) and each texture that no longer holds air_run's texels (tN,
+ * FNV-1a over slice 0 as -getBytes: returns it, rows and images tightly packed), in index
+ * order; `unchanged` when the dispatch completed and changed nothing, which is a weak
+ * agreement (docs/air.md section 5). A buffer or texture that one back end changed and the
+ * other did not is then a field on one line only, so equal lines mean equal outputs.
+ * REASON is the driver's sentence (the compiler library's, through the NSError) or this
+ * harness's own; `not-dispatched` is --compute-all leaving out a kernel that loops on a
+ * value its buffers do not hold (compute_hangers). The older lines (dispatched, buffer N)
+ * stay as they were, because tools/air/metalcheck.py reads them.
+ */
+static int compute_dispatch(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+			    id<MTLComputePipelineState> first, NSString *firstName);
+
+static const char *
+backend_word(void)
+{
+	return backend_is_vk() ? "vk" : "gallium";
+}
+
+/* FNV-1a over slice 0 of a texture compute_dispatch made, read back whole: rows of 64 texels
+ * and images of `height` rows tightly packed, which is the order its texels were written in,
+ * so the digest of an untouched texture is the one computed while it was seeded. False when
+ * there is nothing to read the bytes into. */
+static bool
+compute_texture_digest(id<MTLTexture> tex, uint64_t *digest)
+{
+	NSUInteger w = [tex width], h = [tex height], d = [tex depth];
+	NSUInteger stride = w * texel_bytes_of([tex pixelFormat]);
+	unsigned char *bytes = calloc(1, stride * h * d);
+
+	if (bytes == NULL) {
+		return false;
+	}
+	[tex getBytes:bytes
+	  bytesPerRow:stride
+	bytesPerImage:stride * h
+	   fromRegion:MTLRegionMake3D(0, 0, 0, w, h, d)
+	  mipmapLevel:0
+		slice:0];
+	*digest = fnv1a(bytes, stride * h * d);
+	free(bytes);
+	return true;
+}
+
 static void
 compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
 {
@@ -605,6 +1717,15 @@ compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
 			refused++;
 			printf("drvtest: compute %-32s refused: %s\n", [name UTF8String],
 			       err != nil ? [[err localizedDescription] UTF8String] : "(no reason)");
+			/* the one kernel this run was asked for gets its result line here, since
+			 * there is no dispatch to give it one (M3d) */
+			if (only != NULL) {
+				printf("drvtest: compute-result %s %s no-pipeline %s\n", backend_word(),
+				       [name UTF8String],
+				       fn == nil ? "the library has no function of that name"
+				       : err != nil ? [[err localizedDescription] UTF8String]
+						    : "(no reason)");
+			}
 			continue;
 		}
 		compiled++;
@@ -630,20 +1751,48 @@ compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
 	printf("drvtest: newCommandQueue gave %s\n",
 	       queue != nil ? class_getName(object_getClass(queue)) : "nil");
 	if (queue == nil) {
+		printf("drvtest: compute-result %s %s no-dispatch the device gave no command "
+		       "queue\n", backend_word(), [firstName UTF8String]);
 		return;
 	}
+	(void)compute_dispatch(dev, queue, first, firstName);
+}
+
+/*
+ * The dispatch of one compiled kernel, as compute_path always made it -- sixteen zeroed
+ * buffers, sixteen textures of air_run's texels, a sampler, 4x4x1 threads in one group --
+ * and then the compute-result line above. A function of its own since M3d so that
+ * --compute-all (compute_every) dispatches every kernel of a library exactly the way the
+ * one-kernel jobs (userland/rc.jobs.metal1/2/3, metalcompute) dispatch theirs, and so it
+ * releases what it made: one process now makes many of these.
+ *
+ * Returns 0 for a dispatch that completed, 1 for one the driver refused or that did not
+ * complete, 2 when this harness could not set it up.
+ */
+static int
+compute_dispatch(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+		 id<MTLComputePipelineState> first, NSString *firstName)
+{
 	/* Eight buffers, all bound. How many a kernel reads is its own business -- the corpus's
 	 * compute kernels take between one and five -- and binding fewer than it declares would
 	 * make it read a slot nothing was bound to. Metal's own rule is that a shader sees only
 	 * what it declared, so binding more is harmless. */
 	enum { RW_TEST_BUFFERS = 16 };
-	id<MTLBuffer> bufs[RW_TEST_BUFFERS];
+	id<MTLBuffer> bufs[RW_TEST_BUFFERS] = { nil };
+	/* what each texture held before the dispatch, as the result line digests it (M3d) */
+	uint64_t seeded[RW_TEST_BUFFERS] = { 0 };
+	int verdict = 2;
 
 	for (int i = 0; i < RW_TEST_BUFFERS; i++) {
 		bufs[i] = [dev newBufferWithLength:4096 options:0];
 		if (bufs[i] == nil) {
 			printf("drvtest: buffer %d could not be made\n", i);
-			return;
+			printf("drvtest: compute-result %s %s no-dispatch buffer %d could not be "
+			       "made\n", backend_word(), [firstName UTF8String], i);
+			for (int k = 0; k < i; k++) {
+				[bufs[k] release];
+			}
+			return 2;
 		}
 		if ([bufs[i] contents] != NULL) {
 			memset([bufs[i] contents], 0, 4096);
@@ -743,6 +1892,7 @@ compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
 		unsigned texel_bytes = texel_bytes_of(pf);
 		NSUInteger stride = 64 * texel_bytes;
 
+		seeded[i] = 0xcbf29ce484222325ULL;   /* fnv1a's basis, folded row by row below */
 		for (NSUInteger slice = 0; slice < [texs[i] arrayLength] *
 		     (texture_kind == MTLTextureTypeCube ? 6 : 1); slice++) {
 			for (NSUInteger z = 0; z < [texs[i] depth]; z++) {
@@ -755,6 +1905,14 @@ compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
 						v[2] = 300.0f + x + y + (float)z;
 						v[3] = 400.0f;
 						write_texel(row + x * texel_bytes, pf, v);
+					}
+					/* the digest of what slice 0 holds now, in the order
+					 * compute_texture_digest reads it back: z, then rows */
+					if (slice == 0 && y < [texs[i] height]) {
+						for (NSUInteger b = 0; b < stride; b++) {
+							seeded[i] = (seeded[i] ^ row[b]) *
+								    0x100000001b3ULL;
+						}
 					}
 					[texs[i] replaceRegion:MTLRegionMake3D(0, y, z, 64, 1, 1)
 						   mipmapLevel:0
@@ -773,6 +1931,10 @@ compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
 	printf("drvtest: %d of %d textures made, sampler %s\n", textures_made, RW_TEST_BUFFERS,
 	       sampler != nil ? class_getName(object_getClass(sampler)) : "nil");
 
+	/* M4: the dispatch itself is the work phase of a timed sweep, from the command buffer
+	 * to its wait (cost_phase; a no-op otherwise). The sixteen textures' uploads above are
+	 * setup: on Vulkan each row is a submission and a wait of its own. */
+	cost_phase(COST_WORK);
 	id<MTLCommandBuffer> cmd = [queue commandBuffer];
 	id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
@@ -780,7 +1942,9 @@ compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
 	       cmd != nil ? class_getName(object_getClass(cmd)) : "nil",
 	       enc != nil ? class_getName(object_getClass(enc)) : "nil");
 	if (cmd == nil || enc == nil) {
-		return;
+		printf("drvtest: compute-result %s %s no-dispatch the device gave no command "
+		       "buffer or no compute encoder\n", backend_word(), [firstName UTF8String]);
+		goto release;
 	}
 	[enc setComputePipelineState:first];
 	for (int i = 0; i < RW_TEST_BUFFERS; i++) {
@@ -800,6 +1964,7 @@ compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
 	[enc endEncoding];
 	[cmd commit];
 	[cmd waitUntilCompleted];
+	cost_phase(COST_READBACK);
 	printf("drvtest: dispatched %s: status %lu%s\n", [firstName UTF8String],
 	       (unsigned long)[cmd status],
 	       [cmd error] != nil ? [[NSString stringWithFormat:@", error: %@",
@@ -831,6 +1996,279 @@ compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
 		printf("drvtest: nothing was written to either buffer, so nothing is proven: this "
 		       "kernel writes its buffer unconditionally\n");
 	}
+
+	/* The result line (M3d): a dispatch that did not complete is a refusal, with the
+	 * driver's sentence; one that did lists every buffer and texture it changed, each by
+	 * its digest. */
+	if ([cmd status] != MTLCommandBufferStatusCompleted) {   /* RW_CB_COMPLETED, below */
+		printf("drvtest: compute-result %s %s refused-dispatch status %lu: %s\n",
+		       backend_word(), [firstName UTF8String], (unsigned long)[cmd status],
+		       [cmd error] != nil ? [[[cmd error] localizedDescription] UTF8String]
+					  : "(no error)");
+		verdict = 1;
+		goto release;
+	}
+	{
+		char line[1024];
+		size_t at = 0;
+		unsigned changed = 0;
+
+		line[0] = '\0';
+		for (int which = 0; which < RW_TEST_BUFFERS; which++) {
+			const unsigned char *bytes = [bufs[which] contents];
+			bool zero = true;
+
+			for (int i = 0; bytes != NULL && i < 4096 && zero; i++) {
+				zero = bytes[i] == 0;
+			}
+			if (bytes == NULL || zero) {
+				continue;
+			}
+			changed++;
+			at += snprintf(line + at, at < sizeof(line) ? sizeof(line) - at : 0,
+				       " b%d %016llx", which,
+				       (unsigned long long)fnv1a(bytes, 4096));
+			at = at < sizeof(line) ? at : sizeof(line) - 1;
+		}
+		for (int i = 0; i < RW_TEST_BUFFERS; i++) {
+			uint64_t now;
+
+			if (texs[i] == nil || !compute_texture_digest(texs[i], &now) ||
+			    now == seeded[i]) {
+				continue;
+			}
+			changed++;
+			at += snprintf(line + at, at < sizeof(line) ? sizeof(line) - at : 0,
+				       " t%d %016llx", i, (unsigned long long)now);
+			at = at < sizeof(line) ? at : sizeof(line) - 1;
+		}
+		printf("drvtest: compute-result %s %s ran%s\n", backend_word(),
+		       [firstName UTF8String], changed ? line : " unchanged");
+		verdict = 0;
+	}
+release:
+	fflush(stdout);
+	for (int i = 0; i < RW_TEST_BUFFERS; i++) {
+		[bufs[i] release];
+		[texs[i] release];
+	}
+	[sampler release];
+	return verdict;
+}
+
+/*
+ * --compute-all [FROM COUNT] (M3d): every KERNEL of the library, in -functionNames order,
+ * each compiled and dispatched by compute_dispatch exactly as a one-kernel job dispatches
+ * its one, with a compute-result line each and a compute-summary line at the end -- the
+ * compute counterpart of --draw-all, and like it given a slice: FROM counts kernels only
+ * (fragment and vertex functions are not numbered), COUNT how many to attempt from there,
+ * 60 unless given, so a library too long for one boot's log is several honest runs.
+ *
+ * WHAT EACH KERNEL IS BOUND: the sixteen zeroed buffers compute_dispatch always binds, and
+ * for each texture slot the kernel DECLARES (rwa_module_textures, the compiler library's own
+ * answer, asked of the driver's device as --draw-all asks it) a texture of the declared type
+ * and of the element type and width it reads -- half RGBA16Float, ushort RGBA16Uint, short
+ * RGBA16Sint, float/uint/int their RGBA32 formats -- which is what the one-kernel jobs of
+ * userland/rc.jobs.metal1/2/3 spell out by hand with --texslots, for the same reason (a
+ * texture2d<half> written through a 32-bit descriptor is a different store, docs/air.md
+ * 5d). A slot --texslots names keeps what the command line says, as everywhere else in
+ * this program: the deliberate mismatch stays possible.
+ *
+ * WHAT IS LEFT OUT unless --compute-hangers: the fourteen kernels of PortraitFilters that
+ * tools/air/kstruct.py reads as leaving a loop only on a value from a buffer (a count, a
+ * sentinel, a hash entry), which zeros do not hold, so a dispatch of one never ends and
+ * the core has to be recovered (docs/air.md section 5; rc.jobs.metalall leaves out the same
+ * fourteen). Each still gets its line, `not-dispatched`, with the reason.
+ */
+static bool compute_all;
+static unsigned compute_from, compute_count = 60;
+static bool compute_hangers_too;
+/* kernels compute_every handed to compute_dispatch, for --quiet's cost line (M4, W3) */
+static unsigned compute_every_dispatched;
+
+static const char *const compute_hangers[] = {
+	"MetalFaceMask_GenerateMask", "MetalFaceMask_GenerateToothMask",
+	"MetalFaceMask_ConnectSpans", "MetalFaceMask_PropagateParents",
+	"MetalFaceMask_ResolveAssociations", "MetalFaceMask_AddSeedPoint",
+	"MetalFaceMask_DrawSpans", "MetalFaceMask_DrawEye", "fbs_bistochastize_iter",
+	"fbs_bistochastize_final", "fbs_pcg_init", "fbs_pcg_iter1", "fbs_slice_trilinear",
+	"confidence",
+};
+
+static bool
+compute_is_hanger(const char *name)
+{
+	for (size_t i = 0; i < sizeof(compute_hangers) / sizeof(compute_hangers[0]); i++) {
+		if (strcmp(name, compute_hangers[i]) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* The format compute_every binds a declared slot with: the element type AND its width,
+ * because a kernel's image store is as wide as its element (ir3's stib.u16 for a half)
+ * and the descriptor has to agree. 0 when the declaration names no element: the slot is
+ * then bound what compute_dispatch's probe finds, as before. */
+static MTLPixelFormat
+compute_format_for(const struct rwa_texture_decl *d)
+{
+	bool narrow = d->element_bits == 16;
+
+	switch (d->element) {
+	case RWA_ELEMENT_FLOAT:
+		return narrow ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA32Float;
+	case RWA_ELEMENT_UINT:
+		return narrow ? MTLPixelFormatRGBA16Uint : MTLPixelFormatRGBA32Uint;
+	case RWA_ELEMENT_INT:
+		return narrow ? MTLPixelFormatRGBA16Sint : MTLPixelFormatRGBA32Sint;
+	default:
+		return 0;
+	}
+}
+
+/* Fills slot_format/slot_kind for every slot `fn` declares and the command line did not
+ * name (keep_format[] is the command line's). False and a sentence when the library cannot
+ * say, which is that kernel's no-texture line. */
+static bool
+compute_slots_for(id<MTLFunction> fn, const MTLPixelFormat *keep_format, char *why,
+		  size_t why_size)
+{
+	if (rwa_module_textures == NULL) {
+		return true;   /* load_texture_query has said why; the probe's format stands */
+	}
+	NSData *bc = function_bitcode(fn);
+
+	if (bc == nil) {
+		snprintf(why, why_size, "it does not answer bitcodeData, so there is no module to "
+			 "read a declaration out of");
+		return false;
+	}
+	struct rwa_texture_decl decl[RW_TEX_SLOTS];
+	unsigned n = 0;
+	char reason[256] = "";
+
+	if (rwa_module_textures(air_device, [bc bytes], [bc length], NULL, decl, RW_TEX_SLOTS,
+				&n, reason, sizeof(reason)) != 0) {
+		snprintf(why, why_size, "%s", reason);
+		return false;
+	}
+	for (unsigned k = 0; k < n; k++) {
+		unsigned slot = decl[k].index;
+
+		if (slot >= RW_TEX_SLOTS) {
+			snprintf(why, why_size, "it declares texture %u and this harness binds %u "
+				 "slots", slot, RW_TEX_SLOTS);
+			return false;
+		}
+		if (keep_format[slot] != 0) {
+			continue;
+		}
+		MTLPixelFormat f = compute_format_for(&decl[k]);
+
+		if (f == 0 && !decl[k].type_known) {
+			continue;   /* nothing declared: the probe's format and kind stand */
+		}
+		slot_format[slot] = f != 0 ? f : texture_format;
+		slot_kind[slot] = decl[k].type_known ? (NSUInteger)decl[k].type : texture_kind;
+	}
+	return true;
+}
+
+static void
+compute_every(id<MTLDevice> dev, id<MTLLibrary> library)
+{
+	const char *backend = backend_word();
+	unsigned seen = 0, attempted = 0, ran = 0, refused = 0, nopipe = 0, notex = 0,
+		 skipped = 0, nodispatch = 0;
+	MTLPixelFormat keep_format[RW_TEX_SLOTS];
+	NSUInteger keep_kind[RW_TEX_SLOTS];
+	id<MTLCommandQueue> queue = [dev newCommandQueue];
+
+	if (queue == nil) {
+		printf("drvtest: compute-all: the device gave no command queue\n");
+		return;
+	}
+	load_texture_query(dev);
+	memcpy(keep_format, slot_format, sizeof(keep_format));
+	memcpy(keep_kind, slot_kind, sizeof(keep_kind));
+	for (NSString *name in [library functionNames]) {
+		@autoreleasepool {
+			id<MTLFunction> fn = [library newFunctionWithName:name];
+			const char *cname = [name UTF8String];
+
+			if (fn == nil || [fn functionType] != MTLFunctionTypeKernel) {
+				[fn release];
+				continue;
+			}
+			if (seen++ < compute_from || attempted >= compute_count) {
+				[fn release];
+				continue;
+			}
+			attempted++;
+			/* M4: the phases of a timed sweep (cost_phase; a no-op otherwise) */
+			cost_phase(COST_SETUP);
+			if (!compute_hangers_too && compute_is_hanger(cname)) {
+				printf("drvtest: compute-result %s %s not-dispatched it leaves a loop only "
+				       "on a value its buffers do not hold when they are zeros "
+				       "(tools/air/kstruct.py), so the dispatch would not end; "
+				       "--compute-hangers dispatches it anyway\n", backend, cname);
+				skipped++;
+				[fn release];
+				continue;
+			}
+			NSError *err = nil;
+			cost_phase(COST_PIPELINE);
+			id<MTLComputePipelineState> ps =
+			    [dev newComputePipelineStateWithFunction:fn error:&err];
+
+			cost_phase(COST_SETUP);
+			if (ps == nil) {
+				const char *reason = err != nil ?
+				    [[err localizedDescription] UTF8String] : "(no reason)";
+
+				printf("drvtest: compute %-32s refused: %s\n", cname, reason);
+				printf("drvtest: compute-result %s %s no-pipeline %s\n", backend, cname,
+				       reason);
+				nopipe++;
+				[fn release];
+				continue;
+			}
+			printf("drvtest: compute %-32s compiled: %lu threads per group, width %lu, "
+			       "%lu bytes of threadgroup memory\n", cname,
+			       (unsigned long)[ps maxTotalThreadsPerThreadgroup],
+			       (unsigned long)[ps threadExecutionWidth],
+			       (unsigned long)[ps staticThreadgroupMemoryLength]);
+
+			char whynot[256] = "";
+
+			memcpy(slot_format, keep_format, sizeof(keep_format));
+			memcpy(slot_kind, keep_kind, sizeof(keep_kind));
+			if (!compute_slots_for(fn, keep_format, whynot, sizeof(whynot))) {
+				printf("drvtest: compute-result %s %s no-texture %s\n", backend, cname,
+				       whynot);
+				notex++;
+			} else {
+				compute_every_dispatched++;
+				int v = compute_dispatch(dev, queue, ps, name);
+
+				ran += v == 0;
+				refused += v == 1;
+				nodispatch += v == 2;
+			}
+			[ps release];
+			[fn release];
+		}
+	}
+	memcpy(slot_format, keep_format, sizeof(keep_format));
+	memcpy(slot_kind, keep_kind, sizeof(keep_kind));
+	printf("drvtest: compute-summary %s of %u kernels from %u: %u ran, %u refused-dispatch, "
+	       "%u no-pipeline, %u no-texture, %u no-dispatch, %u not-dispatched (%u kernels in "
+	       "the library)\n", backend, attempted, compute_from, ran, refused, nopipe, notex,
+	       nodispatch, skipped, seen);
+	fflush(stdout);
+	[queue release];
+	print_vk_counts("after --compute-all and its releases");
 }
 
 /*
@@ -859,6 +2297,20 @@ compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
  * covers, so the two roads draw the same pixels and a difference is a shader difference. */
 static const char *vertex_function;
 static const char *fragment_function = "clearFragment20";
+/* --rtfmt NAME: the pixel format of --draw's three attachments, RGBA32Uint unless it is
+ * given. It exists for one shader shape: a fragment function that writes ONE float, such as
+ * QuartzCore's path_rect_frag_lpf (position and three flat varyings in, `coverage` out at
+ * target 2, no buffer, texture or sampler at all -- the smallest draw the Vulkan back end
+ * takes, milestone M3a). Into a four-channel attachment the three channels it does not
+ * write hold whatever the back end leaves there, so two back ends could disagree about a
+ * correct picture; into R32Float there is nothing else in the texel. */
+static MTLPixelFormat draw_target_format = MTLPixelFormatRGBA32Uint;
+/* --clear VALUE: what --draw's attachments are cleared to, all four channels, 0 unless it is
+ * given. A shader that writes 0 everywhere (path_rect_frag_lpf over the generated stage: no
+ * varyings reach it, so its rectangle is empty) leaves a 0-cleared target exactly as an
+ * attachment nothing was drawn into: with a clear the shader does not produce, a digest of the
+ * picture tells "drew 0" from "drew nothing" (run 011617, where both back ends read back 0). */
+static double draw_clear;
 static bool draw_all;
 /* --draw-depth, which is the draw with a depth attachment under it and so with the first
  * depth test this port has ever run (depth_path). */
@@ -877,6 +2329,26 @@ static bool draw_attrib;
 /* --argbuf: the argument encoder and the buffer offset, on the device. */
 static bool argbuf;
 /*
+ * --draw-msaa [N] (M3c-3): a pass of N samples (4 unless given) drawn with the --draw
+ * fragment function into three multisample attachments of --rtfmt's format, each resolved
+ * at the end of the pass into a one-sample texture (MTLStoreActionMultisampleResolve with
+ * a resolveTexture), and attachment 2's resolve read back. msaa_path says what is printed
+ * and what each number has to be.
+ */
+static bool draw_msaa;
+static unsigned msaa_samples = 4;
+/* --draw-one NAME (M3c-3): the sweep of --draw-all over one fragment function, by name
+ * instead of by index, in a process of its own: the same drawall and drawall-result lines,
+ * so a single draw joins with a sweep's line on the name. */
+static const char *draw_one;
+/* --gallium-depth-stores: draw a fragment shader that stores [[depth]] on the Gallium back
+ * end anyway. Without it the sweep refuses such a shader there by name, because that draw
+ * times the GPU out on Gallium (docs/KNOWN_ISSUES.md K28) and a sweep should not wedge the
+ * core to say so again; this flag is how K28 is measured on purpose. */
+static bool gallium_depth_stores;
+/* what the last draw_every attempted and drew, for --quiet's cost line (M4, W2) */
+static unsigned draw_every_attempted, draw_every_drew;
+/*
  * Which slice of the library to draw. Not a convenience: the loader keeps the first 256 KB
  * of a boot's log and the last 1 MB, dropping the middle, and the boot's own noise fills
  * most of that first 256 KB -- so about seventy lines of sweep survive per boot. Two runs
@@ -887,6 +2359,8 @@ static bool argbuf;
 static unsigned draw_from, draw_count = 60;
 /* --blit: the blit encoder alone (blit_test), then stop */
 static bool blit_only;
+static bool pixels_only;         /* --pixels: the mode's M5a form, pixels_path */
+static unsigned tex_pixels;      /* M5b: --tex or --texfmt with --pixels: its group there */
 /* --seed-rows writes the draw's 4x4 texture one row at a time, at a non-zero region origin,
  * which is how this test used to do it always. It is a flag now because that made every
  * measurement of that texture depend on the driver's origin.y, and because four rows landing
@@ -1005,6 +2479,172 @@ format_for_element(unsigned element)
 	}
 }
 
+/*
+ * A slot Metal declares as depth2d<...>, which takes a DEPTH texture and nothing else -- and
+ * which this harness bound a colour one under until M3c-2.
+ *
+ * The corpus has exactly one: texturedFragment2DDepth declares its texture 0 as
+ * `depth2d<float, sample>` (the only other depth declaration in AppleMetalGLRenderer's
+ * library, depth2d_ms<float, read>, is a multisample texture neither back end makes).
+ * rwa_module_textures reports that slot as a 2D texture of FLOAT elements, which is true and
+ * is also exactly what an RGBA32Float texture is, so format_for_element bound one -- a
+ * binding Metal itself would refuse (a depth2d argument takes a depth pixel format), and
+ * one neither back end refused, because nothing compares under it and both read channel 0
+ * of a colour texture as happily as the depth of a depth one. It is MTLPixelFormatDepth32Float
+ * now, on both back ends, made ShaderRead (what the shader declares) and RenderTarget (so a
+ * render pass can clear it).
+ *
+ * Only `depth2d<`: depth2d_ms and depth2d_array are other kinds, and the first is refused
+ * as a multisample texture before a format matters.
+ *
+ * [M3c-3: the first is no longer refused -- both back ends make a multisample texture now,
+ * and slot_is_depth2d_ms below gives a depth2d_ms slot a Depth32Float one of MS_SAMPLES.]
+ */
+static bool
+slot_is_depth2d(const struct rwa_texture_decl *d)
+{
+	return strncmp(d->metal_type, "depth2d<", 8) == 0;
+}
+
+/*
+ * A slot Metal declares as a MULTISAMPLE texture (M3c-3): texture2d_ms<T, read> or
+ * depth2d_ms<float, read>, which rwa_module_textures reports as MTLTextureType2DMultisample.
+ * Six of Apple's 271 fragment shaders declare one, and until M3c-3 this harness made it a
+ * texture of ONE sample -- draw_texture_descriptor's sampleCount 1 -- which both compiler
+ * libraries refuse by Metal's own rule ("MTLTextureDescriptor sampleCount must be > 1 for
+ * multisample textures"), so the sweep said "no MTLTextureType 4 ... could be made" on both.
+ *
+ * MS_SAMPLES is four because that is the count both GPUs' drivers offer and Metal's
+ * commonest: freedreno takes 2 and 4 (valid_sample_count) and turnip's a6xx 2 and 4
+ * (sampleCounts). A depth2d_ms slot is a Depth32Float texture, as a depth2d one is.
+ */
+#define MS_SAMPLES 4
+
+static bool
+slot_is_multisample(const struct rwa_texture_decl *d)
+{
+	return d->type_known && d->type == MTLTextureType2DMultisample;
+}
+
+static bool
+slot_is_depth2d_ms(const struct rwa_texture_decl *d)
+{
+	return strncmp(d->metal_type, "depth2d_ms<", 11) == 0;
+}
+
+/*
+ * What a multisample colour slot is filled with: ONE colour in every sample of every texel,
+ * texel (0, 0) of the pattern fill_draw_texture writes into slot `slot` --
+ *
+ *     r = 100 + 1000 * slot,  g = 200,  b = 300,  a = 400
+ *
+ * -- because a clear is the only way to fill a multisample texture that Metal has (it
+ * cannot be MTLStorageModeShared, so -replaceRegion: cannot reach it, and both compiler
+ * libraries refuse the write by name), and a clear fills every sample alike. Read at any
+ * coordinate and any sample index it is that colour, so every mean over samples is that
+ * colour too, which is what makes the six shaders' outputs computable here (ms_expect).
+ */
+static void
+ms_seed(unsigned slot, double rgba[4])
+{
+	rgba[0] = 100.0 + 1000.0 * slot;
+	rgba[1] = 200.0;
+	rgba[2] = 300.0;
+	rgba[3] = 400.0;
+}
+
+/* clear_depth_texture's twin for colour: a render pass whose colour attachment 0 is the
+ * texture, MTLLoadActionClear with `rgba`, and no draw -- which reaches the compiler
+ * library's rwa_clear_color on both back ends (hkmetal.m's recordPassEnd). */
+static bool
+clear_color_texture(id<MTLDevice> dev, id<MTLTexture> tex, const double rgba[4], char *why,
+		    size_t why_size)
+{
+	id<MTLCommandQueue> queue = [dev newCommandQueue];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	MTLRenderPassColorAttachmentDescriptor *ca = [[rp colorAttachments] objectAtIndexedSubscript:0];
+	bool ok = false;
+
+	[ca setTexture:tex];
+	[ca setLoadAction:MTLLoadActionClear];
+	[ca setClearColor:MTLClearColorMake(rgba[0], rgba[1], rgba[2], rgba[3])];
+	[ca setStoreAction:MTLStoreActionStore];
+
+	id<MTLCommandBuffer> cmd = [queue commandBuffer];
+	id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+
+	if (enc == nil) {
+		snprintf(why, why_size, "the pass that clears its multisample texture gave no "
+			 "encoder");
+	} else {
+		[enc endEncoding];
+		[cmd commit];
+		[cmd waitUntilCompleted];
+		ok = [cmd status] == RW_CB_COMPLETED;
+		if (!ok) {
+			snprintf(why, why_size, "the pass that clears its multisample texture to "
+				 "(%g %g %g %g) ended with status %lu%s%s", rgba[0], rgba[1],
+				 rgba[2], rgba[3], (unsigned long)[cmd status],
+				 [cmd error] != nil ? ": " : "",
+				 [cmd error] != nil ?
+				 [[[cmd error] localizedDescription] UTF8String] : "");
+		}
+	}
+	[queue release];
+	return ok;
+}
+
+/*
+ * What a depth2d slot is seeded with: ONE value in every texel, because there is no other way
+ * to fill a depth texture that both back ends serve. -replaceRegion: on one is refused by name
+ * on both (a depth texel has an aspect the call cannot name), so is a buffer-to-texture blit
+ * (Gallium's plain_texture, and the Vulkan back end agrees), and a texture-to-texture copy
+ * from R32Float is Gallium's alone (Vulkan copies a depth format only into itself). A render
+ * pass that clears it and draws nothing reaches rwa_clear_depth_stencil on both.
+ *
+ * The value is texel (1, 1) of the depth seed --draw-depth uses for colour textures,
+ * (1 + 4 + 0.5) / 64 = 0.0859375, exact as a float and neither 0 nor 1 -- so the 2D depth
+ * shader still has to store 0.0859375 there. What it no longer says is WHICH texel was
+ * sampled: every texel holds that one number, and the verdict lines say so.
+ */
+#define DEPTH2D_SEED 0.0859375
+
+static bool
+clear_depth_texture(id<MTLDevice> dev, id<MTLTexture> tex, double value, char *why,
+		    size_t why_size)
+{
+	id<MTLCommandQueue> queue = [dev newCommandQueue];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	MTLRenderPassDepthAttachmentDescriptor *za = [rp depthAttachment];
+	bool ok = false;
+
+	[za setTexture:tex];
+	[za setLoadAction:MTLLoadActionClear];
+	[za setClearDepth:value];
+	[za setStoreAction:MTLStoreActionStore];
+
+	id<MTLCommandBuffer> cmd = [queue commandBuffer];
+	id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+
+	if (enc == nil) {
+		snprintf(why, why_size, "the pass that clears its depth texture gave no encoder");
+	} else {
+		[enc endEncoding];
+		[cmd commit];
+		[cmd waitUntilCompleted];
+		ok = [cmd status] == RW_CB_COMPLETED;
+		if (!ok) {
+			snprintf(why, why_size, "the pass that clears its depth texture to %g ended "
+				 "with status %lu%s%s", value, (unsigned long)[cmd status],
+				 [cmd error] != nil ? ": " : "",
+				 [cmd error] != nil ?
+				 [[[cmd error] localizedDescription] UTF8String] : "");
+		}
+	}
+	[queue release];
+	return ok;
+}
+
 static void
 release_slots(id<MTLTexture> *tex, unsigned slots)
 {
@@ -1022,6 +2662,11 @@ release_slots(id<MTLTexture> *tex, unsigned slots)
  * made" is a limit of the driver (it binds no multisample texture), where the old
  * "declares texture 0 as a texture2d_ms and the texture bound there is a 2d" was a
  * limit of this harness.
+ *
+ * [M3c-3: that sentence turned out to be the harness's after all -- it asked for a
+ * multisample type of ONE sample, which Metal itself forbids, and Gallium had made
+ * multisample textures all along. A multisample slot is made with MS_SAMPLES now and filled
+ * by a clear (ms_seed), and a depth2d_ms slot by clear_depth_texture.]
  *
  * Without the query (an older compiler library, or a boot with no GPU) it does nothing
  * and says so by leaving every slot nil: the caller's single --texslots binding then
@@ -1075,13 +2720,29 @@ textures_for_shader(id<MTLDevice> dev, id<MTLFunction> fn, id<MTLTexture> *out,
 		    decl[k].element == RWA_ELEMENT_UNKNOWN) {
 			continue;
 		}
+		/* A depth2d slot gets a depth texture (slot_is_depth2d says why it did not),
+		 * and RenderTarget beside what the shader declares, for the clear that seeds
+		 * it. --texslots still overrides it, for the reason it overrides the rest.
+		 *
+		 * [M3c-3: and a multisample slot gets a multisample texture of MS_SAMPLES,
+		 * Private (Metal's only storage mode for one), RenderTarget for the same
+		 * reason -- its clear is a render pass -- and Depth32Float for depth2d_ms.] */
+		bool multisample = !overridden && slot_is_multisample(&decl[k]);
+		bool depth2d = !overridden &&
+		    (slot_is_depth2d(&decl[k]) || slot_is_depth2d_ms(&decl[k]));
 		MTLPixelFormat format = overridden ? slot_format[slot]
-						   : format_for_element(decl[k].element);
+			: depth2d ? MTLPixelFormatDepth32Float
+				  : format_for_element(decl[k].element);
 		NSUInteger type = overridden ? slot_kind[slot]
 			: (decl[k].type_known ? (NSUInteger)decl[k].type : texture_kind);
 		MTLTextureDescriptor *td = draw_texture_descriptor(type, format,
-		    (MTLTextureUsage)decl[k].usage);
+		    (MTLTextureUsage)decl[k].usage |
+		    (depth2d || multisample ? MTLTextureUsageRenderTarget : 0));
 
+		if (multisample) {
+			[td setSampleCount:MS_SAMPLES];
+			[td setStorageMode:MTLStorageModePrivate];
+		}
 		out[slot] = [dev newTextureWithDescriptor:td];
 		if (out[slot] == nil) {
 			/* The driver has already printed the compiler library's own sentence
@@ -1094,6 +2755,31 @@ textures_for_shader(id<MTLDevice> dev, id<MTLFunction> fn, id<MTLTexture> *out,
 				 "a texture whose metadata carries no type name",
 				 (unsigned long)type, (unsigned long)format);
 			return false;
+		}
+		if (depth2d) {
+			char cleared[200] = "";
+
+			if (!clear_depth_texture(dev, out[slot], DEPTH2D_SEED, cleared,
+						 sizeof(cleared))) {
+				snprintf(why, why_size, "it declares texture %u as %s, and %s",
+					 slot, decl[k].metal_type, cleared);
+				return false;
+			}
+			continue;
+		}
+		/* a multisample colour slot is cleared to ms_seed(slot) in every sample, the
+		 * only fill there is for one (ms_seed says why) */
+		if (multisample) {
+			char cleared[200] = "";
+			double rgba[4];
+
+			ms_seed(slot, rgba);
+			if (!clear_color_texture(dev, out[slot], rgba, cleared, sizeof(cleared))) {
+				snprintf(why, why_size, "it declares texture %u as %s, and %s",
+					 slot, decl[k].metal_type, cleared);
+				return false;
+			}
+			continue;
 		}
 		fill_draw_texture(out[slot], slot);
 	}
@@ -2373,9 +4059,10 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 	load_texture_query(dev);
 
 	/* Three attachments, because the shader writes target 2 and Metal numbers them from 0;
-	 * the format is the one air_run drew into, so the comparison is of the same thing. */
+	 * the format is the one air_run drew into, so the comparison is of the same thing
+	 * (--rtfmt changes it, for a shader that writes one float). */
 	MTLTextureDescriptor *td =
-	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Uint
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:draw_target_format
 							      width:4
 							     height:4
 							  mipmapped:NO];
@@ -2409,7 +4096,7 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 	[pd setVertexFunction:vertex];   /* nil: the library generates the stage, as air_run does */
 	for (int i = 0; i < 3; i++) {
 		[[[pd colorAttachments] objectAtIndexedSubscript:i]
-		    setPixelFormat:MTLPixelFormatRGBA32Uint];
+		    setPixelFormat:draw_target_format];
 	}
 	err = nil;
 	id<MTLRenderPipelineState> pipeline = [dev newRenderPipelineStateWithDescriptor:pd
@@ -2481,8 +4168,11 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 
 		[a setTexture:targets[i]];
 		[a setLoadAction:MTLLoadActionClear];
-		[a setClearColor:MTLClearColorMake(0, 0, 0, 0)];
+		[a setClearColor:MTLClearColorMake(draw_clear, draw_clear, draw_clear, draw_clear)];
 		[a setStoreAction:MTLStoreActionStore];
+	}
+	if (draw_clear != 0) {
+		printf("drvtest: draw: the attachments are cleared to %g (--clear)\n", draw_clear);
 	}
 
 	/* Textures for the fragment stage, when the shader reads any. The first attempt at
@@ -2491,9 +4181,20 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 	 * this harness. The texels are air_run's own, so the picture can be compared. */
 	id<MTLTexture> dtex[4] = { nil, nil, nil, nil };
 	id<MTLSamplerState> dsamp = nil;
-	MTLTextureDescriptor *dtd = texture_descriptor(
-	    slot_format[0] != 0 ? slot_format[0] : MTLPixelFormatRGBA32Uint,
-	    MTLTextureUsageShaderRead);
+	/*
+	 * --texslots 0=3d:FORMAT makes these four 3D textures, 4x4x4, filled the way the
+	 * sweep fills a 3D slot (fill_draw_texture: every depth, b = 300 + x + y + z) -- so
+	 * that one of Apple's texture3d shaders can be drawn alone, and its digest of
+	 * attachment 2 is the t2 of its --draw-all line. Before this the slot's kind was read
+	 * and dropped here (only its format was used), which bound a 2D texture to a
+	 * texture3d and was refused for it. Any other kind keeps the 2D texture this draw
+	 * always made, byte for byte, so the hand-checked 2D measurements stay what they were.
+	 */
+	bool volume = slot_format[0] != 0 && slot_kind[0] == MTLTextureType3D;
+	MTLTextureDescriptor *dtd = volume ?
+	    draw_texture_descriptor(MTLTextureType3D, slot_format[0], MTLTextureUsageShaderRead) :
+	    texture_descriptor(slot_format[0] != 0 ? slot_format[0] : MTLPixelFormatRGBA32Uint,
+			       MTLTextureUsageShaderRead);
 
 	[dtd setWidth:4];
 	[dtd setHeight:4];
@@ -2523,8 +4224,13 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 		 * from the first: four rows landing in one place would leave every texel
 		 * carrying the last row's y = 203, and pixel (0, 0) would then read
 		 * 100 203 303 400 with no flip anywhere.
+		 *
+		 * A 3D texture is filled as the sweep fills one, a row at a time at
+		 * origin (0, y, z): the same texels the --draw-all line was drawn from.
 		 */
-		if (seed_rows) {
+		if (volume) {
+			fill_draw_texture(dtex[i], (unsigned)i);
+		} else if (seed_rows) {
 			for (unsigned y = 0; y < 4; y++) {
 				[dtex[i] replaceRegion:MTLRegionMake2D(0, y, 4, 1)
 					  mipmapLevel:0
@@ -2560,14 +4266,47 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 				printf("   (x/y of each texel; row %u must read y = %u)\n",
 				       y, 200 + y);
 			}
+			/* and the whole volume in ONE read, which is the call that has to
+			 * step from one depth to the next: 64 texels, each checked against
+			 * what fill_draw_texture wrote (exact for the 16- and 32-bit formats) */
+			if (volume) {
+				unsigned char vol[4 * 4 * 4 * 16];
+				unsigned good = 0;
+
+				memset(vol, 0, sizeof(vol));
+				[dtex[i] getBytes:vol
+				      bytesPerRow:4 * stride_bytes
+				    bytesPerImage:4 * 4 * stride_bytes
+				       fromRegion:MTLRegionMake3D(0, 0, 0, 4, 4, 4)
+				      mipmapLevel:0
+					    slice:0];
+				for (unsigned z = 0; z < 4; z++) {
+					for (unsigned y = 0; y < 4; y++) {
+						for (unsigned x = 0; x < 4; x++) {
+							float v[4] = { 0, 0, 0, 0 };
+
+							read_texel(vol + ((z * 4 + y) * 4 + x) *
+								   stride_bytes, [dtd pixelFormat], v);
+							good += v[0] == 100.0f + x &&
+								v[1] == 200.0f + y &&
+								v[2] == 300.0f + x + y + z &&
+								v[3] == 400.0f;
+						}
+					}
+				}
+				printf("drvtest: draw: the 3D texture read back whole (4x4x4 in one "
+				       "call): %u of 64 texels as seeded (b = 300 + x + y + z)\n",
+				       good);
+			}
 		}
 	}
 	MTLSamplerDescriptor *dsd = [[MTLSamplerDescriptor alloc] init];
 
 	dsamp = [dev newSamplerStateWithDescriptor:dsd];
 	[dsd release];
-	printf("drvtest: draw: %d textures of format %lu for the fragment stage\n",
-	       dtex[0] != nil ? (dtex[3] != nil ? 4 : 1) : 0, (unsigned long)[dtd pixelFormat]);
+	printf("drvtest: draw: %d textures of format %lu for the fragment stage%s\n",
+	       dtex[0] != nil ? (dtex[3] != nil ? 4 : 1) : 0, (unsigned long)[dtd pixelFormat],
+	       volume ? ", MTLTextureType3D 4x4x4 (--texslots)" : "");
 
 	id<MTLCommandQueue> queue = [dev newCommandQueue];
 	id<MTLCommandBuffer> cmd = [queue commandBuffer];
@@ -2636,8 +4375,16 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 	}
 
 	if (draw_all) {
+		/* --quiet (M4, W2): the sweep is a timed workload with a cost line (WHAT A
+		 * WORKLOAD COSTS, near the top); the single draw above is not in it */
+		if (cost_quiet) {
+			cost_begin("W2");
+		}
 		draw_every(dev, library, queue, rp, uniform, dtex, dsamp, targets);
-		return;
+		if (cost_quiet) {
+			cost_end("draws", "draw", "draw-all %u shaders", draw_every_attempted);
+		}
+		goto release;   /* the sweep's objects are this draw's, and are counted the same way */
 	}
 
 	unsigned pixel[4] = { 0 };
@@ -2656,21 +4403,45 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 	 * docs/metal.md 10.32 is the measurement that followed from printing them all.
 	 */
 	{
+		/* the texel's size from the format, so --rtfmt reads back what it drew; for
+		 * the default RGBA32Uint this is the four words per pixel it always was */
+		unsigned tb = texel_bytes_of(draw_target_format);
+		unsigned words = tb >= 4 ? tb / 4 : 1;
 		unsigned grid[4 * 4 * 4];
 
 		memset(grid, 0, sizeof(grid));
 		[targets[2] getBytes:grid
-			 bytesPerRow:4 * 16
+			 bytesPerRow:4 * tb
 			  fromRegion:MTLRegionMake2D(0, 0, 4, 4)
 			 mipmapLevel:0];
 		for (unsigned gy = 0; gy < 4; gy++) {
 			for (unsigned gx = 0; gx < 4; gx++) {
-				const unsigned *t = grid + (gy * 4 + gx) * 4;
+				const unsigned *t = grid + (gy * 4 + gx) * words;
 
-				printf("drvtest: draw: attachment 2 at (%u, %u) = %u %u %u %u\n",
-				       gx, gy, t[0], t[1], t[2], t[3]);
+				printf("drvtest: draw: attachment 2 at (%u, %u) =", gx, gy);
+				for (unsigned w = 0; w < words; w++) {
+					printf(" %u", t[w]);
+				}
+				printf("\n");
 			}
 		}
+		/*
+		 * ONE NUMBER FOR THE WHOLE PICTURE, so two runs -- the two back ends in one
+		 * boot (--backend), or two boots -- are compared by one line and not by
+		 * sixteen. FNV-1a over the bytes exactly as -getBytes: returned them, rows
+		 * tightly packed, the 4x4 texels of attachment 2: nothing is decoded first,
+		 * so a difference anywhere in any channel changes it. It is the same code on
+		 * both back ends, which is the point.
+		 */
+		const unsigned char *bytes = (const unsigned char *)grid;
+		unsigned long long digest = 0xcbf29ce484222325ull;
+
+		for (unsigned i = 0; i < 4 * 4 * tb; i++) {
+			digest = (digest ^ bytes[i]) * 0x100000001b3ull;
+		}
+		printf("drvtest: draw: digest of attachment 2 (%s, 4x4, pixel format %lu, %u "
+		       "bytes): fnv1a64 %016llx\n", shader, (unsigned long)draw_target_format,
+		       4 * 4 * tb, digest);
 	}
 	printf("drvtest: draw: the pixel at (0, 0) of attachment 2 is %u %u %u %u\n",
 	       pixel[0], pixel[1], pixel[2], pixel[3]);
@@ -2695,6 +4466,26 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 			    targets);
 	}
 	fflush(stdout);
+
+	/* And what this draw made, released, so that the Vulkan back end's own count of
+	 * what it still holds (print_vk_counts, here and in main after the autorelease
+	 * pool this runs in has drained the command buffer) can say whether anything
+	 * leaked. Last, after every number above is printed: these releases have never
+	 * run on the device, and a fault in one must not cost the picture. */
+release:
+	print_vk_counts("after the draw, before releasing what it made");
+	[pipeline release];
+	[uniform release];
+	[corners release];
+	[coords release];
+	for (int i = 0; i < 4; i++) {
+		[dtex[i] release];
+	}
+	[dsamp release];
+	for (int i = 0; i < 3; i++) {
+		[targets[i] release];
+	}
+	[queue release];
 }
 
 /*
@@ -2721,6 +4512,16 @@ draw_path(id<MTLDevice> dev, const char *metallib)
  *
  * Which of the two runs is the pipeline's own answer (-writesDepth, out of the compiler
  * library's rwa_render_info) and not a flag here.
+ *
+ * ON BOTH BACK ENDS since M3c-2: --backend vk runs the same steps through air_vk.c's depth
+ * attachment, MTLDepthStencilState (Vulkan dynamic state) and rwa_depth_read, and every run
+ * ends in one machine-readable line, drvtest: depth-result (depth_path), so the gallium and
+ * vk runs of one boot can be compared line for line. Two things differ by GPU driver and not
+ * by this test: Stencil8 is a texture turnip makes and freedreno's Gallium driver does not
+ * (both then refuse it as a depth attachment, which has no depth aspect), and
+ * texturedFragment2DDepth's texture is a depth2d, which is a Depth32Float texture now and
+ * seeded with one value everywhere (DEPTH2D_SEED) -- where it used to be an RGBA32Float
+ * texture with the seed below, a binding Metal itself would not accept.
  */
 static MTLPixelFormat depth_attachment_format = MTLPixelFormatDepth32Float;
 
@@ -3064,8 +4865,37 @@ argbuf_path(id<MTLDevice> dev, const char *metallib)
 	       expected[2], expected[3]);
 }
 
+/*
+ * THE RESULT LINE of --draw-depth, one per run in one shape whatever happened, so the two
+ * runs of one boot (--backend gallium and --backend vk, M3c-2) can be put side by side the
+ * way --draw-all's drawall-result lines are:
+ *
+ *     drvtest: depth-result BACKEND FRAGMENT FORMAT VERDICT d D0 D1 D2 D3
+ *
+ * FORMAT is the MTLPixelFormat number. VERDICT is `discards` or `disagrees` for a shader
+ * that writes colour (the four-step test), `same` or `different` for one that stores
+ * [[depth]] (one step; D1..D3 are then 0), or how it stopped -- `no-pipeline REASON`,
+ * `no-texture REASON`, `no-depth-attachment`, `stopped` -- with no depths after it. The
+ * depths are the buffer's texel (0, 0) after each step, %.9g, which is exact for
+ * Depth32Float and shows Depth16Unorm's quantum.
+ */
+static char depth_result[320];
+
+static void depth_path_steps(id<MTLDevice> dev, const char *metallib);
+
 static void
 depth_path(id<MTLDevice> dev, const char *metallib)
+{
+	depth_result[0] = '\0';
+	depth_path_steps(dev, metallib);
+	printf("drvtest: depth-result %s %s %lu %s\n", backend_is_vk() ? "vk" : "gallium",
+	       fragment_function, (unsigned long)depth_attachment_format,
+	       depth_result[0] != '\0' ? depth_result : "stopped");
+	fflush(stdout);
+}
+
+static void
+depth_path_steps(id<MTLDevice> dev, const char *metallib)
 {
 	NSError *err = nil;
 	NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:metallib]];
@@ -3131,6 +4961,7 @@ depth_path(id<MTLDevice> dev, const char *metallib)
 	if (zt == nil) {
 		printf("drvtest: depth: the depth attachment could not be made; the driver has "
 		       "printed the compiler library's own reason\n");
+		snprintf(depth_result, sizeof(depth_result), "no-depth-attachment");
 		return;
 	}
 	printf("drvtest: depth: the depth attachment is a %s of pixel format %lu\n",
@@ -3174,6 +5005,8 @@ depth_path(id<MTLDevice> dev, const char *metallib)
 	       err != nil ? ", error: " : "",
 	       err != nil ? [[err localizedDescription] UTF8String] : "");
 	if (pipeline == nil) {
+		snprintf(depth_result, sizeof(depth_result), "no-pipeline %s",
+			 err != nil ? [[err localizedDescription] UTF8String] : "(no reason)");
 		return;
 	}
 	SEL writes = sel_getUid("writesDepth");
@@ -3268,9 +5101,14 @@ depth_path(id<MTLDevice> dev, const char *metallib)
 	if (!textures_for_shader(dev, fragment, dtex, RW_TEX_SLOTS, &declared, texwhy,
 				 sizeof(texwhy))) {
 		printf("drvtest: depth: %s: %s\n", fragment_function, texwhy);
+		snprintf(depth_result, sizeof(depth_result), "no-texture %s", texwhy);
 		return;
 	}
 	bool declared_3d = false;
+	/* A depth2d slot is a Depth32Float texture since M3c-2, already seeded by
+	 * textures_for_shader with DEPTH2D_SEED in every texel: there is no per-texel write of a
+	 * depth texture on either back end (DEPTH2D_SEED says why), so it is left as it is. */
+	bool depth_seeded = false;
 
 	for (unsigned i = 0; i < RW_TEX_SLOTS; i++) {
 		if (dtex[i] == nil) {
@@ -3278,6 +5116,10 @@ depth_path(id<MTLDevice> dev, const char *metallib)
 		}
 		if ([dtex[i] textureType] == MTLTextureType3D) {
 			declared_3d = true;
+		}
+		if ([dtex[i] pixelFormat] == MTLPixelFormatDepth32Float) {
+			depth_seeded = true;
+			continue;
 		}
 		if (shader_writes_depth) {
 			fill_depth_texture(dtex[i]);
@@ -3290,6 +5132,8 @@ depth_path(id<MTLDevice> dev, const char *metallib)
 		[sd release];
 		printf("drvtest: depth: %u texture slot%s declared, seeded with %s\n", declared,
 		       declared == 1 ? "" : "s",
+		       depth_seeded ? "0.0859375 in every texel (a depth2d slot, given a "
+				      "Depth32Float texture cleared to that value)" :
 		       shader_writes_depth ? "(x + 4y + 16z + 0.5) / 64 in every channel"
 					   : "air_run's texels");
 	}
@@ -3420,12 +5264,19 @@ depth_path(id<MTLDevice> dev, const char *metallib)
 
 		printf("drvtest: depth: the shader sampled texel (1, 1, %u) and stored %.9g to "
 		       "[[depth]]; the buffer holds %.9g\n", declared_3d ? 1 : 0, want, got);
+		if (depth_seeded) {
+			printf("drvtest: depth: its depth2d texture holds 0.0859375 in EVERY texel, "
+			       "so this says the depth texture was sampled and stored, and not "
+			       "which texel\n");
+		}
 		printf("drvtest: depth: the quad's own depth was 0.5 and the clear was 1, so "
 		       "neither could be mistaken for it\n");
 		printf("drvtest: depth: %s\n", same && uniform_depth ?
 		       "THE SAME -- a Metal fragment shader's [[depth]] reached the depth "
 		       "buffer on the Adreno" :
 		       "DIFFERENT, and a depth buffer that is nearly right is worse than none");
+		snprintf(depth_result, sizeof(depth_result), "%s d %.9g 0 0 0",
+			 same && uniform_depth ? "same" : "different", got);
 	} else {
 		bool far_discarded = memcmp(pixel[1], pixel[0], sizeof(pixel[0])) == 0;
 		bool nearer_drawn = memcmp(pixel[2], pixel[0], sizeof(pixel[0])) != 0;
@@ -3461,6 +5312,10 @@ depth_path(id<MTLDevice> dev, const char *metallib)
 		       "write and the buffer all agree" :
 		       "SOMETHING ABOVE DISAGREES, and a depth test that is nearly right is "
 		       "worse than none");
+		snprintf(depth_result, sizeof(depth_result), "%s d %.9g %.9g %.9g %.9g",
+			 far_discarded && nearer_drawn && control_drawn && depths_right &&
+			 uniform_depth ? "discards" : "disagrees",
+			 depth_at[0], depth_at[1], depth_at[2], depth_at[3]);
 	}
 	fflush(stdout);
 }
@@ -3486,6 +5341,8 @@ fault(int sig, siginfo_t *info, void *uap)
 		lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
 		fp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
 	}
+	/* --quiet (M4): the console back first, with what the workload had printed so far */
+	cost_capture_rescue();
 	printf("drvtest: SIGNAL %d at %p\n", sig, info != NULL ? info->si_addr : NULL);
 	for (int i = 0; i < 10; i++) {
 		uintptr_t at = i == 0 ? pc : i == 1 ? lr : 0;
@@ -3771,14 +5628,337 @@ blit_test(id<MTLDevice> dev)
  * 256 shaders that declare no texture are bound what they were bound before and their pixels
  * stay comparable with that run's.
  */
+/*
+ * ONE NUMBER PER ATTACHMENT, for the per-shader result line of --draw-all: FNV-1a over the
+ * whole 4x4 picture exactly as -getBytes: returns it, rows tightly packed -- the digest
+ * --draw prints for its first step, over every attachment instead of one. Nothing is
+ * decoded first, so a difference anywhere in any channel changes it, and it is the same
+ * code whichever back end drew, which is what lets two logs of one boot be compared
+ * shader by shader on the host.
+ */
+/*
+ * M5c: the digest of a shader that writes fewer channels than the attachment has, over the channel it
+ * writes. texturedFragment2DStencil and ...Multisample return one ushort (of the corpus's 271, the only
+ * two: `air.render_target` of every function, by the native air2nir), and this sweep draws everything
+ * into RGBA32Uint, so G, B and A held whatever a GPU leaves, moved from boot to boot, and were carried
+ * as "undefined channels aside" through every comparison since M3b. That shape is this harness's and
+ * not a Metal one: real Metal refuses the pipeline ("fragment shader color output does not have enough
+ * components for the pixel format", on an M1), so it has no value for those channels to match. A
+ * stencil READ has one, (s, 0, 0, 1), on real Metal and on vk: view-x32s8.
+ */
+static bool target_digest_first_word_only;
+
+static unsigned long long
+target_digest(id<MTLTexture> target)
+{
+	unsigned tb = texel_bytes_of(draw_target_format);
+	unsigned char grid[4 * 4 * 16];
+	unsigned long long digest = 0xcbf29ce484222325ull;
+
+	memset(grid, 0, sizeof(grid));
+	[target getBytes:grid bytesPerRow:4 * tb fromRegion:MTLRegionMake2D(0, 0, 4, 4)
+	      mipmapLevel:0];
+	for (unsigned i = 0; i < 4 * 4 * tb; i++) {
+		if (target_digest_first_word_only && i % tb >= 4) {
+			continue;
+		}
+		digest = (digest ^ grid[i]) * 0x100000001b3ull;
+	}
+	return digest;
+}
+
+/*
+ * The same FNV-1a over a DEPTH attachment (M3c-2): the sixteen floats the driver's own aspect
+ * reader gives back (hkReadDepth -> rwa_depth_read, which decodes with Mesa's unpackers on
+ * both back ends, so Depth32Float comes back as the bits that were stored), row-major, as
+ * bytes. -getBytes: is no use here -- both compiler libraries refuse a depth texture through
+ * it by name -- and the depth at (0, 0) is handed back as well for the human-readable line.
+ * False when the driver is older than this test or the read is refused.
+ */
+static bool
+depth_digest(id<MTLTexture> zt, unsigned long long *digest, float *first)
+{
+	SEL sel = sel_getUid("hkReadDepth:stencil:fromRegion:");
+	float map[4 * 4];
+
+	*digest = 0xcbf29ce484222325ull;
+	*first = 0.0f;
+	if (![zt respondsToSelector:sel]) {
+		return false;
+	}
+	memset(map, 0, sizeof(map));
+	if (!((BOOL (*)(id, SEL, float *, uint8_t *, MTLRegion))objc_msgSend)(
+		zt, sel, map, NULL, MTLRegionMake2D(0, 0, 4, 4))) {
+		return false;
+	}
+	const unsigned char *b = (const unsigned char *)map;
+
+	for (unsigned i = 0; i < sizeof(map); i++) {
+		*digest = (*digest ^ b[i]) * 0x100000001b3ull;
+	}
+	*first = map[0];
+	return true;
+}
+
+/*
+ * WHAT APPLE'S SIX MULTISAMPLE SHADERS MUST DRAW HERE (M3c-3), computed from the clear that
+ * filled their texture and from nothing either back end said -- so a vk line can be judged
+ * where Gallium has no line to compare it with (the depth one: KNOWN_ISSUES K28).
+ *
+ * Texture 0 holds ms_seed(0) = (100, 200, 300, 400) in every sample of every texel. What
+ * each shader does with it, read off its own AIR (llvm-dis of AppleMetalGLRenderer's
+ * default.metallib; every coordinate is the generated stage's constant 0.375, floored to
+ * texel (0, 0)):
+ *
+ *   texturedFragment2DFloatMultisamplePoint   sum of read(coord, i) over get_num_samples()
+ *                                             samples, divided by the count: the seed, as
+ *                                             four floats, into render targets 0-3
+ *   texturedFragment2DFloatMultisampleLinear  the same sum at texels (0,0) (0,1) (1,0)
+ *                                             (1,1), mixed by fract(0.375) and divided by
+ *                                             the count: the seed again -- a mix of four
+ *                                             equal values is that value, exactly, and so
+ *                                             is 4 x 100 / 4 in floats
+ *   texturedFragment2DIntMultisample          the integer sum (sdiv by the count): the seed
+ *   texturedFragment2DUIntMultisample         (udiv): the seed. 4 x 400 does not wrap
+ *   texturedFragment2DStencilMultisample      read(coord, 0) of a texture2d_ms<ushort>,
+ *                                             channel 0 as an i16 into target 0: 100 in R,
+ *                                             G/B/A of target 0 not defined by the shader
+ *                                             (its one-sample twin leaves them holding
+ *                                             whatever each GPU leaves, M3b)
+ *   texturedFragment2DDepthMultisample        read_depth_2d_ms(coord, 0) stored to
+ *                                             [[depth]], no colour: the depth attachment
+ *                                             holds DEPTH2D_SEED, the clear of its
+ *                                             depth2d_ms texture, in all sixteen texels
+ *
+ * In this harness's RGBA32Uint attachments a float lands as its bits (100.0 is 1120403456,
+ * the convention texturedFragment2DFloat's 1120534528 = 101.0 already shows) and an
+ * integer as its value. The four averaging shaders write render targets 0-3; target 3 has
+ * no attachment here, and Metal drops that write. A target a shader does not write holds
+ * the pass's clear (--clear, 0 unless given), as its bits.
+ */
+enum ms_kind { MS_FLOAT, MS_INT, MS_UINT, MS_LOW16, MS_DEPTH };
+
+static const struct {
+	const char *name;
+	enum ms_kind kind;
+	unsigned targets;        /* which of t0..t2 the shader writes */
+} ms_expect[] = {
+	{ "texturedFragment2DFloatMultisamplePoint",  MS_FLOAT, 0x7 },
+	{ "texturedFragment2DFloatMultisampleLinear", MS_FLOAT, 0x7 },
+	{ "texturedFragment2DIntMultisample",         MS_INT,   0x7 },
+	{ "texturedFragment2DUIntMultisample",        MS_UINT,  0x7 },
+	{ "texturedFragment2DStencilMultisample",     MS_LOW16, 0x1 },
+	{ "texturedFragment2DDepthMultisample",       MS_DEPTH, 0x0 },
+};
+
+/* FNV-1a over sixteen copies of one 16-byte texel: the digest target_digest would print for
+ * a 4x4 RGBA32Uint attachment every pixel of which is `w`. */
+static unsigned long long
+uniform_digest(const unsigned w[4])
+{
+	unsigned char grid[4 * 4 * 16];
+
+	for (unsigned i = 0; i < 16; i++) {
+		memcpy(grid + 16 * i, w, 16);
+	}
+	return fnv1a(grid, sizeof(grid));
+}
+
+/*
+ * The check: -1 when `name` is not one of the six (or the attachments are not RGBA32Uint,
+ * which is what the table is computed for), 1 when every defined channel of every pixel of
+ * every attachment -- and the depth, for the depth shader -- is what it must be, 0 when
+ * anything is not. The line it prints says what was expected, so a reader needs no table.
+ */
+static int
+ms_check(const char *name, id<MTLTexture> *targets, bool zread, unsigned long long zdigest)
+{
+	int e = -1;
+
+	for (unsigned i = 0; i < sizeof(ms_expect) / sizeof(ms_expect[0]); i++) {
+		if (strcmp(name, ms_expect[i].name) == 0) {
+			e = (int)i;
+		}
+	}
+	if (e < 0) {
+		return -1;
+	}
+	if (draw_target_format != MTLPixelFormatRGBA32Uint) {
+		printf("drvtest: drawall %-34s ms: no expectation for attachments of pixel format "
+		       "%lu (it is computed for RGBA32Uint)\n", name,
+		       (unsigned long)draw_target_format);
+		return -1;
+	}
+	double seed[4];
+	float clearf = (float)draw_clear;
+	unsigned clearbits;
+
+	ms_seed(0, seed);
+	memcpy(&clearbits, &clearf, sizeof(clearbits));
+	printf("drvtest: drawall %-34s ms: texture 0 is %u samples of (%g %g %g %g) in every "
+	       "texel; it must draw", name, MS_SAMPLES, seed[0], seed[1], seed[2], seed[3]);
+
+	bool all = true;
+
+	for (unsigned t = 0; t < 3; t++) {
+		unsigned want[4], care = 0xf;
+
+		for (unsigned c = 0; c < 4; c++) {
+			want[c] = clearbits;
+		}
+		if (ms_expect[e].kind == MS_DEPTH) {
+			care = 0;           /* its colour output is undefined (undef in its AIR) */
+		} else if (ms_expect[e].targets & (1u << t)) {
+			for (unsigned c = 0; c < 4; c++) {
+				float f = (float)seed[c];
+
+				switch (ms_expect[e].kind) {
+				case MS_FLOAT:
+					memcpy(&want[c], &f, sizeof(f));
+					break;
+				case MS_INT:
+					want[c] = (unsigned)(int)seed[c];
+					break;
+				case MS_UINT:
+					want[c] = (unsigned)seed[c];
+					break;
+				default:        /* MS_LOW16: R alone */
+					want[c] = c == 0 ? ((unsigned)seed[0] & 0xffffu) : 0;
+					break;
+				}
+			}
+			if (ms_expect[e].kind == MS_LOW16) {
+				care = 0x1;
+			}
+		}
+		unsigned px[4 * 4 * 4];
+		unsigned good = 0;
+
+		memset(px, 0, sizeof(px));
+		[targets[t] getBytes:px bytesPerRow:4 * 16 fromRegion:MTLRegionMake2D(0, 0, 4, 4)
+			 mipmapLevel:0];
+		for (unsigned p = 0; p < 16; p++) {
+			bool same = true;
+
+			for (unsigned c = 0; c < 4; c++) {
+				if ((care & (1u << c)) && px[4 * p + c] != want[c]) {
+					same = false;
+				}
+			}
+			good += same;
+		}
+		all = all && good == 16;
+		if (care == 0) {
+			printf(" t%u anything", t);
+		} else if (care == 0xf) {
+			printf(" t%u %u %u %u %u (digest %016llx)", t, want[0], want[1], want[2],
+			       want[3], uniform_digest(want));
+		} else {
+			printf(" t%u R %u, GBA undefined", t, want[0]);
+		}
+		printf(" [%u/16]", good);
+	}
+	if (ms_expect[e].kind == MS_DEPTH) {
+		float d[16];
+
+		for (unsigned i = 0; i < 16; i++) {
+			d[i] = (float)DEPTH2D_SEED;
+		}
+		unsigned long long want = fnv1a((const unsigned char *)d, sizeof(d));
+		bool same = zread && zdigest == want;
+
+		printf(" d %.9g in all 16 (digest %016llx) [%s]", DEPTH2D_SEED, want,
+		       !zread ? "unreadable" : same ? "16/16" : "differs");
+		all = all && same;
+	}
+	printf(" -> %s\n", all ? "as computed" : "NOT as computed");
+	return all ? 1 : 0;
+}
+
 static void
 draw_every(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queue,
 	   MTLRenderPassDescriptor *rp, id<MTLBuffer> uniform, id<MTLTexture> *dtex,
 	   id<MTLSamplerState> dsamp, id<MTLTexture> *targets)
 {
+	/*
+	 * THE RESULT LINE, one per shader and in one shape whatever happened, so the two logs
+	 * of a boot that ran this once per back end (--backend) can be joined on the name:
+	 *
+	 *     drvtest: drawall-result BACKEND NAME drew t0 HEX t1 HEX t2 HEX
+	 *     drvtest: drawall-result BACKEND NAME no-texture REASON
+	 *     drvtest: drawall-result BACKEND NAME no-pipeline REASON
+	 *     drvtest: drawall-result BACKEND NAME refused-draw REASON
+	 *
+	 * REASON is the driver's own sentence (the compiler library's, through the NSError),
+	 * which is what names the rwa_* call that refused. The older lines stay as they were,
+	 * because tools/air/metalcheck.py reads them; this one is for the cross-back-end table.
+	 *
+	 * A SHADER THAT STORES [[depth]] (M3c-2) gets a depth attachment, and its `drew` line
+	 * one more field at the END, so the line still joins on the name and t0..t2 mean what
+	 * they always meant:
+	 *
+	 *     drvtest: drawall-result BACKEND NAME drew t0 HEX t1 HEX t2 HEX d HEX
+	 *
+	 * where d is FNV-1a over the depth attachment's sixteen floats (depth_digest), or
+	 * `d unreadable` when the driver would not give them back. How the sweep knows: it
+	 * asks for the pipeline as it always did, with three colour attachments and no depth
+	 * one, and BOTH compiler libraries refuse a shader that stores to [[depth]] there with
+	 * a sentence containing "stores to [[depth]]" (air_metal.c and air_vk.c say so in as
+	 * many words). Only after that refusal is the same descriptor asked again with a
+	 * MTLPixelFormatDepth32Float attachment -- so a shader that does not store depth is
+	 * asked exactly what it was asked before, and the 269 lines without a `d` are the
+	 * lines of the runs before this. The pass then clears the depth to 1.0, binds a state
+	 * of MTLCompareFunctionAlways with depth writes on (Metal's default state writes no
+	 * depth, so without it the store would go nowhere), and the shader's own textures are
+	 * seeded in (0, 1) the way --draw-depth seeds them, because the shader stores what it
+	 * samples and air_run's 100.0 would land outside every depth there is. In Apple's
+	 * library two shaders take this road: texturedFragment2DDepth (a depth2d texture,
+	 * DEPTH2D_SEED everywhere, so d is sixteen 0.0859375s) and texturedFragment3DDepth (a
+	 * texture3d of RGBA32Float, texel (1, 1, 1) = 0.3359375).
+	 *
+	 * [M3c-3: three, with texturedFragment2DDepthMultisample (a depth2d_ms texture of
+	 * MS_SAMPLES, DEPTH2D_SEED in every sample). And ON GALLIUM NONE OF THEM IS DRAWN unless
+	 * --gallium-depth-stores is given: a fragment [[depth]] store times that back end's GPU
+	 * out (docs/KNOWN_ISSUES.md K28, run 030433, four core recoveries in one boot), so the
+	 * line is a refusal by name there, in the same shape:
+	 *
+	 *     drvtest: drawall-result gallium NAME refused-draw not drawn: it stores [[depth]] ...
+	 *
+	 * A SHADER THAT READS A MULTISAMPLE TEXTURE gets one more field at the END of its
+	 * `drew` line, after any `d`, which says whether what it drew is what ms_check computed
+	 * from the clear that filled its texture:
+	 *
+	 *     drvtest: drawall-result BACKEND NAME drew t0 HEX t1 HEX t2 HEX [d HEX] ms match
+	 *     drvtest: drawall-result BACKEND NAME drew t0 HEX t1 HEX t2 HEX [d HEX] ms differs
+	 *
+	 * and the human line before it says what each attachment had to hold, with the digest
+	 * that makes, so the t0..t2 of a back end with no partner line can still be judged.]
+	 */
+	const char *backend = backend_is_vk() ? "vk" : "gallium";
 	unsigned drew = 0, refused = 0, nopipe = 0, notex = 0, asked = 0;
+	/* The depth attachment and the writing state, made the first time a shader needs them
+	 * and released at the end, so a sweep that meets no depth shader makes neither. */
+	id<MTLTexture> zt = nil;
+	id<MTLDepthStencilState> zwrite = nil;
+	unsigned depth_pipes = 0;
 
 	unsigned seen = 0;
+
+	/*
+	 * WHAT THE VULKAN BACK END HOLDS WHILE THE SWEEP RUNS, every 50 shaders attempted and
+	 * once at the end, with the highest command-buffer and fence counts seen at those
+	 * points. Run 020900 counted 208 command buffers and 208 fences in use after its 211
+	 * shaders, before releasing (and run 020036 54 after 60): each Metal command buffer
+	 * gave its rwa fence back only in -dealloc, and
+	 * [queue commandBuffer] here is autoreleased with no pool per shader, so nothing was
+	 * given back until the sweep ended. hkmetal.m now gives the fence back when the
+	 * command buffer completes; these lines are how a run shows whether it does. There is
+	 * deliberately NO @autoreleasepool in this loop: one would hide the very thing being
+	 * measured. Nothing is printed on Gallium (print_vk_counts_into says so by returning
+	 * false).
+	 */
+	unsigned vk_most_cmd = 0, vk_most_fence = 0;
+	bool vk_counted = false;
 
 	for (NSString *name in [library functionNames]) {
 		id<MTLFunction> fn = [library newFunctionWithName:name];
@@ -3787,8 +5967,37 @@ draw_every(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queue,
 		if (fn == nil || [fn functionType] != MTLFunctionTypeFragment) {
 			continue;
 		}
-		if (seen++ < draw_from || drew + refused + nopipe + notex >= draw_count) {
+		/* --draw-one NAME (M3c-3): that function and no other, wherever it stands in
+		 * -functionNames' order; the index is still counted, so the summary says how
+		 * many there were */
+		if (draw_one != NULL) {
+			seen++;
+			if (strcmp([name UTF8String], draw_one) != 0) {
+				continue;
+			}
+		} else if (seen++ < draw_from || drew + refused + nopipe + notex >= draw_count) {
 			continue;
+		}
+		/* M4: the phases of a timed sweep (cost_phase; a no-op outside --quiet's bracket):
+		 * setup from here, the pipeline, the draw from -commandBuffer to its wait, the
+		 * readback after it */
+		cost_phase(COST_SETUP);
+		/* Every way out of an attempt below adds one to exactly one of the four
+		 * counts, so their sum here is the shaders attempted so far, and a sum that
+		 * is a multiple of 50 is the point right after the 50th, 100th... finished. */
+		unsigned attempted = drew + refused + nopipe + notex;
+
+		if (attempted > 0 && attempted % 50 == 0) {
+			char when[64];
+			unsigned n[4];
+
+			snprintf(when, sizeof(when), "during --draw-all after %u shaders",
+				 attempted);
+			if (print_vk_counts_into(when, n)) {
+				vk_counted = true;
+				vk_most_cmd = n[0] > vk_most_cmd ? n[0] : vk_most_cmd;
+				vk_most_fence = n[1] > vk_most_fence ? n[1] : vk_most_fence;
+			}
 		}
 		/*
 		 * What THIS shader declares, made for it, before anything is bound. The slots
@@ -3805,6 +6014,8 @@ draw_every(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queue,
 			notex++;
 			printf("drvtest: drawall %-34s no texture: %s\n", [name UTF8String],
 			       whynot);
+			printf("drvtest: drawall-result %s %s no-texture %s\n", backend,
+			       [name UTF8String], whynot);
 			release_slots(own, RW_TEX_SLOTS);
 			continue;
 		}
@@ -3824,33 +6035,122 @@ draw_every(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queue,
 		printf("drvtest: drawall %-34s about to draw, %u declared texture%s\n",
 		       [name UTF8String], ndecl, ndecl == 1 ? "" : "s");
 		fflush(stdout);
+		cost_phase(COST_PIPELINE);
 		MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
 
 		[pd setFragmentFunction:fn];
 		[pd setVertexFunction:nil];
 		for (int i = 0; i < 3; i++) {
 			[[[pd colorAttachments] objectAtIndexedSubscript:i]
-			    setPixelFormat:MTLPixelFormatRGBA32Uint];
+			    setPixelFormat:draw_target_format];
 		}
 		id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd
 										   error:&err];
+		/* The [[depth]] retry (the comment at the top of this function): that one
+		 * refusal, and nothing else, asks again with a depth attachment. */
+		bool with_depth = false;
+
+		if (ps == nil && err != nil &&
+		    strstr([[err localizedDescription] UTF8String], "stores to [[depth]]") != NULL) {
+			printf("drvtest: drawall %-34s stores to [[depth]]: asked again with a "
+			       "MTLPixelFormatDepth32Float attachment\n", [name UTF8String]);
+			[pd setDepthAttachmentPixelFormat:MTLPixelFormatDepth32Float];
+			err = nil;
+			ps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+			with_depth = ps != nil;
+		}
 		[pd release];
+		cost_phase(COST_SETUP);
+		/* K28 (the comment at the top of this function): not drawn on Gallium, by name */
+		if (with_depth && !backend_is_vk() && !gallium_depth_stores) {
+			refused++;
+			printf("drvtest: drawall %-34s not drawn: it stores [[depth]], and on the "
+			       "Gallium back end that times the GPU out (KNOWN_ISSUES K28); "
+			       "--gallium-depth-stores draws it anyway\n", [name UTF8String]);
+			printf("drvtest: drawall-result %s %s refused-draw not drawn: it stores "
+			       "[[depth]], which times the Gallium back end's GPU out (KNOWN_ISSUES "
+			       "K28)\n", backend, [name UTF8String]);
+			[ps release];
+			release_slots(own, RW_TEX_SLOTS);
+			continue;
+		}
+		if (with_depth && (zt == nil || zwrite == nil)) {
+			MTLTextureDescriptor *ztd = [MTLTextureDescriptor
+			    texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+							 width:4 height:4 mipmapped:NO];
+			MTLDepthStencilDescriptor *dsd = [[MTLDepthStencilDescriptor alloc] init];
+
+			[ztd setUsage:MTLTextureUsageRenderTarget];
+			[dsd setDepthCompareFunction:MTLCompareFunctionAlways];
+			[dsd setDepthWriteEnabled:YES];
+			if (zt == nil) {
+				zt = [dev newTextureWithDescriptor:ztd];
+			}
+			if (zwrite == nil) {
+				zwrite = [dev newDepthStencilStateWithDescriptor:dsd];
+			}
+			[dsd release];
+			if (zt == nil || zwrite == nil) {
+				refused++;
+				printf("drvtest: drawall-result %s %s refused-draw no %s could be made "
+				       "for its [[depth]]\n", backend, [name UTF8String],
+				       zt == nil ? "Depth32Float attachment" : "depth/stencil state");
+				[ps release];
+				release_slots(own, RW_TEX_SLOTS);
+				continue;
+			}
+		}
+		if (with_depth) {
+			/* what it samples is what it stores: seeded in (0, 1), as --draw-depth
+			 * seeds it; a depth2d slot is already DEPTH2D_SEED everywhere */
+			depth_pipes++;
+			for (unsigned k = 0; k < RW_TEX_SLOTS; k++) {
+				if (own[k] != nil &&
+				    [own[k] pixelFormat] != MTLPixelFormatDepth32Float) {
+					fill_depth_texture(own[k]);
+				}
+			}
+		}
 		if (ps == nil) {
 			nopipe++;
 			printf("drvtest: drawall %-34s no pipeline: %s\n", [name UTF8String],
 			       err != nil ? [[err localizedDescription] UTF8String] : "(no reason)");
+			printf("drvtest: drawall-result %s %s no-pipeline %s\n", backend,
+			       [name UTF8String],
+			       err != nil ? [[err localizedDescription] UTF8String] : "(no reason)");
 			release_slots(own, RW_TEX_SLOTS);
 			continue;
 		}
+		cost_phase(COST_WORK);
 		id<MTLCommandBuffer> cmd = [queue commandBuffer];
+		/* The depth attachment is in the pass only for a pipeline made with one, and
+		 * taken out again as soon as the encoder has read the descriptor: the caller's
+		 * rp is shared with every other shader of the sweep. */
+		MTLRenderPassDepthAttachmentDescriptor *za = [rp depthAttachment];
+
+		if (with_depth) {
+			[za setTexture:zt];
+			[za setLoadAction:MTLLoadActionClear];
+			[za setClearDepth:1.0];
+			[za setStoreAction:MTLStoreActionStore];
+		}
 		id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
 
+		if (with_depth) {
+			[za setTexture:nil];
+		}
 		if (enc == nil) {
+			refused++;
+			printf("drvtest: drawall-result %s %s refused-draw no render command encoder\n",
+			       backend, [name UTF8String]);
 			[ps release];
 			release_slots(own, RW_TEX_SLOTS);
 			continue;
 		}
 		[enc setRenderPipelineState:ps];
+		if (with_depth) {
+			[enc setDepthStencilState:zwrite];
+		}
 		for (int i = 0; i < 16; i++) {
 			[enc setFragmentBuffer:uniform offset:0 atIndex:i];
 			/* this shader's own texture where it declared one, and the sweep's
@@ -3870,6 +6170,7 @@ draw_every(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queue,
 		[enc endEncoding];
 		[cmd commit];
 		[cmd waitUntilCompleted];
+		cost_phase(COST_READBACK);
 
 		if ([cmd status] != RW_CB_COMPLETED) {
 			refused++;
@@ -3877,6 +6178,10 @@ draw_every(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queue,
 			       (unsigned long)[cmd status],
 			       [cmd error] != nil ?
 			       [[[cmd error] localizedDescription] UTF8String] : "");
+			printf("drvtest: drawall-result %s %s refused-draw status %lu %s\n", backend,
+			       [name UTF8String], (unsigned long)[cmd status],
+			       [cmd error] != nil ?
+			       [[[cmd error] localizedDescription] UTF8String] : "(no reason)");
 			[ps release];
 			release_slots(own, RW_TEX_SLOTS);
 			continue;
@@ -3896,9 +6201,25 @@ draw_every(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queue,
 				mipmapLevel:0];
 			printf(" t%d %u %u %u %u", t, pixel[0], pixel[1], pixel[2], pixel[3]);
 		}
+		/* and the depth, for a shader drawn with a depth attachment (read once, here,
+		 * and printed in both lines) */
+		unsigned long long zdigest = 0;
+		float zfirst = 0.0f;
+		bool zread = with_depth && depth_digest(zt, &zdigest, &zfirst);
+
+		if (with_depth) {
+			if (zread) {
+				printf(" depth %.9g", zfirst);
+			} else {
+				printf(" depth unreadable");
+			}
+		}
 		/* What was bound, on the same line as the pixel: a row of this table is only
 		 * a measurement if what it was measured against is in it, and metalcheck.py
 		 * has to know which shape air_run should hold to produce the reference. */
+		/* (and the sample count of a multisample one, M3c-3: "0=4:125x4") */
+		bool any_ms = false;
+
 		if (ndecl > 0) {
 			printf(" tex");
 			for (unsigned k = 0; k < RW_TEX_SLOTS; k++) {
@@ -3906,18 +6227,448 @@ draw_every(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queue,
 					printf(" %u=%lu:%lu", k,
 					       (unsigned long)[own[k] textureType],
 					       (unsigned long)[own[k] pixelFormat]);
+					if ([own[k] sampleCount] > 1) {
+						printf("x%lu", (unsigned long)[own[k] sampleCount]);
+						any_ms = true;
+					}
 				}
 			}
+		}
+		printf("\n");
+		/* what a multisample shader had to draw, computed (ms_check), before the
+		 * result line that carries the verdict */
+		int ms = any_ms ? ms_check([name UTF8String], targets, zread, zdigest) : -1;
+
+		target_digest_first_word_only = [name hasPrefix:@"texturedFragment2DStencil"];
+		printf("drvtest: drawall-result %s %s drew", backend, [name UTF8String]);
+		for (int t = 0; t < 3; t++) {
+			printf(" t%d %016llx", t, target_digest(targets[t]));
+		}
+		if (with_depth) {
+			if (zread) {
+				printf(" d %016llx", zdigest);
+			} else {
+				printf(" d unreadable");
+			}
+		}
+		if (ms >= 0) {
+			printf(" ms %s", ms ? "match" : "differs");
 		}
 		printf("\n");
 		[ps release];
 		release_slots(own, RW_TEX_SLOTS);
 	}
+	[zt release];
+	[zwrite release];
+	/* --draw-one with a name the library has no fragment function of: said in the result
+	 * line's own shape, so a job line that misspelt it is a line and not a silence */
+	if (draw_one != NULL && drew + refused + nopipe + notex == 0) {
+		nopipe++;
+		printf("drvtest: drawall-result %s %s no-pipeline the library has no fragment "
+		       "function of that name\n", backend, draw_one);
+	}
+	{
+		char when[64];
+		unsigned n[4];
+
+		snprintf(when, sizeof(when), "during --draw-all after %u shaders (the end)",
+			 drew + refused + nopipe + notex);
+		if (print_vk_counts_into(when, n)) {
+			vk_counted = true;
+			vk_most_cmd = n[0] > vk_most_cmd ? n[0] : vk_most_cmd;
+			vk_most_fence = n[1] > vk_most_fence ? n[1] : vk_most_fence;
+		}
+		if (vk_counted) {
+			printf("drvtest: vk counts during --draw-all: at most %u command buffers "
+			       "and %u fences in use at those points (every 50 shaders and the "
+			       "end)\n", vk_most_cmd, vk_most_fence);
+		}
+	}
+	/* for --quiet's cost line (M4, W2) */
+	draw_every_attempted = drew + refused + nopipe + notex;
+	draw_every_drew = drew;
+	/* before the two summaries, which stay the last lines of a sweep (metalcheck.py reads
+	 * the second as the end) */
+	printf("drvtest: drawall-depth %s %u stored to [[depth]] and were given a Depth32Float "
+	       "attachment for it\n", backend, depth_pipes);
+	printf("drvtest: drawall-summary %s drew %u no-pipeline %u refused-draw %u "
+	       "no-texture %u (of %u fragment shaders from index %u)\n", backend, drew, nopipe,
+	       refused, notex, seen, draw_from);
 	printf("drvtest: drawall: %u drew, %u refused at the draw, %u got no pipeline, "
 	       "%u could not be given the textures they declare (of the %u fragment shaders "
 	       "from index %u; %u declared a texture and were bound what they declared)\n",
 	       drew, refused, nopipe, notex, seen, draw_from, asked);
 	fflush(stdout);
+}
+
+/*
+ * --draw-msaa [N]: A MULTISAMPLE PASS AND ITS RESOLVE, ON THE HARDWARE (M3c-3).
+ *
+ * The fragment function (--fragment, clearFragment20 unless given) drawn over the generated
+ * quad into THREE attachments of N samples each (4 unless given) and of --rtfmt's format
+ * (RGBA32Uint unless given), cleared to --clear first, each with
+ * MTLStoreActionMultisampleResolve and a one-sample resolveTexture -- so what is read back
+ * is the resolve, which is the only way a multisample texture reaches the processor. Two
+ * passes, because they measure two different things:
+ *
+ *   full      the strip of four: every sample of every pixel covered, so every sample holds
+ *             the shader's colour and so does any resolve of them, averaged or not.
+ *             Attachment 2's resolve must be that colour in all 16 pixels, and attachments
+ *             0 and 1 (which these shaders do not write) the clear in all 32.
+ *   triangle  vertices 0-2 only: the half of the quad below the anti-diagonal, whose edge
+ *             runs through the CENTRES of the four pixels on that diagonal. At one sample
+ *             each of those is in or out; at N samples it is cut, half its samples on each
+ *             side under Vulkan's standard sample positions (2x: offsets of +-0.25 on both
+ *             axes; 4x: x+y offsets of -0.5, -0.25, 0.25, 0.5). So an AVERAGE resolve makes
+ *             those four pixels exactly half way between the colour and the clear, and a
+ *             SAMPLE_ZERO resolve makes each of them one or the other. A "between" count of
+ *             4 is the evidence that there were N samples and that they were averaged; 0
+ *             with a float format would say the pass was single-sampled.
+ *
+ * WHAT THE COLOUR MUST BE is computed here and not taken from either back end, for the three
+ * of Apple's clear shaders that write render target 2 alone, each returning one member of the
+ * ClearFragmentInput at [[buffer(14)]], which this test fills (i * 7 + 13) & 0xff byte by byte:
+ *
+ *   clearFragment10   float4 f  at bytes 0-15:  572199949 1043804201 1515408453 1987012705
+ *                     (as floats 2.1017e-18 0.178894654 1.48687698e16 1.21394141e33,
+ *                     all normal, so an exact average of equal samples gives them back)
+ *   clearFragment20   int4 i    at bytes 16-31: 2458616957 2930221209 3401825461 3873429713
+ *   clearFragment30   uint4 ui  at bytes 32-47: 50066669 504827913 976432165 1448036417
+ *
+ * (In a 4x4 attachment of one such colour the digest is fc5fe79f32951325 for
+ * clearFragment20 -- M3b's own number for it -- and d759cde1d8a7ef25 for clearFragment10.)
+ *
+ * (clearFragment20's four words are docs/metal.md 10.22's, softpipe's and both back ends'
+ * since M3a.) The resolve mode is the one the Vulkan back end uses for the format, which is
+ * Vulkan's requirement: SAMPLE_ZERO for an integer format, AVERAGE for a floating-point or
+ * normalised one. So `--rtfmt rgba32uint --fragment clearFragment20` (or rgba32sint) is the
+ * SAMPLE_ZERO check and `--rtfmt rgba32float --fragment clearFragment10` the AVERAGE one,
+ * whose average of N equal floats must be the float itself; `ulps` says by how many units in
+ * the last place it is not, which is 0 for an exact resolve.
+ *
+ * And the processor's way into a multisample texture is tried and must be refused, by the
+ * compiler library on both back ends (its sentence is the driver's line just above this
+ * program's): -getBytes: must leave the caller's bytes as they were.
+ *
+ * THE RESULT LINE, in one shape whatever happened, joined across back ends on the name:
+ *
+ *     drvtest: msaa-result BACKEND FUNCTION FORMAT SAMPLES MODE full G/16 px W W W W
+ *              expect W W W W|none ulps U others O/32 tri value V clear C between B half H
+ *              digest HEX
+ *     drvtest: msaa-result BACKEND FUNCTION FORMAT SAMPLES MODE no-pipeline|no-texture|
+ *              refused-draw REASON
+ */
+static int
+clear_member_offset(const char *shader)
+{
+	return strcmp(shader, "clearFragment10") == 0 ? 0 :
+	       strcmp(shader, "clearFragment20") == 0 ? 16 :
+	       strcmp(shader, "clearFragment30") == 0 ? 32 : -1;
+}
+
+static bool
+format_is_integer(MTLPixelFormat f)
+{
+	return f == MTLPixelFormatRGBA32Uint || f == MTLPixelFormatRGBA32Sint ||
+	       f == MTLPixelFormatRGBA16Uint || f == MTLPixelFormatRGBA16Sint ||
+	       f == MTLPixelFormatR32Uint;
+}
+
+static void
+msaa_path(id<MTLDevice> dev, const char *metallib)
+{
+	const char *backend = backend_is_vk() ? "vk" : "gallium";
+	const char *shader = fragment_function;
+	const unsigned n = msaa_samples;
+	const MTLPixelFormat fmt = draw_target_format;
+	const unsigned tb = texel_bytes_of(fmt);
+	const char *mode = format_is_integer(fmt) ? "sample-zero" : "average";
+	NSError *err = nil;
+
+#define MSAA_STOP(what, reason) \
+	printf("drvtest: msaa-result %s %s %lu %u %s %s %s\n", backend, shader, \
+	       (unsigned long)fmt, n, mode, (what), (reason))
+
+	if (n < 2) {
+		printf("drvtest: msaa: --draw-msaa %u: a multisample pass has two samples or more "
+		       "(Metal's own rule for a multisample texture)\n", n);
+		MSAA_STOP("no-texture", "a sample count below two");
+		return;
+	}
+	NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:metallib]];
+	dispatch_data_t dd = data != nil ? dispatch_data_create([data bytes], [data length], NULL,
+								DISPATCH_DATA_DESTRUCTOR_DEFAULT) : NULL;
+	id<MTLLibrary> library = dd != NULL ? [dev newLibraryWithData:dd error:&err] : nil;
+	id<MTLFunction> fragment = library != nil ?
+	    [library newFunctionWithName:[NSString stringWithUTF8String:shader]] : nil;
+
+	if (fragment == nil) {
+		printf("drvtest: msaa: no %s in %s\n", shader, metallib);
+		MSAA_STOP("no-pipeline", "no such fragment function");
+		return;
+	}
+	printf("drvtest: msaa: %s %s into three %u-sample attachments of pixel format %lu, each "
+	       "resolved into a one-sample texture (%s, what Vulkan requires of that format)\n",
+	       metallib, shader, n, (unsigned long)fmt, mode);
+
+	MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+
+	[pd setFragmentFunction:fragment];
+	[pd setVertexFunction:nil];
+	for (int i = 0; i < 3; i++) {
+		[[[pd colorAttachments] objectAtIndexedSubscript:i] setPixelFormat:fmt];
+	}
+	/* rasterSampleCount and sampleCount are one property of Metal's under two names; the
+	 * driver reads it as -sampleCount (hkmetal.m) */
+	[pd setRasterSampleCount:n];
+	id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+
+	[pd release];
+	printf("drvtest: msaa: the %u-sample pipeline: %s%s%s\n", n, ps != nil ? "made" : "NOT MADE",
+	       err != nil ? ": " : "", err != nil ? [[err localizedDescription] UTF8String] : "");
+	if (ps == nil) {
+		MSAA_STOP("no-pipeline", err != nil ? [[err localizedDescription] UTF8String]
+						     : "(no reason)");
+		return;
+	}
+
+	MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+										 width:4
+										height:4
+									     mipmapped:NO];
+	MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+										 width:4
+										height:4
+									     mipmapped:NO];
+
+	[md setTextureType:MTLTextureType2DMultisample];
+	[md setSampleCount:n];
+	[md setStorageMode:MTLStorageModePrivate];
+	[md setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+	[od setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+
+	id<MTLTexture> ms[3] = { nil, nil, nil }, one[3] = { nil, nil, nil };
+	id<MTLBuffer> uniform = nil;
+	id<MTLCommandQueue> queue = nil;
+	bool made = true;
+
+	for (int i = 0; i < 3; i++) {
+		ms[i] = [dev newTextureWithDescriptor:md];
+		one[i] = [dev newTextureWithDescriptor:od];
+		made = made && ms[i] != nil && one[i] != nil;
+	}
+	if (!made) {
+		MSAA_STOP("no-texture", "the attachments could not be made (the driver's sentence "
+				       "is the line above)");
+		goto out;
+	}
+
+	/* the processor's way in and out, which must be refused (and the driver says why) */
+	{
+		unsigned char probe[4 * 4 * 16];
+		bool untouched = true;
+
+		memset(probe, 0xa5, sizeof(probe));
+		[ms[2] getBytes:probe bytesPerRow:4 * tb fromRegion:MTLRegionMake2D(0, 0, 4, 4)
+		    mipmapLevel:0];
+		for (size_t i = 0; i < sizeof(probe); i++) {
+			untouched = untouched && probe[i] == 0xa5;
+		}
+		printf("drvtest: msaa: -getBytes: of a %u-sample texture %s (Metal forbids it; "
+		       "the compiler library's refusal is the driver's line above)\n", n,
+		       untouched ? "left the caller's bytes as they were" :
+				   "WROTE INTO the caller's bytes");
+		[ms[2] replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:probe
+			 bytesPerRow:4 * tb];
+		printf("drvtest: msaa: -replaceRegion: of it was asked as well; the driver's line "
+		       "above is its refusal\n");
+	}
+
+	uniform = [dev newBufferWithLength:256 options:0];
+	if (uniform != nil && [uniform contents] != NULL) {
+		unsigned char *bytes = [uniform contents];
+
+		for (int i = 0; i < 256; i++) {
+			bytes[i] = (unsigned char)((i * 7 + 13) & 0xff);
+		}
+	}
+	queue = [dev newCommandQueue];
+
+	/* the colour it must be, and the clear's bits (both back ends put the clear's float
+	 * bits in an integer channel, M3a) */
+	unsigned want[4] = { 0, 0, 0, 0 };
+	int member = clear_member_offset(shader);
+	bool known = member >= 0 && tb == 16 && uniform != nil;
+	float clearf = (float)draw_clear;
+	unsigned clearbits;
+
+	memcpy(&clearbits, &clearf, sizeof(clearbits));
+	if (known) {
+		memcpy(want, (const unsigned char *)[uniform contents] + member, sizeof(want));
+	}
+
+	unsigned grid[2][4 * 4 * 4];
+	unsigned others = 0;
+
+	for (int pass = 0; pass < 2; pass++) {
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+
+		for (int i = 0; i < 3; i++) {
+			MTLRenderPassColorAttachmentDescriptor *a =
+			    [[rp colorAttachments] objectAtIndexedSubscript:i];
+
+			[a setTexture:ms[i]];
+			[a setLoadAction:MTLLoadActionClear];
+			[a setClearColor:MTLClearColorMake(draw_clear, draw_clear, draw_clear,
+							   draw_clear)];
+			[a setStoreAction:MTLStoreActionMultisampleResolve];
+			[a setResolveTexture:one[i]];
+		}
+		id<MTLCommandBuffer> cmd = [queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+
+		if (enc == nil) {
+			MSAA_STOP("refused-draw", "no render command encoder");
+			goto out;
+		}
+		[enc setRenderPipelineState:ps];
+		for (int i = 0; i < 16; i++) {
+			[enc setFragmentBuffer:uniform offset:0 atIndex:i];
+		}
+		[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0
+			vertexCount:pass == 0 ? 4 : 3];
+		[enc endEncoding];
+		[cmd commit];
+		[cmd waitUntilCompleted];
+		if ([cmd status] != RW_CB_COMPLETED) {
+			char reason[320];
+
+			snprintf(reason, sizeof(reason), "status %lu %s", (unsigned long)[cmd status],
+				 [cmd error] != nil ?
+				 [[[cmd error] localizedDescription] UTF8String] : "(no reason)");
+			printf("drvtest: msaa: the %s pass: %s\n", pass == 0 ? "full" : "triangle",
+			       reason);
+			MSAA_STOP("refused-draw", reason);
+			goto out;
+		}
+		memset(grid[pass], 0, sizeof(grid[pass]));
+		[one[2] getBytes:grid[pass] bytesPerRow:4 * tb fromRegion:MTLRegionMake2D(0, 0, 4, 4)
+		     mipmapLevel:0];
+		if (pass == 0 && tb == 16) {
+			/* the attachments these shaders do not write: the clear, resolved */
+			for (int i = 0; i < 2; i++) {
+				unsigned px[4 * 4 * 4];
+
+				memset(px, 0, sizeof(px));
+				[one[i] getBytes:px bytesPerRow:4 * tb
+				      fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+				for (int p = 0; p < 16; p++) {
+					others += px[4 * p] == clearbits && px[4 * p + 1] == clearbits &&
+						  px[4 * p + 2] == clearbits && px[4 * p + 3] == clearbits;
+				}
+			}
+		}
+	}
+
+	/* the full pass: all 16 pixels against the colour, and how far a float one is off */
+	unsigned good = 0, ulps = 0;
+
+	for (int p = 0; p < 16 && tb == 16; p++) {
+		bool same = true;
+
+		for (int c = 0; c < 4; c++) {
+			unsigned g = grid[0][4 * p + c];
+			unsigned d = g > want[c] ? g - want[c] : want[c] - g;
+
+			same = same && g == want[c];
+			if (known && !format_is_integer(fmt) && d > ulps) {
+				ulps = d;   /* same sign, so the distance of the bits is in ulps */
+			}
+		}
+		good += known && same;
+	}
+	/* the triangle pass: each pixel the colour, the clear, or between them -- and of the
+	 * between ones, how many are exactly half way, which a float AVERAGE of two covered and
+	 * two uncovered samples (or one and one) is: (x + x + c + c) / 4 with c = 0 is x / 2,
+	 * exact in floats */
+	unsigned value = 0, clear = 0, between = 0, half = 0;
+	char map[4][5];
+
+	for (int p = 0; p < 16 && tb == 16; p++) {
+		const unsigned *g = &grid[1][4 * p];
+		bool is_value = known && g[0] == want[0] && g[1] == want[1] && g[2] == want[2] &&
+				g[3] == want[3];
+		bool is_clear = g[0] == clearbits && g[1] == clearbits && g[2] == clearbits &&
+				g[3] == clearbits;
+		bool is_half = false;
+
+		if (known && !is_value && !is_clear && fmt == MTLPixelFormatRGBA32Float &&
+		    draw_clear == 0) {
+			is_half = true;
+			for (int c = 0; c < 4; c++) {
+				float w, h;
+
+				memcpy(&w, &want[c], sizeof(w));
+				memcpy(&h, &g[c], sizeof(h));
+				is_half = is_half && h == w * 0.5f;
+			}
+		}
+		value += is_value;
+		clear += is_clear;
+		between += !is_value && !is_clear;
+		half += is_half;
+		map[p / 4][p % 4] = is_value ? 'V' : is_clear ? '.' : is_half ? 'h' : '?';
+		map[p / 4][4] = '\0';
+	}
+	if (tb == 16) {
+		for (int y = 0; y < 4; y++) {
+			printf("drvtest: msaa: the triangle pass, resolved row %d: %s   (V the colour, "
+			       ". the clear, h exactly half way, ? anything else)\n", y, map[y]);
+		}
+	}
+	printf("drvtest: msaa: the full pass resolved: pixel (0, 0) of attachment 2 is %u %u %u %u; "
+	       "%u of 16 pixels are", grid[0][0], grid[0][1], grid[0][2], grid[0][3], good);
+	if (known) {
+		printf(" %u %u %u %u, the member at byte %d of [[buffer(14)]]", want[0], want[1],
+		       want[2], want[3], member);
+	} else {
+		printf(" a computed colour: none here for %s in pixel format %lu (clearFragment10, 20 "
+		       "or 30 in a 16-byte format has one)", shader, (unsigned long)fmt);
+	}
+	printf("; %u of the 32 pixels of attachments 0 and 1 are the clear\n", others);
+	if (n == 2 || n == 4) {
+		printf("drvtest: msaa: expected under Vulkan's standard %u-sample positions: the "
+		       "triangle pass 6 colour, 6 clear and %s\n", n,
+		       format_is_integer(fmt) ? "4 of either, none between (SAMPLE_ZERO)"
+					      : "4 between, each exactly half way (AVERAGE)");
+	}
+	if (known && !format_is_integer(fmt)) {
+		printf("drvtest: msaa: a float resolve is %u ulps from the colour at worst (0 is an "
+		       "exact average of %u equal samples)\n", ulps, n);
+	}
+	printf("drvtest: msaa-result %s %s %lu %u %s full %u/16 px %u %u %u %u expect", backend,
+	       shader, (unsigned long)fmt, n, mode, good, grid[0][0], grid[0][1], grid[0][2],
+	       grid[0][3]);
+	if (known) {
+		printf(" %u %u %u %u", want[0], want[1], want[2], want[3]);
+	} else {
+		printf(" none");
+	}
+	printf(" ulps %u others %u/32 tri value %u clear %u between %u half %u digest %016llx\n",
+	       ulps, others, value, clear, between, half,
+	       (unsigned long long)fnv1a((const unsigned char *)grid[0], 4 * 4 * tb));
+	fflush(stdout);
+
+out:
+	print_vk_counts("after the msaa passes, before releasing what they made");
+	for (int i = 0; i < 3; i++) {
+		[ms[i] release];
+		[one[i] release];
+	}
+	[uniform release];
+	[queue release];
+	[ps release];
+#undef MSAA_STOP
 }
 
 /*
@@ -5044,11 +7795,50 @@ pic_count_bands(void)
  * and the next: five times a second beats a window server that swaps occasionally. With
  * JOBS="" nothing of this is needed and the first push would have been enough.
  */
+/*
+ * --stop-compositor (M5c, for a screenshot the owner asked for): the window server stopped while the
+ * picture is held. Five repaints a second do not beat a compositor drawing a clock's second hand, and
+ * run 123748's shot had the picture in a band across the home screen. SIGSTOP and SIGCONT, around
+ * this mode only, on a RAM boot that is about to end.
+ */
+static bool pic_stop_compositor;
+
+static pid_t
+pic_find_process(const char *name)
+{
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	size_t size = 0;
+
+	if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0) {
+		return -1;
+	}
+	size += 16 * sizeof(struct kinfo_proc);
+	struct kinfo_proc *all = malloc(size);
+	pid_t found = -1;
+
+	if (all != NULL && sysctl(mib, 4, all, &size, NULL, 0) == 0) {
+		for (size_t i = 0; i < size / sizeof(struct kinfo_proc); i++) {
+			if (strcmp(all[i].kp_proc.p_comm, name) == 0) {
+				found = all[i].kp_proc.p_pid;
+			}
+		}
+	}
+	free(all);
+	return found;
+}
+
 static void
 pic_show(int seconds)
 {
 	if (pic_connection == 0) {
 		return;
+	}
+	const pid_t compositor = pic_stop_compositor ? pic_find_process("backboardd") : -1;
+
+	if (compositor > 0) {
+		int stopped = kill(compositor, SIGSTOP);
+
+		printf("drvtest: picture: backboardd (%d) stopped for the hold: %d\n", compositor, stopped);
 	}
 	/* "--picture 0" is still a picture: pic_push has already painted it once. */
 	if (seconds < 1) {
@@ -5067,6 +7857,9 @@ pic_show(int seconds)
 		usleep(200000);
 	}
 	printf("drvtest: picture: done repainting after %d seconds\n", seconds);
+	if (compositor > 0) {
+		printf("drvtest: picture: backboardd continued: %d\n", kill(compositor, SIGCONT));
+	}
 	fflush(stdout);
 }
 
@@ -5150,12 +7943,41 @@ picture_path(id<MTLDevice> dev, const char *metallib, int seconds)
  *      which is why it is measured and printed instead of assumed. A -waitUntilCompleted that
  *      is NOT ~0 means this comment is out of date and every other number here is mis-split.
  *
+ * [2026-11-05, M4: THIS COMMENT IS OUT OF DATE, ON BOTH BACK ENDS, and point 3 is how that
+ * shows. Since 2026-10-23 (docs/air.md 9.3) hkmetal.m asks the compiler library for
+ * rwa_device_defer_waits(1) unless the boot has metal_sync=1, and both libraries honour it:
+ * on Gallium (air_metal.c) rwa_render_draw and rwa_dispatch_buffers record into freedreno's
+ * batch and return without finish_or_say_why, and rwa_flush at the end of -commit flushes the
+ * context once and hands the fence back; on Vulkan (air_vk.c) every draw and dispatch records
+ * into the device's one VkCommandBuffer and rwa_flush submits it once with its own VkFence
+ * (ONE COMMAND BUFFER AT A TIME there). On both, -waitUntilCompleted waits on that fence
+ * (hkmetal.m -hkWaitFence). So by default, on either back end: (1) encoding still only
+ * records; (2) -commit is our translation and the submission -- NOT the GPU's execution and
+ * not the wait, so the processor and the GPU do overlap across command buffers; (3)
+ * -waitUntilCompleted carries the GPU's time and is NOT ~0 (971 us after a one-draw
+ * 1080x2400 -commit, docs/air.md 9.3). The measurements below are kept exactly as they were
+ * -- same cases, same clock, same brackets -- and are to be read that way: -commit as the
+ * processor's side and -waitUntilCompleted as the GPU's. Three of the mode's own derived
+ * lines assume the old split and are wrong under the default: "THE SPLIT" (tm_say_gpu_side)
+ * subtracts only when the kernel timed about as many submissions as the case made DRAWS,
+ * which a batched command buffer no longer is, so it says "NOT the same work" there;
+ * tm_submissions counts draws, not submissions; and tm_verdict's frame arithmetic is built
+ * from -commit medians, so it prices the processor's side of a frame only. With metal_sync=1
+ * all of the original text holds. M4's cost line at the end of the mode (cost_end) has the
+ * kernel's own submission count and the core's time for the whole mode beside it.]
+ *
  * ONE DRAW IS ONE RENDER PASS IS ONE SUBMISSION. rwa_render_draw creates the surfaces, sets
  * the framebuffer, clears, draws, flushes and fences, then tears the framebuffer down again
  * (air_metal.c around 4124-4346). So eight Metal draws into one encoder are eight kernel
  * submissions and eight passes over the attachment, not one -- which is exactly why this mode
  * times one draw per command buffer AND eight, and prints the marginal cost of a draw
  * separately from the cost of a command buffer.
+ * [M4: still eight passes, on both back ends (air_vk.c begins a rendering per draw too), but
+ * no longer eight submissions by default: the eight are recorded and go to the kernel at the
+ * command buffer's one rwa_flush, as one submission on Vulkan and in one flush on Gallium
+ * (docs/air.md 9.3: "the 8 draws go to the kernel in one flush instead of eight"). The
+ * marginal cost of a draw is still what the batched case prices, on the processor's side in
+ * -commit and on the GPU's in -waitUntilCompleted.]
  *
  * WHAT IS MEASURED, AND WHY THESE AND NOT OTHERS
  *
@@ -5450,6 +8272,7 @@ tm_make_pipeline(id<MTLDevice> dev, id<MTLFunction> vertex, id<MTLFunction> frag
 	uint64_t t1 = tm_now_ns();
 
 	*ns = t1 - t0;
+	cost_pipeline_add(*ns);         /* the whole mode's pipelines field (M4, cost_end) */
 	[pd release];
 	if (ps == nil && why != NULL) {
 		snprintf(why, size, "%s", err != nil ?
@@ -5492,18 +8315,28 @@ struct tm_worked {
 };
 
 static int tm_worked_state;     /* 0 not tried, 1 answers, -1 this kernel has no such request */
+/*
+ * [M4: the request goes through cost_worked_since, which answers what it always answered --
+ * the core's time since this function's previous read -- out of the process's running totals
+ * (WHAT A WORKLOAD COSTS, near the top). The cost keeper reads 0x7d every 20 ms while the
+ * whole mode is measured, and a raw read here would then get only the last 20 ms; out of the
+ * totals it gets all of it, and a five-second report of the kernel's no longer takes a
+ * case's counts either.]
+ */
+static struct cost_mark tm_worked_mark;
+_Static_assert(sizeof(struct tm_worked) == sizeof(struct cost_worked),
+	       "tm_worked and cost_worked are both HKGPU.cpp's struct hk_worked");
 
 static bool
 tm_gpu_worked(struct tm_worked *out)
 {
-	struct tm_worked in = { 0, 0, { 0 } };
-	size_t size = sizeof(in);
+	size_t size = sizeof(*out);
 
 	if (tm_worked_state < 0 || pic_connection == 0) {
 		return false;
 	}
-	kern_return_t kr = IOConnectCallStructMethod(pic_connection, 0x7d, &in, sizeof(in),
-						     out, &size);
+	kern_return_t kr = cost_worked_since(pic_connection, &tm_worked_mark,
+					     (struct cost_worked *)out, &size);
 
 	if (kr != KERN_SUCCESS || size < sizeof(*out)) {
 		/* The two answers worth telling apart are printed as the number, because they
@@ -6164,7 +8997,8 @@ tm_draw_case(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queu
 	       "large number here means work moved and this comment is stale");
 	tm_say("-waitUntilCompleted after that -commit", &wait,
 	       "it is NOT ~0 -- then the fence is no longer paid inside -commit and every "
-	       "split in this mode is wrong");
+	       "split in this mode is wrong [M4: which is the default since 2026-10-23, a "
+	       "fence per command buffer on both back ends: expected unless metal_sync=1]");
 
 	uint64_t one = tm_median(&load1), many = tm_median(&loadN);
 
@@ -6461,6 +9295,7 @@ tm_dispatch(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queue
 				    [dev newComputePipelineStateWithFunction:again error:&e];
 				uint64_t t1 = tm_now_ns();
 
+				cost_pipeline_add(t1 - t0);     /* (M4, cost_end) */
 				if (p != nil) {
 					tm_add(&compile, t1 - t0);
 					[p release];
@@ -6530,7 +9365,8 @@ tm_dispatch(id<MTLDevice> dev, id<MTLLibrary> library, id<MTLCommandQueue> queue
 	tm_say("the encoding of that dispatch", &encode,
 	       "it is anywhere near -commit: encoding only records here");
 	tm_say("-waitUntilCompleted after that dispatch", &wait,
-	       "it is not ~0 -- then the fence moved out of -commit on the compute path too");
+	       "it is not ~0 -- then the fence moved out of -commit on the compute path too "
+	       "[M4: it has, by default, on both back ends]");
 	[ps release];
 out:
 	for (int i = 0; i < TM_DISPATCH_BUFFERS; i++) {
@@ -6826,6 +9662,11 @@ tm_slots(id<MTLCommandQueue> queue)
  *     frame is the SUM of its draws. A driver that pipelined would reach the maximum of the
  *     two instead of the sum, and that is the single biggest difference between these numbers
  *     and what the same hardware can do.
+ *     [M4: true only with metal_sync=1 now. With the default fence per command buffer, on
+ *     both back ends, -commit does not wait (the comment at the top of this section), so the
+ *     per-draw medians this arithmetic uses are the processor's side alone and the frame
+ *     rates below are an upper bound; the GPU's side is -waitUntilCompleted's and the cost
+ *     line's. The arithmetic is kept as it was, and says so in the log.]
  *   - EVERY DRAW COVERS THE WHOLE PANEL in the upper bracket and sixteen pixels in the lower
  *     one. A real scene is between them and nearer the lower end, so the two brackets are
  *     printed and the middle is not invented.
@@ -6870,6 +9711,10 @@ tm_verdict(void)
 	       "draw, with no overlap between processor and GPU because this driver fences "
 	       "inside -commit. Two brackets: every draw 4x4 (the per-draw floor) and every "
 	       "draw the whole 1080x2400 panel (the ceiling)\n");
+	printf("drvtest: time: [M4: with a fence per command buffer -- the default unless "
+	       "metal_sync=1 -- -commit does not wait, so the per-draw figures below are the "
+	       "processor's side alone and these frame rates are an upper bound; the GPU's side "
+	       "is in -waitUntilCompleted above and in the cost line at the end]\n");
 	for (unsigned i = 0; i < sizeof(scene) / sizeof(scene[0]); i++) {
 		double fixed = (double)tm_present_ns + (double)tm_buffer_ns;
 		double small = fixed + (double)scene[i] * tm_small_marginal_ns;
@@ -6937,6 +9782,11 @@ time_path(id<MTLDevice> dev, const char *metallib, unsigned repeats)
 	       "fence there (10.13), so -commit is what an application waits on and "
 	       "-waitUntilCompleted should measure ~0. Both are printed; if the second is not "
 	       "~0, the split in every line below is wrong\n");
+	printf("drvtest: time: [M4: that sentence holds with metal_sync=1 only. By default, on "
+	       "both back ends, -commit records and submits once (rwa_device_defer_waits) and "
+	       "-waitUntilCompleted carries the GPU's time, so read -commit as the processor's "
+	       "side and -waitUntilCompleted as the GPU's; the comment above time_path says "
+	       "which derived lines that affects]\n");
 	printf("drvtest: time: the GPU's share is separated three ways, in order of how much "
 	       "they can be trusted: by ASKING THE KERNEL for the core's own time per case "
 	       "(request 0x7d, if this kernel has it -- the next line says whether it does), "
@@ -6961,6 +9811,20 @@ time_path(id<MTLDevice> dev, const char *metallib, unsigned repeats)
 	if (queue == nil) {
 		printf("drvtest: time: no command queue\n");
 		return;
+	}
+	/*
+	 * [M4, W1: the whole mode is one workload with a cost line (cost_end, before the slot
+	 * test, which may block for ever). cost_begin spends COST_PRE_MS in an idle window and
+	 * reads the machine's state, which no launching application waits through, so the two
+	 * marks of the main-to-first-pixel line are moved on by what it took: that line means
+	 * what it meant.]
+	 */
+	{
+		uint64_t before_cost = tm_now_ns();
+
+		cost_begin("W1");
+		tm_main_entered += tm_now_ns() - before_cost;
+		tm_mode_entered += tm_now_ns() - before_cost;
 	}
 	/* opened here and not at the end, because the present measurement needs it and
 	 * because a mode that stops early should still have shown what it got that far */
@@ -6995,9 +9859,341 @@ time_path(id<MTLDevice> dev, const char *metallib, unsigned repeats)
 	       "a histogram -- but only in a window in which something was submitted, so a "
 	       "burst shorter than five seconds leaves no such line\n", tm_submissions);
 	fflush(stdout);
+	/* M4, W1: the cost line of the whole mode, with the kernel's own submission count for
+	 * it (tm_submissions above counts draws asked for, not submissions) */
+	cost_end(NULL, NULL, "time %u repeats", tm_repeats);
 	tm_slots(queue);
 	printf("drvtest: time: done\n");
 	fflush(stdout);
+}
+
+/*
+ * ==========================================================================================
+ * --frames N owned|surface (M4, W4): A FRAME, N TIMES, AND WHAT EACH ONE COSTS
+ * ==========================================================================================
+ *
+ * The workload nearest to what a game or the window server does with Metal: N frames, each
+ * ONE command buffer with ONE render pass of ONE full-screen draw into a 1080x2400 BGRA8
+ * target, cleared first (an application clears once a frame), committed and waited for --
+ * one frame at a time, nothing in flight between two, so each frame's numbers are its own:
+ *
+ *   owned     the target is a texture of the driver's own (newTextureWithDescriptor:);
+ *   surface   it is an IOSurface this program makes -- BGRA, four bytes a texel, the row
+ *             length the kernel's own, as drawable_test makes one and as CoreAnimation makes a
+ *             drawable's -- imported with newTextureWithDescriptor:iosurface:plane: (hkmetal.m,
+ *             hkdrawable.m rwd_texture_for_surface, rwa_texture_from_surface): a drawable's
+ *             road.
+ *
+ * On Vulkan an imported surface is mapped once at import, so the kernel treats it as SEEN
+ * and cleans and invalidates the processor's cache over it at EVERY submission (air_vk.c,
+ * THE SURFACE MARKED "SEEN"; HKGPU.cpp submit): ten megabytes for this one, in our system
+ * time, at every frame. --vk-noseen (AIR_VK_NOSEEN=1, set before Metal starts) turns that
+ * mapping off, so the same frames with and without it price that clean; the lines then say
+ * "surface-noseen". Gallium never maps a surface it only draws into, so there the kernel
+ * cleans it when its seed moved or 4 ms after the last time (GPU_PUSH_AGAIN_MS).
+ *
+ * THE SHADER: clearFragment01 of AppleMetalGLRenderer, over the stage the library generates
+ * (no vertex function: the quad covers the attachment). No fragment shader of that library
+ * binds nothing -- all 271 take a constant buffer (llvm-dis of every module, 2026-11-05) --
+ * and clearFragment01 binds the least: one 48-byte ClearFragmentInput at [[buffer(14)]],
+ * float4 out to colour 0, which --time has drawn into BGRA8 since 10.33 with its pixel
+ * checked. It is bound at 14 alone, as its module declares (air.location_index 14).
+ *
+ * WHAT IS PRINTED: the cost line (cost_end; the N frames are its work phase, the pipeline is
+ * its pipelines field, and one warm-up frame before them is setup: ir3 links a program at
+ * its first draw); then one frames line, the per-frame median and p90 of the wall time
+ * (-commandBuffer to -waitUntilCompleted, the frame's autorelease pool included), of the
+ * process's CPU time, user and system apart (getrusage around the same), of the core's time
+ * and of the submissions (0x7d at both ends of the frame: a backboardd submission that
+ * finished inside one of ours is in it, which the median does not see and the p90 may), and
+ * backboardd's frames over the same period; then the pixel at (0, 0), read through the
+ * driver after the timed frames, against the colour the buffer names.
+ */
+enum { FRAMES_MAX = 4096 };
+
+static int
+frames_compare(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+/* The median and the 90th percentile (the ceil(0.9 n)-th smallest) of n samples, sorted here. */
+static void
+frames_stats(uint64_t *v, unsigned n, double *median, double *p90)
+{
+	unsigned k = (9 * n + 9) / 10;
+
+	*median = *p90 = 0;
+	if (n == 0) {
+		return;
+	}
+	qsort(v, n, sizeof(v[0]), frames_compare);
+	*median = n % 2 ? (double)v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
+	*p90 = (double)v[(k > 0 ? k : 1) - 1];
+}
+
+/* A surface the way drawable_test and CoreAnimation make one: no bytes-per-row asked for */
+static IOSurfaceRef
+frames_surface(int width, int height)
+{
+	CFMutableDictionaryRef props = CFDictionaryCreateMutable(NULL, 0,
+	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	const CFStringRef keys[4] = {
+		kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfacePixelFormat, kIOSurfaceBytesPerElement,
+	};
+	const int values[4] = { width, height, 0x42475241 /* 'BGRA' */, 4 };
+	IOSurfaceRef surface;
+
+	if (props == NULL) {
+		return NULL;
+	}
+	for (int i = 0; i < 4; i++) {
+		CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &values[i]);
+
+		CFDictionarySetValue(props, keys[i], n);
+		CFRelease(n);
+	}
+	surface = IOSurfaceCreate(props);
+	CFRelease(props);
+	return surface;
+}
+
+/* One frame: a command buffer, the pass, the draw, -commit, the wait; in its own pool. */
+static bool
+frames_one(id<MTLCommandQueue> queue, MTLRenderPassDescriptor *rp,
+	   id<MTLRenderPipelineState> ps, id<MTLBuffer> uniform, char *why, size_t size)
+{
+	bool ok = false;
+
+	@autoreleasepool {
+		id<MTLCommandBuffer> cmd = [queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = cmd != nil ?
+		    [cmd renderCommandEncoderWithDescriptor:rp] : nil;
+
+		if (enc == nil) {
+			snprintf(why, size, "no %s", cmd == nil ? "command buffer" : "render encoder");
+		} else {
+			[enc setRenderPipelineState:ps];
+			[enc setFragmentBuffer:uniform offset:0 atIndex:14];
+			[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+			[enc endEncoding];
+			[cmd commit];
+			[cmd waitUntilCompleted];
+			ok = [cmd status] == RW_CB_COMPLETED;
+			if (!ok) {
+				snprintf(why, size, "status %lu: %s", (unsigned long)[cmd status],
+					 [cmd error] != nil ?
+					 [[[cmd error] localizedDescription] UTF8String] : "(no error)");
+			}
+		}
+	}
+	return ok;
+}
+
+static void
+frames_path(id<MTLDevice> dev, const char *metallib, unsigned n, const char *target)
+{
+	/* the colour clearFragment01 is told to write (--time's): b g r a */
+	static const unsigned char want[4] = { 109, 182, 73, 255 };
+	const char *backend = backend_is_vk() ? "vk" : "gallium";
+	const char *noseen_env = getenv("AIR_VK_NOSEEN");
+	bool surface = strcmp(target, "surface") == 0;
+	bool noseen = noseen_env != NULL && strcmp(noseen_env, "1") == 0;
+	char label[32], why[512] = "";
+	NSError *err = nil;
+	IOSurfaceRef surf = NULL;
+	id<MTLLibrary> library = nil;
+	id<MTLFunction> fn = nil;
+	id<MTLCommandQueue> queue = nil;
+	id<MTLTexture> tex = nil;
+	id<MTLBuffer> uniform = nil;
+	id<MTLRenderPipelineState> ps = nil;
+	MTLRenderPipelineDescriptor *pd = nil;
+	uint64_t *v[5] = { NULL, NULL, NULL, NULL, NULL };     /* wall, user, sys, gpu, subs */
+	unsigned done = 0;
+	uint64_t warm_ns = 0;
+
+	if (!surface && strcmp(target, "owned") != 0) {
+		printf("drvtest: frames: the target is owned or surface, not %s\n", target);
+		return;
+	}
+	n = n == 0 ? 1 : n > FRAMES_MAX ? FRAMES_MAX : n;
+	snprintf(label, sizeof(label), "%s%s", target, surface && noseen ? "-noseen" : "");
+	if (noseen && !backend_is_vk()) {
+		printf("drvtest: frames: AIR_VK_NOSEEN=1 is the Vulkan back end's switch; on "
+		       "Gallium it changes nothing\n");
+	}
+	NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:metallib]];
+
+	if (data != nil) {
+		dispatch_data_t dd = dispatch_data_create([data bytes], [data length], NULL,
+							  DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+
+		library = [dev newLibraryWithData:dd error:&err];
+	}
+	fn = library != nil ? [library newFunctionWithName:@"clearFragment01"] : nil;
+	queue = [dev newCommandQueue];
+	uniform = [dev newBufferWithLength:256 options:0];
+	if (fn == nil || queue == nil || uniform == nil || [uniform contents] == NULL) {
+		printf("drvtest: frames %s W4 %s: NOT MEASURED: %s\n", backend, label,
+		       library == nil ? "the library could not be read" :
+		       fn == nil ? "it has no clearFragment01" :
+		       "no command queue or no constant buffer");
+		goto out;
+	}
+	{
+		float *u = [uniform contents];
+
+		memset(u, 0, 256);
+		u[0] = want[2] / 255.0f;
+		u[1] = want[1] / 255.0f;
+		u[2] = want[0] / 255.0f;
+		u[3] = 1.0f;
+	}
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+							       width:PANEL_W
+							      height:PANEL_H
+							   mipmapped:NO];
+
+	[td setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+	if (surface) {
+		surf = frames_surface(PANEL_W, PANEL_H);
+		if (surf == NULL) {
+			printf("drvtest: frames %s W4 %s: NOT MEASURED: IOSurfaceCreate would not make "
+			       "a %ux%u BGRA surface\n", backend, label, PANEL_W, PANEL_H);
+			goto out;
+		}
+		printf("drvtest: frames %s W4 %s: surface %u, %zux%zu, %zu bytes a row, %zu bytes\n",
+		       backend, label, IOSurfaceGetID(surf), IOSurfaceGetWidth(surf),
+		       IOSurfaceGetHeight(surf), IOSurfaceGetBytesPerRow(surf),
+		       IOSurfaceGetAllocSize(surf));
+		tex = [dev newTextureWithDescriptor:td iosurface:surf plane:0];
+	} else {
+		tex = [dev newTextureWithDescriptor:td];
+	}
+	if (tex == nil) {
+		printf("drvtest: frames %s W4 %s: NOT MEASURED: no %ux%u BGRA8 texture %s (the "
+		       "driver's line above says why)\n", backend, label, PANEL_W, PANEL_H,
+		       surface ? "over the surface" : "of the driver's own");
+		goto out;
+	}
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	MTLRenderPassColorAttachmentDescriptor *ca = [[rp colorAttachments] objectAtIndexedSubscript:0];
+
+	[ca setTexture:tex];
+	[ca setLoadAction:MTLLoadActionClear];
+	[ca setClearColor:MTLClearColorMake(0, 0, 0, 1)];
+	[ca setStoreAction:MTLStoreActionStore];
+	pd = [[MTLRenderPipelineDescriptor alloc] init];
+	[pd setFragmentFunction:fn];
+	[pd setVertexFunction:nil];
+	[[[pd colorAttachments] objectAtIndexedSubscript:0] setPixelFormat:MTLPixelFormatBGRA8Unorm];
+	for (int i = 0; i < 5; i++) {
+		v[i] = calloc(n, sizeof(uint64_t));
+		if (v[i] == NULL) {
+			printf("drvtest: frames %s W4 %s: NOT MEASURED: no memory for %u samples\n",
+			       backend, label, n);
+			goto out;
+		}
+	}
+	printf("drvtest: frames %s W4 %s: %u frames, each one command buffer with one cleared "
+	       "pass of one full-screen clearFragment01 draw into a %ux%u BGRA8 %s, committed and "
+	       "waited for\n", backend, label, n, PANEL_W, PANEL_H,
+	       surface ? "IOSurface" : "texture");
+	fflush(stdout);
+
+	cost_begin("W4");
+	cost_phase(COST_PIPELINE);
+	ps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+	cost_phase(COST_SETUP);
+	if (ps == nil) {
+		cost_end("frames", "frame", "frames 0 of %u %s", n, label);
+		printf("drvtest: frames %s W4 %s: NOT MEASURED: no pipeline: %s\n", backend, label,
+		       err != nil ? [[err localizedDescription] UTF8String] : "(no reason)");
+		goto out;
+	}
+	{
+		uint64_t t0 = tm_now_ns();
+
+		if (!frames_one(queue, rp, ps, uniform, why, sizeof(why))) {
+			cost_end("frames", "frame", "frames 0 of %u %s", n, label);
+			printf("drvtest: frames %s W4 %s: NOT MEASURED: the warm-up frame did not "
+			       "complete: %s\n", backend, label, why);
+			goto out;
+		}
+		warm_ns = tm_now_ns() - t0;
+	}
+	/* the frames read 0x7d at both ends of each themselves: the keeper waits meanwhile */
+	cost_keeper_pause(true);
+	for (unsigned i = 0; i < n; i++) {
+		struct rusage r0, r1;
+		uint64_t t0, t1;
+		bool ok;
+
+		cost_phase(COST_WORK);
+		t0 = tm_now_ns();
+		getrusage(RUSAGE_SELF, &r0);
+		ok = frames_one(queue, rp, ps, uniform, why, sizeof(why));
+		getrusage(RUSAGE_SELF, &r1);
+		t1 = tm_now_ns();
+		cost_phase(COST_SETUP);
+		if (!ok) {
+			printf("drvtest: frames %s W4 %s: frame %u did not complete (%s): the numbers "
+			       "below are of the %u before it\n", backend, label, i, why, done);
+			break;
+		}
+		v[0][done] = t1 - t0;
+		v[1][done] = cost_tv_us(r1.ru_utime) - cost_tv_us(r0.ru_utime);
+		v[2][done] = cost_tv_us(r1.ru_stime) - cost_tv_us(r0.ru_stime);
+		v[3][done] = cost_run.last_us;
+		v[4][done] = cost_run.last_subs;
+		done++;
+	}
+	cost_keeper_pause(false);
+	cost_end("frames", "frame", "frames %u %s", done, label);
+	{
+		double m[5], p[5];
+		int frames = cost_cur.a.frames >= 0 && cost_cur.b.frames >= 0 ?
+		    cost_cur.b.frames - cost_cur.a.frames : -1;
+
+		for (int i = 0; i < 5; i++) {
+			frames_stats(v[i], done, &m[i], &p[i]);
+		}
+		printf("drvtest: frames %s W4 %s: %u frames: wall median %.1f p90 %.1f us, cpu user "
+		       "median %.1f p90 %.1f sys median %.1f p90 %.1f us, gpu median %.1f p90 %.1f "
+		       "us, submissions a frame median %.1f p90 %.0f; the warm-up frame %.1f us (not "
+		       "counted); backboardd %d frames in the same %.0f ms\n", backend, label, done,
+		       m[0] / 1000.0, p[0] / 1000.0, m[1], p[1], m[2], p[2], m[3], p[3], m[4], p[4],
+		       warm_ns / 1000.0, frames, (cost_cur.b.ns - cost_cur.a.ns) / 1e6);
+	}
+	{
+		unsigned char px[4] = { 0, 0, 0, 0 };
+
+		[tex getBytes:px bytesPerRow:4 fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0];
+		printf("drvtest: frames %s W4 %s: pixel (0,0) is r g b %u %u %u and its buffer named "
+		       "%u %u %u -- %s\n", backend, label, px[2], px[1], px[0], want[2], want[1],
+		       want[0], px[0] == want[0] && px[1] == want[1] && px[2] == want[2] ?
+		       "the same, so the timed frames drew" :
+		       "NOT THE SAME: the timings above are of frames that did something else");
+	}
+	fflush(stdout);
+out:
+	for (int i = 0; i < 5; i++) {
+		free(v[i]);
+	}
+	[ps release];
+	[pd release];
+	[tex release];
+	if (surf != NULL) {
+		CFRelease(surf);
+	}
+	[uniform release];
+	[queue release];
+	[fn release];
+	[library release];
 }
 
 /*
@@ -7512,6 +10708,1198 @@ sweep_every_class(void)
 	}
 }
 
+/*
+ * ==========================================================================================
+ * --burst [N] (M4-1): COMMAND BUFFERS NOBODY WAITS FOR, AND WHAT THEY HELD
+ * ==========================================================================================
+ *
+ * Run 071937: --time on the Vulkan back end faulted the GPU's SMMU in four processes of five,
+ * right after tm_queue's 256 empty command buffers, in the next case's -getBytes:. That mode
+ * reaches the case after a dozen others and some 400 lines of log, so this is the same shape
+ * alone, and a little more of it (air_vk.c's M4-1 entry has the cause):
+ *
+ *   (a) One clear, committed and not waited for, so there is a submission for the empty ones
+ *       to follow, as there was in --time. Then N empty command buffers, made, committed and
+ *       dropped with no wait, exactly tm_queue's loop -- on the old library each of them left
+ *       a wait on the completion queue, and that wait recorded and submitted on a second
+ *       thread. Then, AT ONCE and with no wait, what
+ *       tm_present does next: a panel-sized texture made and read back. And eight small
+ *       reads, because a read is the thing that records outside the driver's rw_pipe_lock.
+ *   (b) N command buffers each with one small piece of real work, committed with no wait: odd
+ *       ones a clear pass with no draw (no shader, so this mode needs no library), even ones a
+ *       buffer copied into a texture, and each then that texture copied into one that stays.
+ *       What each used -- its texture, and its buffer if it had one -- is released right after
+ *       -commit, which Metal allows: the command buffer holds them, so it is usually the
+ *       completion queue that lets go of them last and destroys them, on the old library by
+ *       recording there too. Every sixteenth round, a small read on this thread as well.
+ *   (c) Real work, waited for: a clear of the panel-sized target and the small texture copied
+ *       into it, and the pixels read back. The small one must hold what the LAST of (b) wrote,
+ *       which is only so if all of (b) ran, in order; and each of (b) must have completed
+ *       without an error (counted by a handler) and the last of (a) too.
+ *
+ * "ok" here is about THIS PROCESS: right pixels and no command buffer in error. A fault shows
+ * first in the kernel's own "THE SMMU REFUSED" line in the same log, and here only once turnip
+ * has seen it and says VK_ERROR_DEVICE_LOST, so a run is clean when this line says ok AND that
+ * line is absent.
+ */
+enum { BURST_SIDE = 16 };
+
+static _Atomic unsigned burst_completed, burst_failed;
+
+/* What the i-th of (b) writes, in memory order (BGRA8): different from its neighbours. */
+static void
+burst_pattern(unsigned i, uint8_t bgra[4])
+{
+	bgra[0] = (uint8_t)(i * 37 + 11);
+	bgra[1] = (uint8_t)(i * 101 + 3);
+	bgra[2] = (uint8_t)(i * 13 + 200);
+	bgra[3] = 255;
+}
+
+/* One step either way, for a clear: its colour is a float on the way there. */
+static bool
+burst_same(const uint8_t got[4], const uint8_t want[4])
+{
+	for (unsigned i = 0; i < 4; i++) {
+		if (abs((int)got[i] - (int)want[i]) > 1) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static int
+burst_test(id<MTLDevice> dev, unsigned n)
+{
+	const char *backend = backend_is_vk() ? "vk" : "gallium";
+	const size_t panel_bytes = (size_t)PANEL_W * PANEL_H * 4;
+	const MTLRegion whole = MTLRegionMake2D(0, 0, BURST_SIDE, BURST_SIDE);
+	id<MTLCommandQueue> queue = [dev newCommandQueue];
+	MTLTextureDescriptor *small =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+							       width:BURST_SIDE
+							      height:BURST_SIDE
+							   mipmapped:NO];
+	MTLTextureDescriptor *panel =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+							       width:PANEL_W
+							      height:PANEL_H
+							   mipmapped:NO];
+
+	[small setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+	[panel setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+
+	id<MTLTexture> keep = [dev newTextureWithDescriptor:small];
+	id<MTLTexture> target = [dev newTextureWithDescriptor:panel];
+	uint8_t *host = malloc(panel_bytes);
+	uint8_t texels[BURST_SIDE * BURST_SIDE * 4];
+
+	if (queue == nil || keep == nil || target == nil || host == NULL) {
+		printf("drvtest: burst-result %s FAILED there is no queue, no 16x16 and 1080x2400 "
+		       "texture or no memory, so nothing was tried\n", backend);
+		fflush(stdout);
+		return 1;
+	}
+	printf("drvtest: burst: %u empty command buffers, then %u small ones, none waited for\n",
+	       n, n);
+	fflush(stdout);
+
+	/* (a): work the empty ones follow, then tm_queue's own loop, keeping the last so that
+	 * its end can be asked about */
+	@autoreleasepool {
+		id<MTLCommandBuffer> cmd = [queue commandBuffer];
+		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+
+		pass.colorAttachments[0].texture = keep;
+		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+		[[cmd renderCommandEncoderWithDescriptor:pass] endEncoding];
+		[cmd commit];
+	}
+
+	id<MTLCommandBuffer> last_empty = nil;
+	uint64_t t0 = tm_now_ns();
+
+	for (unsigned i = 0; i < n; i++) {
+		@autoreleasepool {
+			id<MTLCommandBuffer> cmd = [queue commandBuffer];
+
+			[cmd commit];
+			if (i == n - 1) {
+				last_empty = [cmd retain];
+			}
+		}
+	}
+	uint64_t t1 = tm_now_ns();
+
+	/* and what came next in the run that faulted, with nothing waited for in between */
+	{
+		id<MTLTexture> frame = [dev newTextureWithDescriptor:panel];
+
+		[frame getBytes:host
+		    bytesPerRow:PANEL_W * 4
+		     fromRegion:MTLRegionMake2D(0, 0, PANEL_W, PANEL_H)
+		    mipmapLevel:0];
+		[frame release];
+	}
+	for (unsigned i = 0; i < 8; i++) {
+		[keep getBytes:texels bytesPerRow:BURST_SIDE * 4 fromRegion:whole mipmapLevel:0];
+	}
+	uint64_t t2 = tm_now_ns();
+
+	/* (b) */
+	unsigned refused = 0;
+
+	for (unsigned i = 0; i < n; i++) {
+		@autoreleasepool {
+			uint8_t want[4];
+			id<MTLTexture> tex = [dev newTextureWithDescriptor:small];
+			id<MTLBuffer> src = nil;
+			id<MTLCommandBuffer> cmd = [queue commandBuffer];
+
+			burst_pattern(i, want);
+			if ((i & 1) != 0 && tex != nil) {
+				MTLRenderPassDescriptor *pass =
+				    [MTLRenderPassDescriptor renderPassDescriptor];
+
+				pass.colorAttachments[0].texture = tex;
+				pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+				pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+				pass.colorAttachments[0].clearColor =
+				    MTLClearColorMake(want[2] / 255.0, want[1] / 255.0,
+						      want[0] / 255.0, 1);
+				[[cmd renderCommandEncoderWithDescriptor:pass] endEncoding];
+			} else if (tex != nil) {
+				src = [dev newBufferWithLength:sizeof(texels)
+						       options:MTLResourceStorageModeShared];
+			}
+			if (tex == nil || ((i & 1) == 0 && src == nil)) {
+				refused++;
+				[cmd commit];
+				[src release];
+				[tex release];
+				continue;
+			}
+			id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+
+			if (src != nil) {
+				uint8_t *p = [src contents];
+
+				for (unsigned t = 0; t < BURST_SIDE * BURST_SIDE; t++) {
+					memcpy(p + t * 4, want, 4);
+				}
+				[blit copyFromBuffer:src
+					sourceOffset:0
+				   sourceBytesPerRow:BURST_SIDE * 4
+				 sourceBytesPerImage:sizeof(texels)
+					  sourceSize:MTLSizeMake(BURST_SIDE, BURST_SIDE, 1)
+					   toTexture:tex
+				    destinationSlice:0
+				    destinationLevel:0
+				   destinationOrigin:MTLOriginMake(0, 0, 0)];
+			}
+			[blit copyFromTexture:tex
+				  sourceSlice:0
+				  sourceLevel:0
+				 sourceOrigin:MTLOriginMake(0, 0, 0)
+				   sourceSize:MTLSizeMake(BURST_SIDE, BURST_SIDE, 1)
+				    toTexture:keep
+			     destinationSlice:0
+			     destinationLevel:0
+			    destinationOrigin:MTLOriginMake(0, 0, 0)];
+			[blit endEncoding];
+			[cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+				if ([c status] == MTLCommandBufferStatusCompleted &&
+				    [c error] == nil) {
+					atomic_fetch_add(&burst_completed, 1);
+				} else {
+					atomic_fetch_add(&burst_failed, 1);
+				}
+			}];
+			[cmd commit];
+			[src release];
+			[tex release];
+			if (i % 16 == 15) {
+				[keep getBytes:texels
+				   bytesPerRow:BURST_SIDE * 4
+				    fromRegion:whole
+				   mipmapLevel:0];
+			}
+		}
+	}
+	uint64_t t3 = tm_now_ns();
+
+	/* (c): the last of (b) is what `keep` holds once all of (b) has run, in order */
+	uint8_t want_small[4], want_clear[4] = { 191, 64, 128, 255 };
+	uint8_t got_clear[4] = { 0 }, got_copied[4] = { 0 }, got_small[4] = { 0 };
+	NSUInteger final_status = 0;
+
+	burst_pattern(n - 1, want_small);
+	@autoreleasepool {
+		id<MTLCommandBuffer> cmd = [queue commandBuffer];
+		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+
+		pass.colorAttachments[0].texture = target;
+		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake(0.5, 0.25, 0.75, 1);
+		[[cmd renderCommandEncoderWithDescriptor:pass] endEncoding];
+
+		id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+
+		[blit copyFromTexture:keep
+			  sourceSlice:0
+			  sourceLevel:0
+			 sourceOrigin:MTLOriginMake(0, 0, 0)
+			   sourceSize:MTLSizeMake(BURST_SIDE, BURST_SIDE, 1)
+			    toTexture:target
+		     destinationSlice:0
+		     destinationLevel:0
+		    destinationOrigin:MTLOriginMake(32, 32, 0)];
+		[blit endEncoding];
+		[cmd commit];
+		[cmd waitUntilCompleted];
+		final_status = [cmd status];
+	}
+	[target getBytes:got_clear
+	     bytesPerRow:PANEL_W * 4
+	      fromRegion:MTLRegionMake2D(0, 0, 1, 1)
+	     mipmapLevel:0];
+	[target getBytes:got_copied
+	     bytesPerRow:PANEL_W * 4
+	      fromRegion:MTLRegionMake2D(32, 32, 1, 1)
+	     mipmapLevel:0];
+	[keep getBytes:got_small
+	   bytesPerRow:BURST_SIDE * 4
+	    fromRegion:MTLRegionMake2D(0, 0, 1, 1)
+	   mipmapLevel:0];
+
+	/* The handlers run on the completion queue, in order, and may still be on their way. */
+	unsigned expected = n - refused;
+
+	for (unsigned i = 0; i < 5000 && atomic_load(&burst_completed) +
+					  atomic_load(&burst_failed) < expected; i++) {
+		usleep(1000);
+	}
+	for (unsigned i = 0; i < 5000 && [last_empty status] < MTLCommandBufferStatusCompleted; i++) {
+		usleep(1000);
+	}
+
+	unsigned completed = atomic_load(&burst_completed), failed = atomic_load(&burst_failed);
+	NSUInteger empty_status = [last_empty status];
+	bool ok = refused == 0 && completed == n && failed == 0 &&
+		  final_status == MTLCommandBufferStatusCompleted &&
+		  empty_status == MTLCommandBufferStatusCompleted &&
+		  burst_same(got_clear, want_clear) && burst_same(got_copied, want_small) &&
+		  burst_same(got_small, want_small);
+
+	print_vk_counts("after the burst, with its last empty command buffer still held");
+	printf("drvtest: burst-result %s %s empty %u in %.1f ms then the reads in %.1f ms; small "
+	       "%u in %.1f ms: %u completed, %u in error, %u not made; last empty status %lu, "
+	       "final status %lu (completed is %lu); clear %u %u %u %u want %u %u %u %u, copied "
+	       "%u %u %u %u and small %u %u %u %u want %u %u %u %u\n", backend, ok ? "ok" : "FAILED",
+	       n, (t1 - t0) / 1e6, (t2 - t1) / 1e6, n, (t3 - t2) / 1e6, completed, failed, refused,
+	       (unsigned long)empty_status, (unsigned long)final_status,
+	       (unsigned long)MTLCommandBufferStatusCompleted,
+	       got_clear[0], got_clear[1], got_clear[2], got_clear[3],
+	       want_clear[0], want_clear[1], want_clear[2], want_clear[3],
+	       got_copied[0], got_copied[1], got_copied[2], got_copied[3],
+	       got_small[0], got_small[1], got_small[2], got_small[3],
+	       want_small[0], want_small[1], want_small[2], want_small[3]);
+	fflush(stdout);
+	[last_empty release];
+	[keep release];
+	[target release];
+	[queue release];
+	free(host);
+	return ok ? 0 : 1;
+}
+
+/*
+ * ==========================================================================================
+ * --order [METALLIB] (M4-1, the cost part): WHAT -replaceRegion: AND A DESTROY PROMISE
+ * ==========================================================================================
+ *
+ * air_vk.c no longer submits and waits at each -replaceRegion: and each destroy (UPLOADS and
+ * when_done there): a write goes ahead of whatever is recorded next, a destroy waits for a fence
+ * by itself. That is a change in WHEN, and what an application may see of it is not allowed to
+ * change. So these are the orders Metal promises, each said by an application's calls and read
+ * back, and each must hold on both back ends (Gallium's texture_subdata is the reference: a
+ * case that fails there is the case's own fault or Gallium's, and the line says which back end):
+ *
+ *   blit-wait      write, then at once a blit that copies it out, -commit, wait, read the
+ *                  destination: every round's own bytes, a different pattern each round
+ *   blit-nowait    the same with no wait between the rounds, a destination per round: each
+ *                  holds its own round's bytes. A later write must not reach an earlier
+ *                  command buffer (in Metal that is the application's hazard; here the two
+ *                  are in order on the queue and must stay so)
+ *   draw-wait      write, then at once a draw that samples it (texturedFragment2DUInt writes
+ *                  the texel to four RGBA32Uint targets, a texture of one colour, so the
+ *                  coordinate does not matter), -commit, wait, read a target back
+ *   draw-nowait    as blit-nowait
+ *   encoded-blit   a blit ENCODED, not committed; THEN the write; then -commit: the new bytes
+ *   encoded-draw   the same with a draw: this is the case an upload "ahead of the recording"
+ *                  is for
+ *   rows           64 rows of a 64x64 texture written one call each, read at once; written again
+ *                  bottom up, with a block over them, which overlaps and has an order to keep,
+ *                  read at once and copied out; then 1024 rows, again overlapping. Its cost line
+ *                  says how many submissions that took (WHAT A WORKLOAD COSTS): on vk it should
+ *                  be a handful and no longer 1024
+ *   big            a panel-sized write and read, over THE STAGING RING's largest piece
+ *   ring           64 writes of 256 KB with no -commit between them, four times the ring,
+ *                  into four textures in turn, then each read: the ring full, backpressure
+ *   release        a texture made, written and released with no -commit, 64 times (a destroy of
+ *                  what the open upload names); and written, copied, committed, released with no
+ *                  wait (what a command buffer holds), then the copy read
+ *   contract       the destroy of a buffer that unfinished work names, which Metal's objects
+ *                  never do because a command buffer holds what it uses, so on the contract's
+ *                  own calls, on the driver's own device: a 1 MB buffer copied from and a 8 MB one
+ *                  filled, each destroyed right after rwa_flush, its fence waited for after. If
+ *                  the memory went early that is an SMMU fault: this line is ok AND no
+ *                  "THE SMMU REFUSED" in the log. The longest destroy is printed: no wait in it
+ *   surface        a texture over an IOSurface, written, and the surface read by the processor at
+ *                  once, past its cache with an inline DC CIVAC and DSB SY (sys_dcache_flush is a
+ *                  barrier and a return on this system): that reader cannot be told to wait for a
+ *                  flush, so air_vk.c's write is at once there
+ *   threads        vk only. Two threads writing, blitting, committing and reading their own
+ *                  textures on their own queues, and a third only writing and reading its own,
+ *                  all at once: -replaceRegion: and -getBytes: take no lock in hkmetal.m. On
+ *                  Gallium they share the context unguarded (hkmetal.m, over rw_pipe_lock), so this
+ *                  is not tried there, and the line says so; that is not a result about Gallium.
+ *
+ * Ends in "drvtest: order-result BACKEND ok|FAILED ..." with each case's own line before it.
+ */
+enum { ORDER_SIDE = 16, ORDER_ROUNDS = 8, ORDER_ROWS = 64, ORDER_RING_SIDE = 256 };
+
+static unsigned order_cases, order_bad;
+static char order_bad_names[256];
+
+static void order_case(const char *name, bool ok, const char *fmt, ...)
+	__attribute__((format(printf, 3, 4)));
+
+static void
+order_case(const char *name, bool ok, const char *fmt, ...)
+{
+	va_list ap;
+
+	order_cases++;
+	if (!ok) {
+		order_bad++;
+		strlcat(order_bad_names, " ", sizeof(order_bad_names));
+		strlcat(order_bad_names, name, sizeof(order_bad_names));
+	}
+	printf("drvtest: order %s %s %s: ", backend_is_vk() ? "vk" : "gallium", name,
+	       ok ? "ok" : "FAILED");
+	va_start(ap, fmt);
+	vprintf(fmt, ap);
+	va_end(ap);
+	printf("\n");
+	fflush(stdout);
+}
+
+/* The BGRA8 texel of (round, x, y): different from its neighbours, in round and in place. */
+static void
+order_texel(unsigned round, unsigned x, unsigned y, uint8_t bgra[4])
+{
+	burst_pattern(round * 7 + x * 13 + y * 31, bgra);
+}
+
+/* A w x h picture of round `round`, tightly packed */
+static void
+order_picture(uint8_t *p, unsigned round, unsigned w, unsigned h)
+{
+	for (unsigned y = 0; y < h; y++) {
+		for (unsigned x = 0; x < w; x++) {
+			order_texel(round, x, y, p + ((size_t)y * w + x) * 4);
+		}
+	}
+}
+
+/* How many of a w x h picture's texels are not round `round`'s; the first one in *first */
+static unsigned
+order_wrong(const uint8_t *p, unsigned round, unsigned w, unsigned h, char *first, size_t size)
+{
+	unsigned wrong = 0;
+
+	for (unsigned y = 0; y < h; y++) {
+		for (unsigned x = 0; x < w; x++) {
+			uint8_t want[4];
+			const uint8_t *got = p + ((size_t)y * w + x) * 4;
+
+			order_texel(round, x, y, want);
+			if (memcmp(got, want, 4) != 0) {
+				if (wrong++ == 0 && first != NULL) {
+					snprintf(first, size, "first at (%u, %u): %u %u %u %u want %u %u %u %u",
+						 x, y, got[0], got[1], got[2], got[3], want[0], want[1],
+						 want[2], want[3]);
+				}
+			}
+		}
+	}
+	return wrong;
+}
+
+static id<MTLTexture>
+order_texture(id<MTLDevice> dev, MTLPixelFormat format, unsigned w, unsigned h)
+{
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+							       width:w
+							      height:h
+							   mipmapped:NO];
+
+	[td setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+	return [dev newTextureWithDescriptor:td];
+}
+
+static void
+order_write(id<MTLTexture> t, const void *bytes, unsigned w, unsigned h, unsigned texel)
+{
+	[t replaceRegion:MTLRegionMake2D(0, 0, w, h)
+	     mipmapLevel:0
+	       withBytes:bytes
+	     bytesPerRow:w * texel];
+}
+
+static void
+order_read(id<MTLTexture> t, void *bytes, unsigned w, unsigned h, unsigned texel)
+{
+	[t getBytes:bytes bytesPerRow:w * texel fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+}
+
+static void
+order_blit(id<MTLCommandBuffer> cmd, id<MTLTexture> from, id<MTLTexture> to, unsigned w, unsigned h)
+{
+	id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+
+	[blit copyFromTexture:from
+		  sourceSlice:0
+		  sourceLevel:0
+		 sourceOrigin:MTLOriginMake(0, 0, 0)
+		   sourceSize:MTLSizeMake(w, h, 1)
+		    toTexture:to
+	     destinationSlice:0
+	     destinationLevel:0
+	    destinationOrigin:MTLOriginMake(0, 0, 0)];
+	[blit endEncoding];
+}
+
+/* One texturedFragment2DUInt pass: its four targets cleared and written with what it samples */
+static void
+order_draw(id<MTLCommandBuffer> cmd, id<MTLRenderPipelineState> ps, id<MTLSamplerState> samp,
+	   id<MTLTexture> sampled, __unsafe_unretained id<MTLTexture> targets[4])
+{
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+
+	for (unsigned i = 0; i < 4; i++) {
+		MTLRenderPassColorAttachmentDescriptor *a = [[rp colorAttachments] objectAtIndexedSubscript:i];
+
+		[a setTexture:targets[i]];
+		[a setLoadAction:MTLLoadActionClear];
+		[a setClearColor:MTLClearColorMake(0, 0, 0, 0)];
+		[a setStoreAction:MTLStoreActionStore];
+	}
+	id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+
+	[enc setRenderPipelineState:ps];
+	[enc setFragmentTexture:sampled atIndex:0];
+	[enc setFragmentSamplerState:samp atIndex:0];
+	[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[enc endEncoding];
+}
+
+/* What round `round` is in RGBA32Uint, for the sampled texture and for its targets */
+static void
+order_words(unsigned round, unsigned word[4])
+{
+	word[0] = 1000 + round;
+	word[1] = 2000 + round * 3;
+	word[2] = 3000 + round * 5;
+	word[3] = 4000 + round * 7;
+}
+
+static unsigned
+order_words_wrong(id<MTLTexture> target, unsigned round, char *first, size_t size)
+{
+	unsigned grid[16][4], want[4], wrong = 0;
+
+	memset(grid, 0, sizeof(grid));
+	order_read(target, grid, 4, 4, 16);
+	order_words(round, want);
+	for (unsigned i = 0; i < 16; i++) {
+		if (memcmp(grid[i], want, sizeof(want)) != 0 && wrong++ == 0) {
+			snprintf(first, size, "texel %u is %u %u %u %u, want %u %u %u %u", i, grid[i][0],
+				 grid[i][1], grid[i][2], grid[i][3], want[0], want[1], want[2], want[3]);
+		}
+	}
+	return wrong;
+}
+
+/* The processor's view of a surface past its own cache: DC CIVAC a line at a time, as
+ * air_metal_test's civac_range: no ctr_el0 to ask on this system, and 64 is this core's. */
+static void
+order_civac(const void *p, size_t bytes)
+{
+	uintptr_t a = (uintptr_t)p & ~(uintptr_t)63;
+
+	for (; a < (uintptr_t)p + bytes; a += 64) {
+		__asm__ volatile("dc civac, %0" : : "r"(a));
+	}
+	__asm__ volatile("dsb sy");
+}
+
+static void
+order_rows_and_blocks(id<MTLDevice> dev, id<MTLCommandQueue> queue)
+{
+	enum { S = ORDER_ROWS };
+	static uint8_t picture[S * S * 4], back[S * S * 4], expect[S * S * 4];
+	id<MTLTexture> t = order_texture(dev, MTLPixelFormatBGRA8Unorm, S, S);
+	id<MTLTexture> copy = order_texture(dev, MTLPixelFormatBGRA8Unorm, S, S);
+	char first[128] = "";
+	unsigned wrong_down, wrong_up = 0, wrong_copy = 0, wrong_many = 0;
+
+	if (t == nil || copy == nil) {
+		order_case("rows", false, "no 64x64 textures");
+		return;
+	}
+	/* top to bottom, one call a row, and read at once */
+	order_picture(picture, 40, S, S);
+	for (unsigned y = 0; y < S; y++) {
+		[t replaceRegion:MTLRegionMake2D(0, y, S, 1)
+		     mipmapLevel:0
+		       withBytes:picture + y * S * 4
+		     bytesPerRow:S * 4];
+	}
+	memset(back, 0, sizeof(back));
+	order_read(t, back, S, S, 4);
+	wrong_down = order_wrong(back, 40, S, S, first, sizeof(first));
+
+	/* bottom to top, another picture, and a block over it, in that order: the block overlaps
+	 * what is written, so it must end up on top */
+	order_picture(picture, 41, S, S);
+	memcpy(expect, picture, sizeof(expect));
+	for (unsigned y = S; y-- > 0;) {
+		[t replaceRegion:MTLRegionMake2D(0, y, S, 1)
+		     mipmapLevel:0
+		       withBytes:picture + y * S * 4
+		     bytesPerRow:S * 4];
+	}
+	{
+		static uint8_t block[16 * 16 * 4];
+
+		for (unsigned y = 0; y < 16; y++) {
+			for (unsigned x = 0; x < 16; x++) {
+				order_texel(42, x, y, block + (y * 16 + x) * 4);
+				memcpy(expect + ((y + 8) * S + x + 8) * 4, block + (y * 16 + x) * 4, 4);
+			}
+		}
+		[t replaceRegion:MTLRegionMake2D(8, 8, 16, 16)
+		     mipmapLevel:0
+		       withBytes:block
+		     bytesPerRow:16 * 4];
+	}
+	@autoreleasepool {
+		id<MTLCommandBuffer> cmd = [queue commandBuffer];
+
+		order_blit(cmd, t, copy, S, S);
+		[cmd commit];
+		[cmd waitUntilCompleted];
+	}
+	memset(back, 0, sizeof(back));
+	order_read(t, back, S, S, 4);
+	wrong_up = memcmp(back, expect, sizeof(back)) != 0;
+	memset(back, 0, sizeof(back));
+	order_read(copy, back, S, S, 4);
+	wrong_copy = memcmp(back, expect, sizeof(back)) != 0;
+
+	/* and many: 1024 calls, each row over and over, what WHAT A WORKLOAD COSTS prices */
+	cost_begin("Wrows");
+	cost_phase(COST_WORK);
+	for (unsigned i = 0; i < 1024; i++) {
+		unsigned y = i % S;
+		uint8_t row[S * 4];
+
+		for (unsigned x = 0; x < S; x++) {
+			order_texel(i / S, x, y, row + x * 4);
+		}
+		[t replaceRegion:MTLRegionMake2D(0, y, S, 1) mipmapLevel:0 withBytes:row bytesPerRow:S * 4];
+	}
+	memset(back, 0, sizeof(back));
+	order_read(t, back, S, S, 4);
+	cost_phase(COST_SETUP);
+	cost_end("writes", "write", "rows 1024 writes and one read");
+	wrong_many = order_wrong(back, 1023 / S, S, S, first, sizeof(first));
+	order_case("rows", wrong_down == 0 && !wrong_up && !wrong_copy && wrong_many == 0,
+		   "%u of %u texels wrong written down the texture; bottom up with a block on top "
+		   "%s, its copy %s; 1024 rows, %u wrong %s", wrong_down, S * S,
+		   wrong_up ? "WRONG" : "right", wrong_copy ? "WRONG" : "right", wrong_many, first);
+	[t release];
+	[copy release];
+}
+
+/* The contract's own calls on the driver's device, for a destroy of what unfinished work names */
+struct rwa_buffer;
+struct rwa_fence;
+
+static void
+order_contract(id<MTLDevice> dev)
+{
+	enum { COPIES = 32, COPIED = 4096, SRC = 1 << 20, FILLED = 8 << 20 };
+	void *lib = dlopen(compiler_library(), RTLD_NOW);
+	struct rwa_device *device = NULL;
+	struct rwa_buffer *(*buffer_create)(struct rwa_device *, size_t, char *, size_t) = NULL;
+	void *(*buffer_map)(struct rwa_buffer *) = NULL;
+	void (*buffer_destroy)(struct rwa_buffer *) = NULL;
+	int (*copy_buffer)(struct rwa_buffer *, size_t, struct rwa_buffer *, size_t, size_t, char *,
+			   size_t) = NULL;
+	int (*fill_buffer)(struct rwa_buffer *, size_t, size_t, uint8_t, char *, size_t) = NULL;
+	int (*flush)(struct rwa_device *, struct rwa_fence **, char *, size_t) = NULL;
+	int (*fence_wait)(struct rwa_device *, struct rwa_fence *, char *, size_t) = NULL;
+	void (*fence_release)(struct rwa_device *, struct rwa_fence *) = NULL;
+	SEL mesa = sel_getUid("mesaDevice");
+	char why[256] = "";
+
+	if (lib != NULL) {
+		*(void **)&buffer_create = dlsym(lib, "rwa_buffer_create");
+		*(void **)&buffer_map = dlsym(lib, "rwa_buffer_map");
+		*(void **)&buffer_destroy = dlsym(lib, "rwa_buffer_destroy");
+		*(void **)&copy_buffer = dlsym(lib, "rwa_copy_buffer");
+		*(void **)&fill_buffer = dlsym(lib, "rwa_fill_buffer");
+		*(void **)&flush = dlsym(lib, "rwa_flush");
+		*(void **)&fence_wait = dlsym(lib, "rwa_fence_wait");
+		*(void **)&fence_release = dlsym(lib, "rwa_fence_release");
+	}
+	if ([dev respondsToSelector:mesa]) {
+		device = ((struct rwa_device *(*)(id, SEL))objc_msgSend)(dev, mesa);
+	}
+	if (device == NULL || buffer_create == NULL || buffer_map == NULL || buffer_destroy == NULL ||
+	    copy_buffer == NULL || fill_buffer == NULL || flush == NULL || fence_wait == NULL ||
+	    fence_release == NULL) {
+		order_case("contract", false, "this library or device does not answer those calls, so "
+			   "nothing was tried");
+		return;
+	}
+	struct rwa_buffer *keep = buffer_create(device, COPIES * COPIED, why, sizeof(why));
+	struct rwa_fence *fences[COPIES + 1] = { NULL };
+	uint64_t longest = 0;
+	unsigned failed = 0, wrong = 0;
+
+	if (keep == NULL) {
+		order_case("contract", false, "no buffer: %s", why);
+		return;
+	}
+	for (unsigned i = 0; i < COPIES; i++) {
+		struct rwa_buffer *src = buffer_create(device, SRC, why, sizeof(why));
+
+		if (src == NULL) {
+			failed++;
+			continue;
+		}
+		memset(buffer_map(src), (int)(0x11 + i), SRC);
+		if (copy_buffer(src, SRC - COPIED, keep, i * COPIED, COPIED, why, sizeof(why)) != 0 ||
+		    flush(device, &fences[i], why, sizeof(why)) != 0) {
+			failed++;
+		}
+		uint64_t t0 = tm_now_ns();
+
+		buffer_destroy(src);    /* with the copy of it perhaps not begun */
+
+		uint64_t took = tm_now_ns() - t0;
+
+		longest = took > longest ? took : longest;
+	}
+	{
+		struct rwa_buffer *big = buffer_create(device, FILLED, why, sizeof(why));
+
+		if (big == NULL || fill_buffer(big, 0, FILLED, 0x5a, why, sizeof(why)) != 0 ||
+		    flush(device, &fences[COPIES], why, sizeof(why)) != 0) {
+			failed++;
+		}
+		uint64_t t0 = tm_now_ns();
+
+		buffer_destroy(big);
+
+		uint64_t took = tm_now_ns() - t0;
+
+		longest = took > longest ? took : longest;
+	}
+	for (unsigned i = 0; i <= COPIES; i++) {
+		if (fences[i] != NULL) {
+			if (fence_wait(device, fences[i], why, sizeof(why)) != 0) {
+				failed++;
+			}
+			fence_release(device, fences[i]);
+		}
+	}
+	const uint8_t *k = buffer_map(keep);
+
+	for (unsigned i = 0; i < COPIES; i++) {
+		for (unsigned b = 0; b < COPIED; b += 512) {
+			wrong += k[i * COPIED + b] != (uint8_t)(0x11 + i);
+		}
+	}
+	order_case("contract", failed == 0 && wrong == 0, "%u buffers copied from and one of 8 MB filled, "
+		   "each destroyed right after rwa_flush; the longest destroy %.1f us; %u calls failed "
+		   "%s; %u sampled bytes wrong", COPIES, longest / 1e3, failed, why, wrong);
+	buffer_destroy(keep);
+}
+
+struct order_thread {
+	id<MTLDevice> dev;
+	unsigned seed, rounds;
+	bool commits;                   /* false: only writes and reads of its own texture */
+	unsigned wrong, failed;
+};
+
+/* What a thread does, for threads: its own queue and textures, so Metal has nothing to say */
+static void *
+order_thread_main(void *arg)
+{
+	struct order_thread *t = arg;
+
+	@autoreleasepool {
+		id<MTLCommandQueue> queue = [t->dev newCommandQueue];
+		id<MTLTexture> s = order_texture(t->dev, MTLPixelFormatBGRA8Unorm, ORDER_SIDE, ORDER_SIDE);
+		id<MTLTexture> d = order_texture(t->dev, MTLPixelFormatBGRA8Unorm, ORDER_SIDE, ORDER_SIDE);
+		uint8_t picture[ORDER_SIDE * ORDER_SIDE * 4], back[ORDER_SIDE * ORDER_SIDE * 4];
+
+		if (queue == nil || s == nil || d == nil) {
+			t->failed++;
+			return NULL;
+		}
+		for (unsigned i = 0; i < t->rounds; i++) {
+			unsigned round = t->seed + i;
+
+			order_picture(picture, round, ORDER_SIDE, ORDER_SIDE);
+			order_write(s, picture, ORDER_SIDE, ORDER_SIDE, 4);
+			if (!t->commits) {
+				memset(back, 0, sizeof(back));
+				order_read(s, back, ORDER_SIDE, ORDER_SIDE, 4);
+				t->wrong += order_wrong(back, round, ORDER_SIDE, ORDER_SIDE, NULL, 0) != 0;
+				continue;
+			}
+			@autoreleasepool {
+				id<MTLCommandBuffer> cmd = [queue commandBuffer];
+
+				order_blit(cmd, s, d, ORDER_SIDE, ORDER_SIDE);
+				[cmd commit];
+				if (i % 4 == 3 || i == t->rounds - 1) {
+					[cmd waitUntilCompleted];
+					t->failed += [cmd status] != MTLCommandBufferStatusCompleted;
+					memset(back, 0, sizeof(back));
+					order_read(d, back, ORDER_SIDE, ORDER_SIDE, 4);
+					t->wrong += order_wrong(back, round, ORDER_SIDE, ORDER_SIDE, NULL, 0) != 0;
+				}
+			}
+		}
+		[s release];
+		[d release];
+		[queue release];
+	}
+	return NULL;
+}
+
+static int
+order_test(id<MTLDevice> dev, const char *metallib)
+{
+	const char *backend = backend_is_vk() ? "vk" : "gallium";
+	static uint8_t picture[ORDER_SIDE * ORDER_SIDE * 4], back[ORDER_SIDE * ORDER_SIDE * 4];
+	id<MTLCommandQueue> queue = [dev newCommandQueue];
+	id<MTLTexture> src = order_texture(dev, MTLPixelFormatBGRA8Unorm, ORDER_SIDE, ORDER_SIDE);
+	id<MTLTexture> dst[ORDER_ROUNDS];
+	char first[128];
+	unsigned wrong;
+
+	printf("drvtest: order %s: what -replaceRegion: and a destroy promise, library %s\n", backend,
+	       metallib);
+	fflush(stdout);
+	if (queue == nil || src == nil) {
+		printf("drvtest: order-result %s FAILED no queue or no texture, nothing was tried\n", backend);
+		fflush(stdout);
+		return 1;
+	}
+	for (unsigned i = 0; i < ORDER_ROUNDS; i++) {
+		dst[i] = order_texture(dev, MTLPixelFormatBGRA8Unorm, ORDER_SIDE, ORDER_SIDE);
+	}
+
+	/* blit-wait */
+	wrong = 0;
+	first[0] = 0;
+	for (unsigned i = 0; i < ORDER_ROUNDS; i++) {
+		@autoreleasepool {
+			id<MTLCommandBuffer> cmd;
+
+			order_picture(picture, i, ORDER_SIDE, ORDER_SIDE);
+			order_write(src, picture, ORDER_SIDE, ORDER_SIDE, 4);
+			cmd = [queue commandBuffer];
+			order_blit(cmd, src, dst[0], ORDER_SIDE, ORDER_SIDE);
+			[cmd commit];
+			[cmd waitUntilCompleted];
+			memset(back, 0, sizeof(back));
+			order_read(dst[0], back, ORDER_SIDE, ORDER_SIDE, 4);
+			wrong += order_wrong(back, i, ORDER_SIDE, ORDER_SIDE, first, sizeof(first)) != 0;
+		}
+	}
+	order_case("blit-wait", wrong == 0, "%u of %u rounds wrong %s", wrong, (unsigned)ORDER_ROUNDS, first);
+
+	/* blit-nowait */
+	wrong = 0;
+	first[0] = 0;
+	for (unsigned i = 0; i < ORDER_ROUNDS; i++) {
+		@autoreleasepool {
+			id<MTLCommandBuffer> cmd;
+
+			order_picture(picture, 100 + i, ORDER_SIDE, ORDER_SIDE);
+			order_write(src, picture, ORDER_SIDE, ORDER_SIDE, 4);
+			cmd = [queue commandBuffer];
+			order_blit(cmd, src, dst[i], ORDER_SIDE, ORDER_SIDE);
+			[cmd commit];
+			if (i == ORDER_ROUNDS - 1) {
+				[cmd waitUntilCompleted];
+			}
+		}
+	}
+	for (unsigned i = 0; i < ORDER_ROUNDS; i++) {
+		memset(back, 0, sizeof(back));
+		order_read(dst[i], back, ORDER_SIDE, ORDER_SIDE, 4);
+		wrong += order_wrong(back, 100 + i, ORDER_SIDE, ORDER_SIDE, first, sizeof(first)) != 0;
+	}
+	order_case("blit-nowait", wrong == 0, "%u of %u rounds wrong %s", wrong, (unsigned)ORDER_ROUNDS,
+		   first);
+
+	/* encoded-blit: the encoder ended, the command buffer not committed, then the write */
+	first[0] = 0;
+	order_picture(picture, 200, ORDER_SIDE, ORDER_SIDE);
+	order_write(src, picture, ORDER_SIDE, ORDER_SIDE, 4);
+	@autoreleasepool {
+		id<MTLCommandBuffer> cmd = [queue commandBuffer];
+
+		order_blit(cmd, src, dst[1], ORDER_SIDE, ORDER_SIDE);
+		order_picture(picture, 201, ORDER_SIDE, ORDER_SIDE);
+		order_write(src, picture, ORDER_SIDE, ORDER_SIDE, 4);
+		[cmd commit];
+		[cmd waitUntilCompleted];
+	}
+	memset(back, 0, sizeof(back));
+	order_read(dst[1], back, ORDER_SIDE, ORDER_SIDE, 4);
+	wrong = order_wrong(back, 201, ORDER_SIDE, ORDER_SIDE, first, sizeof(first));
+	order_case("encoded-blit", wrong == 0, "%u texels are not the write made after the encoding %s",
+		   wrong, first);
+
+	/* the draws */
+	NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:metallib]];
+	NSError *err = nil;
+	id<MTLLibrary> library = nil;
+	id<MTLFunction> fn = nil;
+	id<MTLRenderPipelineState> ps = nil;
+	MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+	id<MTLSamplerState> samp = [dev newSamplerStateWithDescriptor:sd];
+	id<MTLTexture> sampled = order_texture(dev, MTLPixelFormatRGBA32Uint, 4, 4);
+	id<MTLTexture> targets[ORDER_ROUNDS][4];
+
+	[sd release];
+	if (data != nil) {
+		dispatch_data_t dd = dispatch_data_create([data bytes], [data length], NULL,
+							  DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+
+		library = [dev newLibraryWithData:dd error:&err];
+	}
+	fn = library != nil ? [library newFunctionWithName:@"texturedFragment2DUInt"] : nil;
+	if (fn != nil) {
+		MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+
+		[pd setFragmentFunction:fn];
+		[pd setVertexFunction:nil];
+		for (unsigned i = 0; i < 4; i++) {
+			[[[pd colorAttachments] objectAtIndexedSubscript:i]
+			    setPixelFormat:MTLPixelFormatRGBA32Uint];
+		}
+		ps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+		[pd release];
+	}
+	for (unsigned i = 0; i < ORDER_ROUNDS; i++) {
+		for (unsigned a = 0; a < 4; a++) {
+			targets[i][a] = order_texture(dev, MTLPixelFormatRGBA32Uint, 4, 4);
+		}
+	}
+	if (ps == nil || sampled == nil || samp == nil) {
+		const char *no = library == nil ? "the library could not be read" :
+		    fn == nil ? "it has no texturedFragment2DUInt" :
+		    ps == nil ? [[err localizedDescription] UTF8String] : "no texture or sampler";
+
+		order_case("draw-wait", false, "not tried: %s", no);
+		order_case("draw-nowait", false, "not tried: %s", no);
+		order_case("encoded-draw", false, "not tried: %s", no);
+	} else {
+		unsigned words[16][4];
+
+		/* draw-wait */
+		wrong = 0;
+		first[0] = 0;
+		for (unsigned i = 0; i < ORDER_ROUNDS; i++) {
+			@autoreleasepool {
+				id<MTLCommandBuffer> cmd;
+
+				for (unsigned t = 0; t < 16; t++) {
+					order_words(i, words[t]);
+				}
+				order_write(sampled, words, 4, 4, 16);
+				cmd = [queue commandBuffer];
+				order_draw(cmd, ps, samp, sampled, targets[0]);
+				[cmd commit];
+				[cmd waitUntilCompleted];
+				wrong += order_words_wrong(targets[0][0], i, first, sizeof(first)) != 0;
+			}
+		}
+		order_case("draw-wait", wrong == 0, "%u of %u rounds wrong %s", wrong,
+			   (unsigned)ORDER_ROUNDS, first);
+
+		/* draw-nowait */
+		wrong = 0;
+		first[0] = 0;
+		for (unsigned i = 0; i < ORDER_ROUNDS; i++) {
+			@autoreleasepool {
+				id<MTLCommandBuffer> cmd;
+
+				for (unsigned t = 0; t < 16; t++) {
+					order_words(100 + i, words[t]);
+				}
+				order_write(sampled, words, 4, 4, 16);
+				cmd = [queue commandBuffer];
+				order_draw(cmd, ps, samp, sampled, targets[i]);
+				[cmd commit];
+				if (i == ORDER_ROUNDS - 1) {
+					[cmd waitUntilCompleted];
+				}
+			}
+		}
+		for (unsigned i = 0; i < ORDER_ROUNDS; i++) {
+			wrong += order_words_wrong(targets[i][0], 100 + i, first, sizeof(first)) != 0;
+		}
+		order_case("draw-nowait", wrong == 0, "%u of %u rounds wrong %s", wrong,
+			   (unsigned)ORDER_ROUNDS, first);
+
+		/* encoded-draw */
+		first[0] = 0;
+		for (unsigned t = 0; t < 16; t++) {
+			order_words(200, words[t]);
+		}
+		order_write(sampled, words, 4, 4, 16);
+		@autoreleasepool {
+			id<MTLCommandBuffer> cmd = [queue commandBuffer];
+
+			order_draw(cmd, ps, samp, sampled, targets[1]);
+			for (unsigned t = 0; t < 16; t++) {
+				order_words(201, words[t]);
+			}
+			order_write(sampled, words, 4, 4, 16);
+			[cmd commit];
+			[cmd waitUntilCompleted];
+		}
+		wrong = order_words_wrong(targets[1][0], 201, first, sizeof(first));
+		order_case("encoded-draw", wrong == 0, "%u texels are not the write made after the "
+			   "encoding %s", wrong, first);
+	}
+
+	/* rows, and the cost of them */
+	order_rows_and_blocks(dev, queue);
+
+	/* big: over the ring's largest piece */
+	{
+		const size_t bytes = (size_t)PANEL_W * PANEL_H * 4;
+		uint8_t *host = malloc(bytes), *host2 = malloc(bytes);
+		id<MTLTexture> panel = order_texture(dev, MTLPixelFormatBGRA8Unorm, PANEL_W, PANEL_H);
+
+		if (host == NULL || host2 == NULL || panel == nil) {
+			order_case("big", false, "no memory or no panel-sized texture");
+		} else {
+			first[0] = 0;
+			order_picture(host, 300, PANEL_W, PANEL_H);
+			order_write(panel, host, PANEL_W, PANEL_H, 4);
+			memset(host2, 0, bytes);
+			order_read(panel, host2, PANEL_W, PANEL_H, 4);
+			wrong = order_wrong(host2, 300, PANEL_W, PANEL_H, first, sizeof(first));
+			order_case("big", wrong == 0, "%u of %u texels wrong %s", wrong, PANEL_W * PANEL_H, first);
+		}
+		free(host);
+		free(host2);
+		[panel release];
+	}
+
+	/* ring: four times over, nothing committed */
+	{
+		const size_t bytes = (size_t)ORDER_RING_SIDE * ORDER_RING_SIDE * 4;
+		uint8_t *host = malloc(bytes);
+		id<MTLTexture> four[4];
+		unsigned made = 0;
+
+		for (unsigned i = 0; i < 4; i++) {
+			four[i] = order_texture(dev, MTLPixelFormatBGRA8Unorm, ORDER_RING_SIDE, ORDER_RING_SIDE);
+			made += four[i] != nil;
+		}
+		if (host == NULL || made != 4) {
+			order_case("ring", false, "no memory or no 256x256 textures");
+		} else {
+			uint64_t t0 = tm_now_ns();
+
+			for (unsigned i = 0; i < 64; i++) {
+				order_picture(host, 400 + i, ORDER_RING_SIDE, ORDER_RING_SIDE);
+				order_write(four[i % 4], host, ORDER_RING_SIDE, ORDER_RING_SIDE, 4);
+			}
+			uint64_t t1 = tm_now_ns();
+
+			wrong = 0;
+			first[0] = 0;
+			for (unsigned i = 0; i < 4; i++) {
+				memset(host, 0, bytes);
+				order_read(four[i], host, ORDER_RING_SIDE, ORDER_RING_SIDE, 4);
+				wrong += order_wrong(host, 400 + 60 + i, ORDER_RING_SIDE, ORDER_RING_SIDE,
+						     first, sizeof(first));
+			}
+			order_case("ring", wrong == 0, "64 writes of 256 KB in %.1f ms, none committed: "
+				   "%u texels of the last four wrong %s", (t1 - t0) / 1e6, wrong, first);
+		}
+		for (unsigned i = 0; i < 4; i++) {
+			[four[i] release];
+		}
+		free(host);
+	}
+
+	/* release */
+	{
+		id<MTLTexture> keep = order_texture(dev, MTLPixelFormatBGRA8Unorm, ORDER_SIDE, ORDER_SIDE);
+
+		for (unsigned i = 0; i < 64; i++) {
+			id<MTLTexture> t = order_texture(dev, MTLPixelFormatBGRA8Unorm, ORDER_SIDE, ORDER_SIDE);
+
+			order_picture(picture, 500 + i, ORDER_SIDE, ORDER_SIDE);
+			order_write(t, picture, ORDER_SIDE, ORDER_SIDE, 4);
+			[t release];
+		}
+		for (unsigned i = 0; i < 64; i++) {
+			@autoreleasepool {
+				id<MTLTexture> t = order_texture(dev, MTLPixelFormatBGRA8Unorm, ORDER_SIDE,
+								 ORDER_SIDE);
+				id<MTLCommandBuffer> cmd;
+
+				order_picture(picture, 600 + i, ORDER_SIDE, ORDER_SIDE);
+				order_write(t, picture, ORDER_SIDE, ORDER_SIDE, 4);
+				cmd = [queue commandBuffer];
+				order_blit(cmd, t, keep, ORDER_SIDE, ORDER_SIDE);
+				[cmd commit];
+				if (i == 63) {
+					[cmd waitUntilCompleted];
+				}
+				[t release];
+			}
+		}
+		first[0] = 0;
+		memset(back, 0, sizeof(back));
+		order_read(keep, back, ORDER_SIDE, ORDER_SIDE, 4);
+		wrong = order_wrong(back, 600 + 63, ORDER_SIDE, ORDER_SIDE, first, sizeof(first));
+		print_vk_counts("after the releases");
+		order_case("release", wrong == 0, "the last of 64 copies: %u texels wrong %s", wrong, first);
+		[keep release];
+	}
+
+	/* contract */
+	order_contract(dev);
+
+	/* surface: its reader cannot be told to wait for a flush */
+	{
+		enum { W = 256, H = 64 };
+		static uint8_t host[W * H * 4];
+		IOSurfaceRef surf = frames_surface(W, H);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+								       width:W
+								      height:H
+								   mipmapped:NO];
+
+		[td setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+		id<MTLTexture> t = surf != NULL ? [dev newTextureWithDescriptor:td iosurface:surf plane:0] : nil;
+
+		if (t == nil) {
+			order_case("surface", false, "no %ux%u BGRA texture over an IOSurface (the driver's "
+				   "line above says why)", W, H);
+		} else {
+			size_t stride = IOSurfaceGetBytesPerRow(surf);
+			unsigned bad = 0;
+
+			first[0] = 0;
+			order_picture(host, 700, W, H);
+			order_write(t, host, W, H, 4);
+			IOSurfaceLock(surf, 1 /* kIOSurfaceLockReadOnly */, NULL);
+
+			const uint8_t *base = IOSurfaceGetBaseAddress(surf);
+
+			order_civac(base, stride * H);
+			for (unsigned y = 0; y < H; y++) {
+				bad += memcmp(base + y * stride, host + y * W * 4, W * 4) != 0;
+			}
+			IOSurfaceUnlock(surf, 1, NULL);
+			order_case("surface", bad == 0, "read by the processor at once past its cache "
+				   "(DC CIVAC): %u of %u rows wrong, %zu bytes a row", bad, H, stride);
+		}
+		[t release];
+		if (surf != NULL) {
+			CFRelease(surf);
+		}
+	}
+
+	/* threads */
+	if (backend_is_vk()) {
+		struct order_thread work[3] = {
+			{ dev, 1000, 512, true, 0, 0 },
+			{ dev, 3000, 512, true, 0, 0 },
+			{ dev, 5000, 512, false, 0, 0 },
+		};
+		pthread_t thread[2];
+		bool started[2];
+		uint64_t t0 = tm_now_ns();
+
+		for (unsigned i = 0; i < 2; i++) {
+			started[i] = pthread_create(&thread[i], NULL, order_thread_main, &work[i + 1]) == 0;
+		}
+		order_thread_main(&work[0]);
+		for (unsigned i = 0; i < 2; i++) {
+			if (started[i]) {
+				pthread_join(thread[i], NULL);
+			}
+		}
+		order_case("threads", work[0].wrong + work[1].wrong + work[2].wrong +
+			   work[0].failed + work[1].failed + work[2].failed == 0 && started[0] && started[1],
+			   "two threads committing and one only writing and reading, 512 rounds each in "
+			   "%.0f ms: wrong %u %u %u, failed %u %u %u", (tm_now_ns() - t0) / 1e6,
+			   work[0].wrong, work[1].wrong, work[2].wrong, work[0].failed, work[1].failed,
+			   work[2].failed);
+	} else {
+		printf("drvtest: order gallium threads not tried: -replaceRegion: and -getBytes: share "
+		       "Gallium's context unguarded (hkmetal.m, over rw_pipe_lock)\n");
+	}
+
+	for (unsigned i = 0; i < ORDER_ROUNDS; i++) {
+		[dst[i] release];
+		for (unsigned a = 0; a < 4; a++) {
+			[targets[i][a] release];
+		}
+	}
+	[src release];
+	[sampled release];
+	[samp release];
+	[ps release];
+	[fn release];
+	[library release];
+	[queue release];
+	print_vk_counts("after everything of --order was released");
+	printf("drvtest: order-result %s %s %u cases, %u failed:%s\n", backend,
+	       order_bad == 0 ? "ok" : "FAILED", order_cases, order_bad,
+	       order_bad == 0 ? " none" : order_bad_names);
+	fflush(stdout);
+	return order_bad != 0;
+}
+
 /* Check completion without an explicit wait, plus handlers registered around commit. */
 static int
 completion_test(id<MTLDevice> dev)
@@ -7585,6 +11973,2072 @@ completion_test(id<MTLDevice> dev)
 	return failures != 0;
 }
 
+/*
+ * What this process left on the GPU, on every way out through exit() (M4-1), so a log shows
+ * whether one process's work could still be running when the next one starts. air_vk.c counts
+ * it, from each fence's own status, at its own exit handler (exit_line says what the two
+ * numbers are), and hands them over in AIR_VK_EXIT because the library has no export to spare;
+ * this handler is registered first thing in main, before any device exists, so it runs after
+ * that one. Gallium's fences are freedreno's and are not counted by anything here, which the
+ * line says rather than printing zeros.
+ */
+/*
+ * --pixels: M5a's half of --draw-attrib, --draw-index, --picture and --blit, through Metal's own
+ * API and so through userland/src/hkmetal.m: the encoder's setters that were stubs until now
+ * (-setCullMode:, -setFrontFacingWinding:, -setViewport:'s rectangle, -setScissorRect:,
+ * -setBlendColorRed:green:blue:alpha:), one colour's clear per attachment, several encoders in a
+ * command buffer. What those modes check without it, and it is why this exists: --draw-attrib's
+ * attachments are 4x4 and its verdict is a count of a gradient's texels; --draw-index draws a
+ * constant colour and looks at two corners; --picture is one texture's bands on the panel, opaque,
+ * and a count; --blit's render passes are uniform colours. air_metal_test --pixels has the same
+ * pictures through the contract, with modules written for it. This one has only what a Metal
+ * library can hold on this phone, which means Apple's own functions, and they serve: a texture
+ * of draw_model.h's pattern, sampled nearest at a coordinate that lands every pixel on its own
+ * texel, is a fragment stage whose output varies per pixel by a known function.
+ *
+ *   texturedVertex2D         position out of [[buffer(0)]], coordinate out of [[buffer(1)]], by id
+ *   std_vert0_lpf            position from [[attribute(0)]], coordinate from [[attribute(3)]],
+ *                            through mvp_matrix at [[buffer(2)]]: the identity, here
+ *   texturedFragment2DFloat  the texel at the coordinate, into four attachments
+ *
+ * Every case is one drvtest: draw-result line (tools/mesa/air/draw_model.h), compared with the
+ * model on both back ends: the Gallium library reads none of the encoder's M5a fields, so those
+ * cases say gallium-lacks there, and its refusal of the blend colour says "refused".
+ */
+struct mpx {
+	id<MTLDevice> dev;
+	id<MTLCommandQueue> queue;
+	id<MTLFunction> vtx2d, frag2d, stdv;
+	id<MTLSamplerState> samp;
+	id<MTLTexture> tsrc, tdst, tcheck;
+	id<MTLBuffer> identity;
+	const char *backend, *mode;
+	bool gallium;
+	unsigned right, wrong, lacks, refused;
+	unsigned mirror;   /* M5b: rows that are the Gallium library's mirrored 16-bit table */
+};
+
+static uint8_t mpx_mem[DM_W * DM_H * 16];
+
+/* One attachment or sampled texture. */
+static id<MTLTexture>
+mpx_texture(struct mpx *m, unsigned fmt, void (*pattern)(unsigned, unsigned, float[4]))
+{
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)fmt
+							       width:DM_W
+							      height:DM_H
+							   mipmapped:NO];
+
+	[td setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+	id<MTLTexture> t = [m->dev newTextureWithDescriptor:td];
+
+	if (t == nil) {
+		printf("drvtest: pixels: a %s texture could not be made\n", dm_format_name(fmt));
+		return nil;
+	}
+	if (pattern != NULL) {
+		unsigned texel = dm_texel_bytes(fmt);
+
+		for (unsigned y = 0; y < DM_H; y++) {
+			for (unsigned x = 0; x < DM_W; x++) {
+				float v[4];
+
+				pattern(x, y, v);
+				dm_encode(fmt, v, mpx_mem + ((size_t)y * DM_W + x) * texel);
+			}
+		}
+		[t replaceRegion:MTLRegionMake2D(0, 0, DM_W, DM_H)
+		     mipmapLevel:0
+		       withBytes:mpx_mem
+		     bytesPerRow:DM_W * texel];
+	}
+	return t;
+}
+
+/* The pipeline, or the case's line saying why not. `formats` are the four attachments. */
+static id<MTLRenderPipelineState>
+mpx_pipeline(struct mpx *m, id<MTLFunction> vertex, MTLVertexDescriptor *vd,
+	     const unsigned formats[4], const struct dm_blend *blends, unsigned zformat,
+	     const char *name)
+{
+	MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+	NSError *err = nil;
+
+	[pd setVertexFunction:vertex];
+	[pd setFragmentFunction:m->frag2d];
+	if (vd != nil) {
+		[pd setVertexDescriptor:vd];
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		MTLRenderPipelineColorAttachmentDescriptor *a =
+		    [[pd colorAttachments] objectAtIndexedSubscript:i];
+
+		[a setPixelFormat:(MTLPixelFormat)formats[i]];
+		if (blends != NULL && i < 2) {
+			const struct dm_blend *b = &blends[i];
+
+			[a setBlendingEnabled:b->on != 0];
+			[a setRgbBlendOperation:(MTLBlendOperation)b->rgb_op];
+			[a setAlphaBlendOperation:(MTLBlendOperation)b->alpha_op];
+			[a setSourceRGBBlendFactor:(MTLBlendFactor)b->src_rgb];
+			[a setDestinationRGBBlendFactor:(MTLBlendFactor)b->dst_rgb];
+			[a setSourceAlphaBlendFactor:(MTLBlendFactor)b->src_alpha];
+			[a setDestinationAlphaBlendFactor:(MTLBlendFactor)b->dst_alpha];
+			[a setWriteMask:(MTLColorWriteMask)b->mask];
+		}
+	}
+	if (zformat != 0) {
+		[pd setDepthAttachmentPixelFormat:(MTLPixelFormat)zformat];
+		[pd setStencilAttachmentPixelFormat:(MTLPixelFormat)zformat];
+	}
+	id<MTLRenderPipelineState> ps = [m->dev newRenderPipelineStateWithDescriptor:pd error:&err];
+
+	[pd release];
+	if (ps == nil) {
+		dm_refused(m->backend, name,
+			   err != nil ? [[err localizedDescription] UTF8String] : "(no reason)");
+		m->refused++;
+	}
+	return ps;
+}
+
+/* Attachment 0 of the four is what is judged; 1..3 are there because the shader writes them. */
+static MTLRenderPassDescriptor *
+mpx_pass(id<MTLTexture> const t[4], MTLLoadAction load, MTLClearColor clear)
+{
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+
+	for (unsigned i = 0; i < 4; i++) {
+		MTLRenderPassColorAttachmentDescriptor *a =
+		    [[rp colorAttachments] objectAtIndexedSubscript:i];
+
+		[a setTexture:t[i]];
+		[a setLoadAction:load];
+		[a setClearColor:clear];
+		[a setStoreAction:MTLStoreActionStore];
+	}
+	return rp;
+}
+
+/* The attachment read back and judged: one line, and the counts. */
+static bool
+mpx_judge(struct mpx *m, id<MTLTexture> t, unsigned fmt, const char *name,
+	  const struct dm_picture *want, float extra, bool lacks)
+{
+	[t getBytes:mpx_mem
+	bytesPerRow:DM_W * dm_texel_bytes(fmt)
+	 fromRegion:MTLRegionMake2D(0, 0, DM_W, DM_H)
+	mipmapLevel:0];
+	bool ok = dm_verdict(m->backend, name, fmt, mpx_mem, want, extra, lacks);
+
+	if (ok) {
+		m->right++;
+	} else if (lacks) {
+		m->lacks++;
+	} else {
+		m->wrong++;
+	}
+	return ok;
+}
+
+/* -commit and the wait; a command buffer that failed is the case's line. */
+static bool
+mpx_finish(struct mpx *m, id<MTLCommandBuffer> cb, const char *name)
+{
+	[cb commit];
+	[cb waitUntilCompleted];
+	if ([cb status] != RW_CB_COMPLETED) {
+		dm_refused(m->backend, name, [cb error] != nil
+			   ? [[[cb error] localizedDescription] UTF8String] : "(no reason)");
+		m->refused++;
+		return false;
+	}
+	return true;
+}
+
+/*
+ * What a textured triangle leaves: dm_triangle over the coordinate, and each covered pixel
+ * the texel its coordinate lands in, which is this harness's whole fragment stage.
+ */
+static void
+mpx_model(struct dm_picture *want, const float win[3][2], const float uv[3][2],
+	  const struct dm_viewport *vp, struct dm_rect rect, unsigned cull, unsigned winding,
+	  void (*pattern)(unsigned, unsigned, float[4]), bool shared)
+{
+	static struct dm_picture cover;
+	float col[3][4];
+	float w[3][2];
+	static const float none[4] = { 0, 0, 0, 0 };
+
+	for (unsigned i = 0; i < 3; i++) {
+		float clip[2] = { win[i][0] * 2.0f / DM_W - 1.0f, 1.0f - win[i][1] * 2.0f / DM_H };
+
+		dm_window(clip, vp, w[i]);
+		col[i][0] = uv[i][0];
+		col[i][1] = uv[i][1];
+		col[i][2] = 0.0f;
+		col[i][3] = 1.0f;
+	}
+	if (dm_culled(w, cull, winding)) {
+		return;
+	}
+	dm_clear(&cover, none);
+	dm_triangle(&cover, w, col, rect, shared);
+	for (unsigned y = 0; y < DM_H; y++) {
+		for (unsigned x = 0; x < DM_W; x++) {
+			if (!cover.care[y][x]) {
+				want->care[y][x] = 0;
+			} else if (cover.px[y][x][3] > 0.5f) {
+				int tx = (int)(cover.px[y][x][0] * DM_W);
+				int ty = (int)(cover.px[y][x][1] * DM_H);
+
+				tx = tx < 0 ? 0 : tx >= DM_W ? DM_W - 1 : tx;
+				ty = ty < 0 ? 0 : ty >= DM_H ? DM_H - 1 : ty;
+				pattern((unsigned)tx, (unsigned)ty, want->px[y][x]);
+			}
+		}
+	}
+}
+
+/* The element std_vert0_lpf's descriptor below reads, at Metal's buffer index 5. */
+struct mpx_std_vertex {
+	float pos[4];
+	float uv[2];
+	float pad[2];
+};
+
+static struct mpx_std_vertex
+mpx_stdv(float wx, float wy, float u, float v)
+{
+	struct mpx_std_vertex e = {
+		{ wx * 2.0f / DM_W - 1.0f, 1.0f - wy * 2.0f / DM_H, 0.0f, 1.0f }, { u, v }, { 0, 0 },
+	};
+	return e;
+}
+
+static MTLVertexDescriptor *
+mpx_std_descriptor(void)
+{
+	MTLVertexDescriptor *vd = [[[MTLVertexDescriptor alloc] init] autorelease];
+	MTLVertexAttributeDescriptor *a0 = [[vd attributes] objectAtIndexedSubscript:0];
+	MTLVertexAttributeDescriptor *a3 = [[vd attributes] objectAtIndexedSubscript:3];
+	MTLVertexBufferLayoutDescriptor *l = [[vd layouts] objectAtIndexedSubscript:5];
+
+	[a0 setFormat:MTLVertexFormatFloat4];
+	[a0 setOffset:0];
+	[a0 setBufferIndex:5];
+	[a3 setFormat:MTLVertexFormatFloat2];
+	[a3 setOffset:16];
+	[a3 setBufferIndex:5];
+	[l setStride:sizeof(struct mpx_std_vertex)];
+	[l setStepFunction:MTLVertexStepFunctionPerVertex];
+	[l setStepRate:1];
+	return vd;
+}
+
+/* What an encoder over std_vert0_lpf binds, whatever it draws. */
+static void
+mpx_bind_std(struct mpx *m, id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> ps,
+	     id<MTLTexture> tex, const struct mpx_std_vertex *v, unsigned n)
+{
+	[enc setRenderPipelineState:ps];
+	for (unsigned i = 2; i <= 4; i++) {
+		[enc setVertexBuffer:m->identity offset:0 atIndex:i];
+	}
+	[enc setVertexBytes:v length:n * sizeof(*v) atIndex:5];
+	[enc setFragmentTexture:tex atIndex:0];
+	[enc setFragmentSamplerState:m->samp atIndex:0];
+}
+
+/* The asymmetric triangle, in window coordinates and with its coordinate in texels 1:1. */
+static const float mpx_tri[3][2] = { { 2.0625f, 1.0625f }, { 4.0625f, 12.0625f },
+				     { 13.0625f, 3.0625f } };
+
+static void
+mpx_tri_uv(float uv[3][2])
+{
+	for (unsigned i = 0; i < 3; i++) {
+		uv[i][0] = mpx_tri[i][0] / DM_W;
+		uv[i][1] = mpx_tri[i][1] / DM_H;
+	}
+}
+
+static const unsigned mpx_all32f[4] = { DM_RGBA32F, DM_RGBA32F, DM_RGBA32F, DM_RGBA32F };
+
+/* ---- --draw-attrib --pixels: orientation, rectangles and stencil, through the encoder ---- */
+static void
+mpx_attrib(struct mpx *m)
+{
+	static struct dm_picture want;
+	static const float black[4] = { 0, 0, 0, 0 };
+	const struct dm_viewport whole = { 0, 0, DM_W, DM_H };
+	id<MTLTexture> t[4];
+	/* a thousandth of a pixel's worth of coordinate never changes a nearest texel */
+	MTLClearColor none = MTLClearColorMake(0, 0, 0, 0);
+	MTLVertexDescriptor *vd = mpx_std_descriptor();
+	float uv[3][2];
+
+	mpx_tri_uv(uv);
+	for (unsigned i = 0; i < 4; i++) {
+		t[i] = mpx_texture(m, DM_RGBA32F, NULL);
+	}
+	id<MTLRenderPipelineState> ps = mpx_pipeline(m, m->stdv, vd, mpx_all32f, NULL, 0,
+						     "orient-pipeline");
+	if (ps == nil) {
+		return;
+	}
+	MTLRenderPassDescriptor *rp = mpx_pass(t, MTLLoadActionClear, none);
+	struct mpx_std_vertex ccw[3], cw[3];
+
+	for (unsigned i = 0; i < 3; i++) {
+		ccw[i] = mpx_stdv(mpx_tri[i][0], mpx_tri[i][1], uv[i][0], uv[i][1]);
+	}
+	cw[0] = ccw[0];
+	cw[1] = ccw[2];
+	cw[2] = ccw[1];
+
+	/* 1-13: the asymmetric triangle under every cull mode and winding, both ways round */
+	static const char *const cn[] = { "none", "front", "back" };
+	static const char *const wn[] = { "cw", "ccw" };
+	for (unsigned tw = 0; tw < 2; tw++) {
+		for (unsigned cull = 0; cull < 3; cull++) {
+			for (unsigned fw = 0; fw < 2; fw++) {
+				char name[64];
+				id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+				id<MTLRenderCommandEncoder> enc =
+				    [cb renderCommandEncoderWithDescriptor:rp];
+
+				snprintf(name, sizeof(name), "orient-%stri-cull%s-front%s", wn[tw],
+					 cn[cull], wn[fw]);
+				mpx_bind_std(m, enc, ps, m->tsrc, tw ? ccw : cw, 3);
+				[enc setCullMode:(MTLCullMode)cull];
+				[enc setFrontFacingWinding:(MTLWinding)fw];
+				[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+				[enc endEncoding];
+				if (!mpx_finish(m, cb, name)) {
+					continue;
+				}
+				const float (*win)[2] = mpx_tri;
+				float swapped[3][2], swuv[3][2];
+
+				if (!tw) {
+					memcpy(swapped[0], mpx_tri[0], sizeof(swapped[0]));
+					memcpy(swapped[1], mpx_tri[2], sizeof(swapped[1]));
+					memcpy(swapped[2], mpx_tri[1], sizeof(swapped[2]));
+					memcpy(swuv[0], uv[0], sizeof(swuv[0]));
+					memcpy(swuv[1], uv[2], sizeof(swuv[1]));
+					memcpy(swuv[2], uv[1], sizeof(swuv[2]));
+					win = (const float (*)[2])swapped;
+				}
+				dm_clear(&want, black);
+				mpx_model(&want, win, tw ? uv : swuv, &whole, dm_whole(), cull, fw,
+					  dm_src, false);
+				mpx_judge(m, t[0], DM_RGBA32F, name, &want, 0.0f,
+					  m->gallium && cull != 0);
+			}
+		}
+	}
+
+	/* 14-19: rectangles. A strip over the whole of clip space through a viewport, with a
+	 * coordinate that keeps a pixel on a texel of its own whatever the viewport's size: the
+	 * texel is the pixel's place inside the viewport, so a viewport put in the wrong place
+	 * or at the wrong y is the picture moved as well as cut. */
+	static const struct {
+		const char *name;
+		MTLViewport vp;
+		MTLScissorRect sc;
+		bool has_vp, has_sc;
+	} rects[] = {
+		{ "viewport-origin", { 4, 2, 8, 8, 0, 1 }, { 0, 0, 0, 0 }, true, false },
+		{ "viewport-lower-right", { 8, 8, 8, 8, 0, 1 }, { 0, 0, 0, 0 }, true, false },
+		{ "viewport-wide", { 1, 11, 14, 4, 0, 1 }, { 0, 0, 0, 0 }, true, false },
+		{ "scissor", { 0, 0, 0, 0, 0, 0 }, { 3, 5, 7, 4 }, false, true },
+		{ "scissor-corner", { 0, 0, 0, 0, 0, 0 }, { 0, 12, 4, 4 }, false, true },
+		{ "viewport-and-scissor", { 2, 2, 12, 12, 0, 1 }, { 6, 0, 4, 16 }, true, true },
+	};
+	for (unsigned c = 0; c < sizeof(rects) / sizeof(rects[0]); c++) {
+		float vw = rects[c].has_vp ? (float)rects[c].vp.width : DM_W;
+		float vh = rects[c].has_vp ? (float)rects[c].vp.height : DM_H;
+		struct dm_viewport vp = { rects[c].has_vp ? (float)rects[c].vp.originX : 0,
+					  rects[c].has_vp ? (float)rects[c].vp.originY : 0, vw, vh };
+		struct dm_rect sc = rects[c].has_sc
+		    ? (struct dm_rect){ (int)rects[c].sc.x, (int)rects[c].sc.y,
+					(int)(rects[c].sc.x + rects[c].sc.width),
+					(int)(rects[c].sc.y + rects[c].sc.height) }
+		    : dm_whole();
+		struct mpx_std_vertex q[4];
+		static const float at[4][2] = { { 0, 0 }, { DM_W, 0 }, { 0, DM_H }, { DM_W, DM_H } };
+		float quv[4][2];
+
+		for (unsigned i = 0; i < 4; i++) {
+			quv[i][0] = at[i][0] / DM_W * vw / DM_W;
+			quv[i][1] = at[i][1] / DM_H * vh / DM_H;
+			q[i] = mpx_stdv(at[i][0], at[i][1], quv[i][0], quv[i][1]);
+		}
+		id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+
+		mpx_bind_std(m, enc, ps, m->tsrc, q, 4);
+		if (rects[c].has_vp) {
+			[enc setViewport:rects[c].vp];
+		}
+		if (rects[c].has_sc) {
+			[enc setScissorRect:rects[c].sc];
+		}
+		[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+		[enc endEncoding];
+		if (!mpx_finish(m, cb, rects[c].name)) {
+			continue;
+		}
+		const float t0[3][2] = { { at[0][0], at[0][1] }, { at[1][0], at[1][1] }, { at[2][0], at[2][1] } };
+		const float t1[3][2] = { { at[2][0], at[2][1] }, { at[1][0], at[1][1] }, { at[3][0], at[3][1] } };
+		const float u0[3][2] = { { quv[0][0], quv[0][1] }, { quv[1][0], quv[1][1] }, { quv[2][0], quv[2][1] } };
+		const float u1[3][2] = { { quv[2][0], quv[2][1] }, { quv[1][0], quv[1][1] }, { quv[3][0], quv[3][1] } };
+
+		dm_clear(&want, black);
+		mpx_model(&want, t0, u0, &vp, sc, 0, 0, dm_src, true);
+		mpx_model(&want, t1, u1, &vp, sc, 0, 0, dm_src, true);
+		mpx_judge(m, t[0], DM_RGBA32F, rects[c].name, &want, 0.0f, m->gallium);
+	}
+
+	/* 20-21: the stencil, through -setStencilReferenceValue: and its two-faced form: the
+	 * triangle replaces a reference, the whole attachment then draws where the stencil
+	 * equals it. The triangle is counter-clockwise as seen, so under Metal's default winding
+	 * it is back-facing and the second case's back reference is the one that goes in. */
+	{
+		MTLTextureDescriptor *zd =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+								       width:DM_W
+								      height:DM_H
+								   mipmapped:NO];
+
+		[zd setUsage:MTLTextureUsageRenderTarget];
+		[zd setStorageMode:MTLStorageModePrivate];
+		id<MTLTexture> z = [m->dev newTextureWithDescriptor:zd];
+		id<MTLRenderPipelineState> zps = mpx_pipeline(m, m->stdv, vd, mpx_all32f, NULL,
+							      (unsigned)MTLPixelFormatDepth32Float_Stencil8,
+							      "stencil-pipeline");
+		MTLStencilDescriptor *wf = [[MTLStencilDescriptor alloc] init];
+		MTLStencilDescriptor *wb = [[MTLStencilDescriptor alloc] init];
+		MTLStencilDescriptor *tf = [[MTLStencilDescriptor alloc] init];
+
+		[wf setDepthStencilPassOperation:MTLStencilOperationReplace];
+		[wb setDepthStencilPassOperation:MTLStencilOperationReplace];
+		[wb setReadMask:0x7f];     /* so the two faces are two states on Gallium as well */
+		[tf setStencilCompareFunction:MTLCompareFunctionEqual];
+		[tf setWriteMask:0];
+		MTLDepthStencilDescriptor *wd = [[MTLDepthStencilDescriptor alloc] init];
+		MTLDepthStencilDescriptor *td = [[MTLDepthStencilDescriptor alloc] init];
+
+		[wd setFrontFaceStencil:wf];
+		[wd setBackFaceStencil:wb];
+		[td setFrontFaceStencil:tf];
+		[td setBackFaceStencil:tf];
+		id<MTLDepthStencilState> ws = [m->dev newDepthStencilStateWithDescriptor:wd];
+		id<MTLDepthStencilState> ts = [m->dev newDepthStencilStateWithDescriptor:td];
+
+		for (unsigned pass = 0; z != nil && zps != nil && pass < 2; pass++) {
+			const char *name = pass ? "stencil-backface-reference" : "stencil-reference";
+			MTLRenderPassDescriptor *zp = mpx_pass(t, MTLLoadActionClear, none);
+			MTLRenderPassDepthAttachmentDescriptor *da = [zp depthAttachment];
+			MTLRenderPassStencilAttachmentDescriptor *sa = [zp stencilAttachment];
+
+			[da setTexture:z];
+			[da setLoadAction:MTLLoadActionClear];
+			[da setClearDepth:1.0];
+			[da setStoreAction:MTLStoreActionStore];
+			[sa setTexture:z];
+			[sa setLoadAction:MTLLoadActionClear];
+			[sa setClearStencil:3];
+			[sa setStoreAction:MTLStoreActionStore];
+			struct mpx_std_vertex q[4];
+			static const float at[4][2] = { { 0, 0 }, { DM_W, 0 }, { 0, DM_H }, { DM_W, DM_H } };
+
+			for (unsigned i = 0; i < 4; i++) {
+				q[i] = mpx_stdv(at[i][0], at[i][1], at[i][0] / DM_W, at[i][1] / DM_H);
+			}
+			id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+			id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:zp];
+
+			mpx_bind_std(m, enc, zps, m->tcheck, ccw, 3);
+			[enc setDepthStencilState:ws];
+			if (pass) {
+				[enc setStencilFrontReferenceValue:0x11 backReferenceValue:0x22];
+			} else {
+				[enc setStencilReferenceValue:0x22];
+			}
+			[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			[enc setDepthStencilState:ts];
+			[enc setStencilReferenceValue:0x22];
+			[enc setVertexBytes:q length:sizeof(q) atIndex:5];
+			[enc setFragmentTexture:m->tsrc atIndex:0];
+			[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+			[enc endEncoding];
+			if (!mpx_finish(m, cb, name)) {
+				continue;
+			}
+			/* the triangle's pixels hold the check it drew and then the source over
+			 * it, the rest nothing: the second draw passes only where the first
+			 * wrote. Both the check and the source are per pixel. */
+			dm_clear(&want, black);
+			mpx_model(&want, mpx_tri, uv, &whole, dm_whole(), 0, 0, dm_src, false);
+			mpx_judge(m, t[0], DM_RGBA32F, name, &want, 0.0f, false);
+		}
+		[wf release];
+		[wb release];
+		[tf release];
+		[wd release];
+		[td release];
+		[ws release];
+		[ts release];
+		[zps release];
+		[z release];
+	}
+	[ps release];
+	for (unsigned i = 0; i < 4; i++) {
+		[t[i] release];
+	}
+}
+
+/* ---- --draw-index --pixels ---- */
+static void
+mpx_index(struct mpx *m)
+{
+	static struct dm_picture want;
+	static const float black[4] = { 0, 0, 0, 0 };
+	const struct dm_viewport whole = { 0, 0, DM_W, DM_H };
+	MTLClearColor none = MTLClearColorMake(0, 0, 0, 0);
+	id<MTLTexture> t[4];
+
+	for (unsigned i = 0; i < 4; i++) {
+		t[i] = mpx_texture(m, DM_RGBA32F, NULL);
+	}
+	id<MTLRenderPipelineState> ps = mpx_pipeline(m, m->vtx2d, nil, mpx_all32f, NULL, 0,
+						     "index-pipeline");
+	if (ps == nil) {
+		return;
+	}
+	MTLRenderPassDescriptor *rp = mpx_pass(t, MTLLoadActionClear, none);
+
+	/* The grid: 25 vertices, a coordinate that lands each pixel on its own texel, and 16
+	 * quads of two triangles, walked in a fixed scrambled order (air_metal_test's own). */
+	float pos[32][4], uvb[32][2];
+	uint32_t tris[96], order[96];
+	unsigned n = 0;
+
+	for (unsigned j = 0; j < 5; j++) {
+		for (unsigned i = 0; i < 5; i++) {
+			float wx = i * 4.0f, wy = j * 4.0f;
+
+			pos[j * 5 + i][0] = wx * 2.0f / DM_W - 1.0f;
+			pos[j * 5 + i][1] = 1.0f - wy * 2.0f / DM_H;
+			pos[j * 5 + i][2] = 0.0f;
+			pos[j * 5 + i][3] = 1.0f;
+			uvb[j * 5 + i][0] = wx / DM_W;
+			uvb[j * 5 + i][1] = wy / DM_H;
+		}
+	}
+	for (unsigned j = 0; j < 4; j++) {
+		for (unsigned i = 0; i < 4; i++) {
+			uint32_t a = j * 5 + i, b = a + 1, c = a + 5, d = c + 1;
+
+			tris[n++] = a; tris[n++] = c; tris[n++] = b;
+			tris[n++] = b; tris[n++] = c; tris[n++] = d;
+		}
+	}
+	for (unsigned k = 0; k < 32; k++) {
+		unsigned from = (k * 13 + 7) % 32;
+
+		for (unsigned c = 0; c < 3; c++) {
+			order[k * 3 + c] = tris[from * 3 + c];
+		}
+	}
+	dm_clear(&want, black);
+	for (unsigned y = 0; y < DM_H; y++) {
+		for (unsigned x = 0; x < DM_W; x++) {
+			dm_src(x, y, want.px[y][x]);
+		}
+	}
+
+	/* The same picture four ways: flat (the comparison), 16 bits, 32 bits, and a base vertex
+	 * with a mesh moved in its buffers behind decoys. Every one is judged against the same
+	 * model, and a line each. */
+	static const struct {
+		const char *name;
+		bool indexed, wide;
+		unsigned offset;
+		int base;
+		int shift;
+	} cases[] = {
+		{ "index-flat", false, false, 0, 0, 0 },
+		{ "index-16", true, false, 8, 0, 0 },
+		{ "index-32", true, true, 16, 0, 0 },
+		{ "index-basevertex", true, false, 0, 7, 7 },
+		{ "index-basevertex-neg", true, false, 0, -7, 0 },
+	};
+	for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+		float mpos[64][4], muv[64][2];
+		uint16_t i16[110];
+		uint32_t i32[110];
+
+		for (unsigned i = 0; i < 64; i++) {
+			mpos[i][0] = mpos[i][1] = 0.0f;
+			mpos[i][2] = 0.0f;
+			mpos[i][3] = 1.0f;
+			muv[i][0] = muv[i][1] = 0.0f;
+		}
+		unsigned count = 96;
+		id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+
+		[enc setRenderPipelineState:ps];
+		[enc setFragmentTexture:m->tsrc atIndex:0];
+		[enc setFragmentSamplerState:m->samp atIndex:0];
+		if (!cases[c].indexed) {
+			float fpos[96][4], fuv[96][2];
+
+			for (unsigned i = 0; i < 96; i++) {
+				memcpy(fpos[i], pos[order[i]], sizeof(fpos[i]));
+				memcpy(fuv[i], uvb[order[i]], sizeof(fuv[i]));
+			}
+			[enc setVertexBytes:fpos length:sizeof(fpos) atIndex:0];
+			[enc setVertexBytes:fuv length:sizeof(fuv) atIndex:1];
+			[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:96];
+		} else {
+			int add = cases[c].base < 0 ? -cases[c].base : 0;
+
+			memcpy(mpos + cases[c].shift, pos, 25 * sizeof(pos[0]));
+			memcpy(muv + cases[c].shift, uvb, 25 * sizeof(uvb[0]));
+			[enc setVertexBytes:mpos length:sizeof(mpos) atIndex:0];
+			[enc setVertexBytes:muv length:sizeof(muv) atIndex:1];
+			for (unsigned i = 0; i < 110; i++) {
+				i16[i] = 0x5a;
+				i32[i] = 0x5a;
+			}
+			for (unsigned i = 0; i < 96; i++) {
+				i16[cases[c].offset / 2 + i] = (uint16_t)(order[i] + (unsigned)add);
+				i32[cases[c].offset / 4 + i] = order[i] + (unsigned)add;
+			}
+			id<MTLBuffer> ib = [m->dev newBufferWithBytes:cases[c].wide ? (void *)i32 : (void *)i16
+							       length:cases[c].wide ? sizeof(i32) : sizeof(i16)
+							      options:0];
+
+			[enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+					indexCount:count
+					 indexType:cases[c].wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+				       indexBuffer:ib
+				 indexBufferOffset:cases[c].offset
+				     instanceCount:1
+					baseVertex:cases[c].base
+				      baseInstance:0];
+			[ib release];
+		}
+		[enc endEncoding];
+		if (mpx_finish(m, cb, cases[c].name)) {
+			mpx_judge(m, t[0], DM_RGBA32F, cases[c].name, &want, 0.0f, false);
+		}
+	}
+	[ps release];
+
+	/*
+	 * A restart index, over the attribute path: on Gallium the bound check sees vertex 65535
+	 * and refuses the draw by name, where a stage that indexes its own buffer would read past
+	 * it on the GPU. Two quads of one strip, 16 and 32 bits.
+	 */
+	MTLVertexDescriptor *vd = mpx_std_descriptor();
+	id<MTLRenderPipelineState> sp = mpx_pipeline(m, m->stdv, vd, mpx_all32f, NULL, 0,
+						     "restart-pipeline");
+
+	if (sp != nil) {
+		static const float corner[8][2] = {
+			{ 1, 1 }, { 6, 1 }, { 1, 6 }, { 6, 6 }, { 9, 9 }, { 15, 9 }, { 9, 14 }, { 15, 14 },
+		};
+		struct mpx_std_vertex v[8];
+
+		for (unsigned i = 0; i < 8; i++) {
+			v[i] = mpx_stdv(corner[i][0], corner[i][1], corner[i][0] / DM_W, corner[i][1] / DM_H);
+		}
+		const uint16_t r16[9] = { 0, 1, 2, 3, 0xffff, 4, 5, 6, 7 };
+		const uint32_t r32[9] = { 0, 1, 2, 3, 0xffffffffu, 4, 5, 6, 7 };
+
+		dm_clear(&want, black);
+		for (unsigned q = 0; q < 2; q++) {
+			const float w0[3][2] = { { corner[q * 4][0], corner[q * 4][1] },
+						 { corner[q * 4 + 1][0], corner[q * 4 + 1][1] },
+						 { corner[q * 4 + 2][0], corner[q * 4 + 2][1] } };
+			const float w1[3][2] = { { corner[q * 4 + 2][0], corner[q * 4 + 2][1] },
+						 { corner[q * 4 + 1][0], corner[q * 4 + 1][1] },
+						 { corner[q * 4 + 3][0], corner[q * 4 + 3][1] } };
+			float u0[3][2], u1[3][2];
+
+			for (unsigned i = 0; i < 3; i++) {
+				u0[i][0] = w0[i][0] / DM_W;
+				u0[i][1] = w0[i][1] / DM_H;
+				u1[i][0] = w1[i][0] / DM_W;
+				u1[i][1] = w1[i][1] / DM_H;
+			}
+			mpx_model(&want, w0, u0, &whole, dm_whole(), 0, 0, dm_src, true);
+			mpx_model(&want, w1, u1, &whole, dm_whole(), 0, 0, dm_src, true);
+		}
+		for (unsigned w = 0; w < 2; w++) {
+			const char *name = w ? "index-restart-32" : "index-restart-16";
+			id<MTLBuffer> ib = [m->dev newBufferWithBytes:w ? (const void *)r32 : (const void *)r16
+							       length:w ? sizeof(r32) : sizeof(r16)
+							      options:0];
+			id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+			id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+
+			mpx_bind_std(m, enc, sp, m->tsrc, v, 8);
+			[enc drawIndexedPrimitives:MTLPrimitiveTypeTriangleStrip
+					indexCount:9
+					 indexType:w ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+				       indexBuffer:ib
+				 indexBufferOffset:0
+				     instanceCount:1
+					baseVertex:0
+				      baseInstance:0];
+			[enc endEncoding];
+			[ib release];
+			if (mpx_finish(m, cb, name)) {
+				mpx_judge(m, t[0], DM_RGBA32F, name, &want, 0.0f, false);
+			}
+		}
+		[sp release];
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		[t[i] release];
+	}
+}
+
+/* A full-attachment strip of texturedVertex2D, each pixel on its own texel. */
+static void
+mpx_bind_quad(struct mpx *m, id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> ps,
+	      id<MTLTexture> tex)
+{
+	static const float qpos[4][4] = {
+		{ -1, -1, 0, 1 }, { 1, -1, 0, 1 }, { -1, 1, 0, 1 }, { 1, 1, 0, 1 },
+	};
+	static const float quv[4][2] = { { 0, 1 }, { 1, 1 }, { 0, 0 }, { 1, 0 } };
+
+	[enc setRenderPipelineState:ps];
+	[enc setVertexBytes:qpos length:sizeof(qpos) atIndex:0];
+	[enc setVertexBytes:quv length:sizeof(quv) atIndex:1];
+	[enc setFragmentTexture:tex atIndex:0];
+	[enc setFragmentSamplerState:m->samp atIndex:0];
+}
+
+/* ---- --picture --pixels: the blend matrix through Metal's descriptors ---- */
+static void
+mpx_blend(struct mpx *m)
+{
+	static const struct { const char *name; struct dm_blend b; } cases[] = {
+		{ "srcover", { 1, DM_ADD, DM_ADD, DM_SA, DM_ISA, DM_SA, DM_ISA, DM_ALL } },
+		{ "premult", { 1, DM_ADD, DM_ADD, DM_ONE, DM_ISA, DM_ONE, DM_ISA, DM_ALL } },
+		{ "oneone", { 1, DM_ADD, DM_ADD, DM_ONE, DM_ONE, DM_ONE, DM_ONE, DM_ALL } },
+		{ "min", { 1, DM_MIN, DM_MIN, DM_ONE, DM_ONE, DM_ONE, DM_ONE, DM_ALL } },
+		{ "max", { 1, DM_MAX, DM_MAX, DM_ONE, DM_ONE, DM_ONE, DM_ONE, DM_ALL } },
+		{ "revsub", { 1, DM_RSUB, DM_RSUB, DM_ONE, DM_ONE, DM_ONE, DM_ONE, DM_ALL } },
+		{ "constant", { 1, DM_ADD, DM_ADD, DM_BC, DM_IBC, DM_BA, DM_IBA, DM_ALL } },
+		{ "mask-r", { 1, DM_ADD, DM_ADD, DM_ONE, DM_ISA, DM_ONE, DM_ISA, DM_R } },
+		{ "mask-rgb", { 1, DM_ADD, DM_ADD, DM_ONE, DM_ISA, DM_ONE, DM_ISA, DM_R | DM_G | DM_B } },
+		{ "mask-gba", { 1, DM_ADD, DM_ADD, DM_ONE, DM_ISA, DM_ONE, DM_ISA, DM_G | DM_B | DM_A } },
+	};
+	static const unsigned formats[] = { DM_RGBA32F, DM_RGBA8, DM_BGRA8, DM_RGBA8_SRGB, DM_BGRA8_SRGB };
+	static const float k[4] = { 0.25f, 0.5f, 0.75f, 0.125f };
+	static struct dm_picture want;
+	MTLClearColor none = MTLClearColorMake(0, 0, 0, 0);
+
+	for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+		unsigned fmt = formats[f];
+		const unsigned fs[4] = { fmt, fmt, fmt, fmt };
+		id<MTLTexture> t[4];
+
+		for (unsigned i = 0; i < 4; i++) {
+			t[i] = mpx_texture(m, fmt, NULL);
+		}
+		for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+			char name[64];
+			struct dm_blend b[2] = { cases[c].b, { 0, 0, 0, 1, 0, 1, 0, 0 } };
+
+			snprintf(name, sizeof(name), "blend-%s-%s", dm_format_name(fmt), cases[c].name);
+			id<MTLRenderPipelineState> ps = mpx_pipeline(m, m->vtx2d, nil, fs, b, 0, name);
+
+			if (ps == nil) {
+				continue;
+			}
+			unsigned texel = dm_texel_bytes(fmt);
+
+			for (unsigned y = 0; y < DM_H; y++) {
+				for (unsigned x = 0; x < DM_W; x++) {
+					float d[4];
+
+					dm_dst(x, y, d);
+					dm_encode(fmt, d, mpx_mem + ((size_t)y * DM_W + x) * texel);
+				}
+			}
+			[t[0] replaceRegion:MTLRegionMake2D(0, 0, DM_W, DM_H)
+				mipmapLevel:0
+				  withBytes:mpx_mem
+				bytesPerRow:DM_W * texel];
+			MTLRenderPassDescriptor *rp = mpx_pass(t, MTLLoadActionLoad, none);
+			id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+			id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+
+			mpx_bind_quad(m, enc, ps, m->tsrc);
+			[enc setBlendColorRed:k[0] green:k[1] blue:k[2] alpha:k[3]];
+			[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+			[enc endEncoding];
+			if (mpx_finish(m, cb, name)) {
+				dm_blend_model(&want, fmt, &cases[c].b, k, dm_src);
+				mpx_judge(m, t[0], fmt, name, &want, 0.0f, false);
+			}
+			[ps release];
+		}
+		for (unsigned i = 0; i < 4; i++) {
+			[t[i] release];
+		}
+	}
+}
+
+/* ---- --blit --pixels: what a pass keeps, clears, stores and hands to the next ---- */
+static void
+mpx_passes(struct mpx *m)
+{
+	static struct dm_picture want;
+	static const float black[4] = { 0, 0, 0, 0 };
+	const struct dm_viewport whole = { 0, 0, DM_W, DM_H };
+	MTLClearColor none = MTLClearColorMake(0, 0, 0, 0);
+	id<MTLTexture> t[4];
+	float uv[3][2];
+
+	mpx_tri_uv(uv);
+	for (unsigned i = 0; i < 4; i++) {
+		t[i] = mpx_texture(m, DM_RGBA32F, NULL);
+	}
+	id<MTLRenderPipelineState> ps = mpx_pipeline(m, m->vtx2d, nil, mpx_all32f, NULL, 0, "pass-pipeline");
+
+	if (ps == nil) {
+		return;
+	}
+	float tpos[3][4], tuv[3][2];
+
+	for (unsigned i = 0; i < 3; i++) {
+		tpos[i][0] = mpx_tri[i][0] * 2.0f / DM_W - 1.0f;
+		tpos[i][1] = 1.0f - mpx_tri[i][1] * 2.0f / DM_H;
+		tpos[i][2] = 0.0f;
+		tpos[i][3] = 1.0f;
+		tuv[i][0] = uv[i][0];
+		tuv[i][1] = uv[i][1];
+	}
+
+	/* 1: Load keeps: a checkerboard from one pass survives everywhere but under the triangle
+	 * of the next, which is a command buffer of its own. */
+	{
+		MTLRenderPassDescriptor *a = mpx_pass(t, MTLLoadActionClear, none);
+		id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:a];
+
+		mpx_bind_quad(m, enc, ps, m->tcheck);
+		[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+		[enc endEncoding];
+		mpx_finish(m, cb, "pass-load-first");
+		MTLRenderPassDescriptor *b = mpx_pass(t, MTLLoadActionLoad, none);
+
+		cb = [m->queue commandBuffer];
+		enc = [cb renderCommandEncoderWithDescriptor:b];
+		[enc setRenderPipelineState:ps];
+		[enc setVertexBytes:tpos length:sizeof(tpos) atIndex:0];
+		[enc setVertexBytes:tuv length:sizeof(tuv) atIndex:1];
+		[enc setFragmentTexture:m->tsrc atIndex:0];
+		[enc setFragmentSamplerState:m->samp atIndex:0];
+		[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[enc endEncoding];
+		if (mpx_finish(m, cb, "pass-load")) {
+			dm_clear(&want, black);
+			for (unsigned y = 0; y < DM_H; y++) {
+				for (unsigned x = 0; x < DM_W; x++) {
+					dm_check(x, y, want.px[y][x]);
+				}
+			}
+			mpx_model(&want, mpx_tri, uv, &whole, dm_whole(), 0, 0, dm_src, false);
+			mpx_judge(m, t[0], DM_RGBA32F, "pass-load", &want, 0.0f, false);
+		}
+	}
+
+	/* 2: Clear: the triangle, and the clear's colour everywhere else, per pixel for it. */
+	{
+		MTLClearColor c = MTLClearColorMake(0.25, 0.5, 0.75, 1.0);
+		static const float cf[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+		MTLRenderPassDescriptor *a = mpx_pass(t, MTLLoadActionClear, c);
+		id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:a];
+
+		[enc setRenderPipelineState:ps];
+		[enc setVertexBytes:tpos length:sizeof(tpos) atIndex:0];
+		[enc setVertexBytes:tuv length:sizeof(tuv) atIndex:1];
+		[enc setFragmentTexture:m->tsrc atIndex:0];
+		[enc setFragmentSamplerState:m->samp atIndex:0];
+		[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[enc endEncoding];
+		if (mpx_finish(m, cb, "pass-clear")) {
+			dm_clear(&want, cf);
+			mpx_model(&want, mpx_tri, uv, &whole, dm_whole(), 0, 0, dm_src, false);
+			mpx_judge(m, t[0], DM_RGBA32F, "pass-clear", &want, 0.0f, false);
+		}
+	}
+
+	/* 3-4: DontCare, either end: all this driver can promise and all an application may rely
+	 * on is that a full-attachment draw after a load DontCare is that draw, and that a store
+	 * DontCare does not fail. It is served as a keep and a store (hkmetal.m), so what was
+	 * stored is judged too: for that case the line is about this driver, not about Metal. */
+	{
+		MTLRenderPassDescriptor *a = mpx_pass(t, MTLLoadActionDontCare, none);
+
+		[[[a colorAttachments] objectAtIndexedSubscript:0] setStoreAction:MTLStoreActionDontCare];
+		id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:a];
+
+		mpx_bind_quad(m, enc, ps, m->tsrc);
+		[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+		[enc endEncoding];
+		if (mpx_finish(m, cb, "pass-dontcare")) {
+			dm_clear(&want, black);
+			for (unsigned y = 0; y < DM_H; y++) {
+				for (unsigned x = 0; x < DM_W; x++) {
+					dm_src(x, y, want.px[y][x]);
+				}
+			}
+			mpx_judge(m, t[0], DM_RGBA32F, "pass-dontcare", &want, 0.0f, false);
+		}
+	}
+
+	/* 5-8: each attachment its own load action: 0 clears, 1 keeps a per-pixel fill, and with
+	 * those two write masks None what is left in them is the load actions alone. Gallium
+	 * clears them all with the first colour, which it always has, and says gallium-lacks.
+	 * Then two attachments in one pass with their own blend and mask, each judged. */
+	{
+		const struct dm_blend off[2] = { { 0, 0, 0, 1, 0, 1, 0, 0 }, { 0, 0, 0, 1, 0, 1, 0, 0 } };
+		id<MTLRenderPipelineState> none_ps = mpx_pipeline(m, m->vtx2d, nil, mpx_all32f, off, 0,
+								  "pass-load-actions");
+		/* attachments 2 and 3 keep Metal's default mask: only 0 and 1 are None here */
+		if (none_ps != nil) {
+			static const float c0[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+			for (unsigned y = 0; y < DM_H; y++) {
+				for (unsigned x = 0; x < DM_W; x++) {
+					float d[4];
+
+					dm_dst(x, y, d);
+					dm_encode(DM_RGBA32F, d, mpx_mem + ((size_t)y * DM_W + x) * 16);
+				}
+			}
+			[t[1] replaceRegion:MTLRegionMake2D(0, 0, DM_W, DM_H)
+				mipmapLevel:0
+				  withBytes:mpx_mem
+				bytesPerRow:DM_W * 16];
+			MTLRenderPassDescriptor *a = mpx_pass(t, MTLLoadActionLoad, none);
+			MTLRenderPassColorAttachmentDescriptor *a0 =
+			    [[a colorAttachments] objectAtIndexedSubscript:0];
+
+			[a0 setLoadAction:MTLLoadActionClear];
+			[a0 setClearColor:MTLClearColorMake(c0[0], c0[1], c0[2], c0[3])];
+			id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+			id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:a];
+
+			mpx_bind_quad(m, enc, none_ps, m->tsrc);
+			[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+			[enc endEncoding];
+			if (mpx_finish(m, cb, "pass-load-actions")) {
+				dm_clear(&want, c0);
+				mpx_judge(m, t[0], DM_RGBA32F, "pass-clear-attachment0", &want, 0.0f, false);
+				dm_clear(&want, black);
+				for (unsigned y = 0; y < DM_H; y++) {
+					for (unsigned x = 0; x < DM_W; x++) {
+						dm_dst(x, y, want.px[y][x]);
+					}
+				}
+				/* Gallium clears every attachment with attachment 0's colour */
+				mpx_judge(m, t[1], DM_RGBA32F, "pass-keep-attachment1", &want, 0.0f, m->gallium);
+			}
+			[none_ps release];
+		}
+		const struct dm_blend mrt[2] = {
+			{ 1, DM_ADD, DM_ADD, DM_ONE, DM_ISA, DM_ONE, DM_ISA, DM_ALL },
+			{ 1, DM_ADD, DM_ADD, DM_ONE, DM_ONE, DM_ONE, DM_ONE, DM_R | DM_A },
+		};
+		const unsigned two[4] = { DM_RGBA32F, DM_RGBA32F, DM_RGBA32F, DM_RGBA32F };
+		id<MTLRenderPipelineState> mps = mpx_pipeline(m, m->vtx2d, nil, two, mrt, 0, "pass-mrt-blend");
+
+		if (mps != nil) {
+			for (unsigned y = 0; y < DM_H; y++) {
+				for (unsigned x = 0; x < DM_W; x++) {
+					float d[4];
+
+					dm_dst(x, y, d);
+					dm_encode(DM_RGBA32F, d, mpx_mem + ((size_t)y * DM_W + x) * 16);
+				}
+			}
+			for (unsigned i = 0; i < 2; i++) {
+				[t[i] replaceRegion:MTLRegionMake2D(0, 0, DM_W, DM_H)
+					mipmapLevel:0
+					  withBytes:mpx_mem
+					bytesPerRow:DM_W * 16];
+			}
+			MTLRenderPassDescriptor *a = mpx_pass(t, MTLLoadActionLoad, none);
+			id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+			id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:a];
+
+			mpx_bind_quad(m, enc, mps, m->tsrc);
+			[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+			[enc endEncoding];
+			if (mpx_finish(m, cb, "pass-mrt-blend")) {
+				dm_blend_model(&want, DM_RGBA32F, &mrt[0], black, dm_src);
+				mpx_judge(m, t[0], DM_RGBA32F, "pass-mrt-blend-0", &want, 0.0f, false);
+				dm_blend_model(&want, DM_RGBA32F, &mrt[1], black, dm_src);
+				mpx_judge(m, t[1], DM_RGBA32F, "pass-mrt-blend-1", &want, 0.0f, false);
+			}
+			[mps release];
+		}
+	}
+
+	/* 9: several encoders in ONE command buffer, in order: the first draws the pattern into a
+	 * target, a blit copies it, the next samples the copy into another. Sampled in a pass
+	 * after the one that drew it, with nothing between them but this driver's barriers. */
+	{
+		id<MTLTexture> mid[4], copy = mpx_texture(m, DM_RGBA32F, NULL), last[4];
+
+		for (unsigned i = 0; i < 4; i++) {
+			mid[i] = mpx_texture(m, DM_RGBA32F, NULL);
+			last[i] = mpx_texture(m, DM_RGBA32F, NULL);
+		}
+		id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+		MTLRenderPassDescriptor *a = mpx_pass(mid, MTLLoadActionClear, none);
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:a];
+
+		mpx_bind_quad(m, enc, ps, m->tsrc);
+		[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+		[enc endEncoding];
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+
+		[blit copyFromTexture:mid[0]
+			  sourceSlice:0
+			  sourceLevel:0
+			 sourceOrigin:MTLOriginMake(0, 0, 0)
+			   sourceSize:MTLSizeMake(DM_W, DM_H, 1)
+			    toTexture:copy
+		     destinationSlice:0
+		     destinationLevel:0
+		    destinationOrigin:MTLOriginMake(0, 0, 0)];
+		[blit endEncoding];
+		MTLRenderPassDescriptor *b = mpx_pass(last, MTLLoadActionClear, none);
+
+		enc = [cb renderCommandEncoderWithDescriptor:b];
+		mpx_bind_quad(m, enc, ps, mid[0]);
+		[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+		[enc endEncoding];
+		/* and a third over the first's own attachment again, sampling the blit's copy */
+		MTLRenderPassDescriptor *c = mpx_pass(mid, MTLLoadActionClear, none);
+
+		enc = [cb renderCommandEncoderWithDescriptor:c];
+		mpx_bind_quad(m, enc, ps, copy);
+		[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+		[enc endEncoding];
+		if (mpx_finish(m, cb, "pass-encoders")) {
+			dm_clear(&want, black);
+			for (unsigned y = 0; y < DM_H; y++) {
+				for (unsigned x = 0; x < DM_W; x++) {
+					dm_src(x, y, want.px[y][x]);
+				}
+			}
+			mpx_judge(m, last[0], DM_RGBA32F, "pass-encoders-sampled", &want, 0.0f, false);
+			mpx_judge(m, mid[0], DM_RGBA32F, "pass-encoders-copied", &want, 0.0f, false);
+		}
+		for (unsigned i = 0; i < 4; i++) {
+			[mid[i] release];
+			[last[i] release];
+		}
+		[copy release];
+	}
+	[ps release];
+	for (unsigned i = 0; i < 4; i++) {
+		[t[i] release];
+	}
+}
+
+
+/*
+ * ---- M5b: --tex --pixels, --texfmt --pixels, and more of --blit --pixels ----
+ *
+ * What those were: --tex and --texfmt say which kind and format a sweep binds for a whole library
+ * (they measure a shader, and read nothing of a level or a slice); --blit runs each blit once on one
+ * level, and --blit --pixels (M5a) what a pass keeps and clears. The same questions as
+ * air_metal_test's --textures, --pixel-formats and --blit --pixels, through Metal's own objects, so
+ * that hkmetal.m's half is measured too: MTLTextureDescriptor's levels and slices, -replaceRegion:
+ * and -getBytes: with them, the three view calls, MTLSamplerDescriptor's whole state,
+ * MTLRenderPassDescriptor's level, slice and depthPlane, a pass that only clears, and the blit
+ * encoder. The fragment stage is texturedFragment2DFloat, so what a sampler answers is at
+ * coordinates of this file's making, on a quad over four RGBA32Float attachments, of which the first
+ * is read. tex_model.h has the numbers; a case the Gallium library has no way to serve says
+ * gallium-lacks and what it drew is in the digest.
+ */
+static id<MTLTexture> mtx_t[4];
+static id<MTLRenderPipelineState> mtx_ps;
+static uint8_t mtx_mem[64 * 64 * 16 * 2];
+
+static bool
+mtx_bytes(struct mpx *m, const char *name, const void *got, const void *want, unsigned count,
+	  unsigned texel, unsigned w, bool lacks)
+{
+	bool ok = tm_bytes(m->backend, name, got, want, count, texel, w, lacks);
+
+	if (ok) {
+		m->right++;
+	} else if (lacks) {
+		m->lacks++;
+	} else {
+		m->wrong++;
+	}
+	return ok;
+}
+
+/* The quad of mpx_bind_quad with its coordinate scaled and offset, row 0 being v = o. */
+static bool
+mtx_draw(struct mpx *m, id<MTLTexture> tex, id<MTLSamplerState> samp, float su, float sv, float ou,
+	 float ov, const char *name)
+{
+	static const float qpos[4][4] = {
+		{ -1, -1, 0, 1 }, { 1, -1, 0, 1 }, { -1, 1, 0, 1 }, { 1, 1, 0, 1 },
+	};
+	const float quv[4][2] = {
+		{ ou, ov + sv }, { ou + su, ov + sv }, { ou, ov }, { ou + su, ov },
+	};
+	MTLRenderPassDescriptor *rp = mpx_pass(mtx_t, MTLLoadActionClear, MTLClearColorMake(0, 0, 0, 0));
+	id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+	id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+
+	[enc setRenderPipelineState:mtx_ps];
+	[enc setVertexBytes:qpos length:sizeof(qpos) atIndex:0];
+	[enc setVertexBytes:quv length:sizeof(quv) atIndex:1];
+	[enc setFragmentTexture:tex atIndex:0];
+	[enc setFragmentSamplerState:samp atIndex:0];
+	[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[enc endEncoding];
+	return mpx_finish(m, cb, name);
+}
+
+static id<MTLTexture>
+mtx_make(struct mpx *m, MTLTextureType type, unsigned fmt, unsigned w, unsigned h, unsigned d,
+	 unsigned slices, unsigned levels, MTLTextureUsage usage, const char *name)
+{
+	MTLTextureDescriptor *td = [[MTLTextureDescriptor alloc] init];
+
+	[td setTextureType:type];
+	[td setPixelFormat:(MTLPixelFormat)fmt];
+	[td setWidth:w];
+	[td setHeight:h];
+	[td setDepth:d];
+	[td setArrayLength:slices];
+	[td setMipmapLevelCount:levels];
+	[td setUsage:usage];
+	id<MTLTexture> t = [m->dev newTextureWithDescriptor:td];
+
+	[td release];
+	if (t == nil) {
+		dm_refused(m->backend, name, "newTextureWithDescriptor: answered nil");
+		m->refused++;
+	}
+	return t;
+}
+
+/* Every level and slice of an RGBA8 texture filled with tm_fill. */
+static void
+mtx_fill(id<MTLTexture> t, unsigned w, unsigned levels, unsigned slices)
+{
+	for (unsigned l = 0; l < levels; l++) {
+		for (unsigned s = 0; s < slices; s++) {
+			unsigned lw = MAX(w >> l, 1);
+
+			tm_fill(mtx_mem, l, s, lw, lw);
+			[t replaceRegion:MTLRegionMake2D(0, 0, lw, lw)
+			     mipmapLevel:l
+				   slice:s
+			       withBytes:mtx_mem
+			     bytesPerRow:lw * 4
+			   bytesPerImage:0];
+		}
+	}
+}
+
+static void
+mtx_want_texels(struct dm_picture *want, unsigned level, unsigned slice, unsigned w, unsigned h)
+{
+	dm_clear(want, (const float[4]){ 0, 0, 0, 0 });
+	for (unsigned y = 0; y < DM_H; y++) {
+		for (unsigned x = 0; x < DM_W; x++) {
+			tm_texelf(level, slice, x * w / DM_W, y * h / DM_H, want->px[y][x]);
+		}
+	}
+}
+
+static id<MTLSamplerState>
+mtx_sampler(struct mpx *m, MTLSamplerAddressMode a, MTLSamplerMipFilter mip, MTLSamplerBorderColor b,
+	    float lmin, float lmax)
+{
+	MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+
+	[sd setMinFilter:MTLSamplerMinMagFilterNearest];
+	[sd setMagFilter:MTLSamplerMinMagFilterNearest];
+	[sd setMipFilter:mip];
+	[sd setSAddressMode:a];
+	[sd setTAddressMode:a];
+	[sd setBorderColor:b];
+	[sd setLodMinClamp:lmin];
+	[sd setLodMaxClamp:lmax];
+	id<MTLSamplerState> s = [m->dev newSamplerStateWithDescriptor:sd];
+
+	[sd release];
+	return s;
+}
+
+/* A picture of tm_texelf through an address mode, the coordinate going from o to o + 16s. */
+static void
+mtx_want_address(struct dm_picture *want, unsigned mode, float s, float o, const float border[4])
+{
+	dm_clear(want, (const float[4]){ 0, 0, 0, 0 });
+	for (unsigned y = 0; y < DM_H; y++) {
+		for (unsigned x = 0; x < DM_W; x++) {
+			int i = tm_wrap(mode, ((float)x + 0.5f) * s / 16.0f + o, 16);
+			int j = tm_wrap(mode, ((float)y + 0.5f) * s / 16.0f + o, 16);
+
+			if (i < 0 || j < 0) {
+				memcpy(want->px[y][x], border, 4 * sizeof(float));
+			} else {
+				tm_texelf(0, 0, (unsigned)i, (unsigned)j, want->px[y][x]);
+			}
+		}
+	}
+}
+
+static void
+mtx_tex(struct mpx *m)
+{
+	static struct dm_picture want;
+	static uint8_t got[64 * 64 * 4];
+	static const float zero[4] = { 0, 0, 0, 0 };
+	const float e = 1.0f / 2048.0f;
+	const bool lk = m->gallium;
+	char name[64];
+
+	/* -replaceRegion: and -getBytes:, by level and by slice */
+	id<MTLTexture> t = mtx_make(m, MTLTextureType2DArray, 70, 16, 16, 1, 3, 3,
+				    MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget |
+					MTLTextureUsagePixelFormatView, "mtl-array");
+	if (t != nil) {
+		mtx_fill(t, 16, 3, 3);
+		for (unsigned l = 0; l < 3; l++) {
+			for (unsigned s = 0; s < 3; s++) {
+				unsigned lw = 16 >> l;
+
+				snprintf(name, sizeof(name), "mtl-array-L%u-S%u-rw", l, s);
+				memset(got, 0, sizeof(got));
+				[t getBytes:got
+				bytesPerRow:lw * 4
+			      bytesPerImage:0
+				 fromRegion:MTLRegionMake2D(0, 0, lw, lw)
+				mipmapLevel:l
+				      slice:s];
+				tm_fill(mtx_mem, l, s, lw, lw);
+				mtx_bytes(m, name, got, mtx_mem, lw * lw, 4, lw, false);
+			}
+		}
+		/* THE VIEW CALLS. A slice of a level as a 2D texture; and what it says of itself */
+		id<MTLTexture> v = [t newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+							 textureType:MTLTextureType2D
+							      levels:NSMakeRange(1, 1)
+							      slices:NSMakeRange(2, 1)];
+		if (v == nil) {
+			dm_refused(m->backend, "mtl-view-level-slice", "a view is nil here");
+			m->lacks++;
+		} else {
+			if (mtx_draw(m, v, m->samp, 1, 1, 0, 0, "mtl-view-level-slice")) {
+				mtx_want_texels(&want, 1, 2, 8, 8);
+				mpx_judge(m, mtx_t[0], DM_RGBA32F, "mtl-view-level-slice", &want, e, false);
+			}
+			printf("drvtest: view-says %s parent %s level %lu slice %lu %lux%lu type %lu\n",
+			       m->backend, [v parentTexture] == t ? "yes" : "NO",
+			       (unsigned long)[v parentRelativeLevel],
+			       (unsigned long)[v parentRelativeSlice], (unsigned long)[v width],
+			       (unsigned long)[v height], (unsigned long)[v textureType]);
+			[v release];
+		}
+		/* another format of the one size */
+		v = [t newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm
+					 textureType:MTLTextureType2D
+					      levels:NSMakeRange(0, 1)
+					      slices:NSMakeRange(1, 1)];
+		if (v == nil) {
+			dm_refused(m->backend, "mtl-view-format", "a view is nil here");
+			m->lacks++;
+		} else {
+			if (mtx_draw(m, v, m->samp, 1, 1, 0, 0, "mtl-view-format")) {
+				mtx_want_texels(&want, 0, 1, 16, 16);
+				for (unsigned y = 0; y < DM_H; y++) {
+					for (unsigned x = 0; x < DM_W; x++) {
+						float k = want.px[y][x][0];
+
+						want.px[y][x][0] = want.px[y][x][2];
+						want.px[y][x][2] = k;
+					}
+				}
+				mpx_judge(m, mtx_t[0], DM_RGBA32F, "mtl-view-format", &want, e, false);
+			}
+			[v release];
+		}
+		/* a swizzle, each channel another's */
+		MTLTextureSwizzleChannels sw = MTLTextureSwizzleChannelsMake(
+			MTLTextureSwizzleAlpha, MTLTextureSwizzleBlue, MTLTextureSwizzleOne,
+			MTLTextureSwizzleZero);
+		v = [t newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+					 textureType:MTLTextureType2D
+					      levels:NSMakeRange(0, 1)
+					      slices:NSMakeRange(0, 1)
+					     swizzle:sw];
+		if (v == nil) {
+			dm_refused(m->backend, "mtl-view-swizzle", "a view is nil here");
+			m->lacks++;
+		} else {
+			if (mtx_draw(m, v, m->samp, 1, 1, 0, 0, "mtl-view-swizzle")) {
+				mtx_want_texels(&want, 0, 0, 16, 16);
+				for (unsigned y = 0; y < DM_H; y++) {
+					for (unsigned x = 0; x < DM_W; x++) {
+						float *p = want.px[y][x], a = p[3], b = p[2];
+
+						p[0] = a;
+						p[1] = b;
+						p[2] = 1.0f;
+						p[3] = 0.0f;
+					}
+				}
+				mpx_judge(m, mtx_t[0], DM_RGBA32F, "mtl-view-swizzle", &want, e, false);
+			}
+			[v release];
+		}
+		[t release];
+	}
+	/* a descriptor's own swizzle, which hkmetal.m serves with a view */
+	{
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+								       width:16
+								      height:16
+								   mipmapped:NO];
+		[td setUsage:MTLTextureUsageShaderRead];
+		[td setSwizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+							     MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+		id<MTLTexture> ds = [m->dev newTextureWithDescriptor:td];
+
+		if (ds != nil) {
+			mtx_fill(ds, 16, 1, 1);
+			if (mtx_draw(m, ds, m->samp, 1, 1, 0, 0, "mtl-descriptor-swizzle")) {
+				mtx_want_texels(&want, 0, 0, 16, 16);
+				for (unsigned y = 0; y < DM_H; y++) {
+					for (unsigned x = 0; x < DM_W; x++) {
+						float k = want.px[y][x][0];
+
+						want.px[y][x][0] = want.px[y][x][2];
+						want.px[y][x][2] = k;
+					}
+				}
+				mpx_judge(m, mtx_t[0], DM_RGBA32F, "mtl-descriptor-swizzle", &want, e, lk);
+			}
+			[ds release];
+		}
+	}
+	/* the same over an IOSurface (-newTextureWithDescriptor:iosurface:plane:), the bytes written
+	 * through the surface's own mapping: B G R A in memory, which BGRA8Unorm reads as the texel,
+	 * and the swizzle then exchanges red and blue */
+	{
+		IOSurfaceRef surf = frames_surface(16, 16);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+								       width:16
+								      height:16
+								   mipmapped:NO];
+		[td setUsage:MTLTextureUsageShaderRead];
+		[td setSwizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+							     MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+		id<MTLTexture> ss = surf != NULL ? [m->dev newTextureWithDescriptor:td iosurface:surf plane:0] : nil;
+
+		if (ss == nil) {
+			dm_refused(m->backend, "mtl-iosurface-swizzle", "no BGRA texture over an IOSurface");
+			m->refused++;
+		} else {
+			IOSurfaceLock(surf, 0, NULL);
+			uint8_t *base = IOSurfaceGetBaseAddress(surf);
+			size_t stride = IOSurfaceGetBytesPerRow(surf);
+
+			for (unsigned y = 0; y < 16; y++) {
+				for (unsigned x = 0; x < 16; x++) {
+					uint8_t rgba[4], *to = base + y * stride + x * 4;
+
+					tm_texel(0, 0, x, y, rgba);
+					to[0] = rgba[2];
+					to[1] = rgba[1];
+					to[2] = rgba[0];
+					to[3] = rgba[3];
+				}
+			}
+			IOSurfaceUnlock(surf, 0, NULL);
+			if (mtx_draw(m, ss, m->samp, 1, 1, 0, 0, "mtl-iosurface-swizzle")) {
+				mtx_want_texels(&want, 0, 0, 16, 16);
+				for (unsigned y = 0; y < DM_H; y++) {
+					for (unsigned x = 0; x < DM_W; x++) {
+						float k = want.px[y][x][0];
+
+						want.px[y][x][0] = want.px[y][x][2];
+						want.px[y][x][2] = k;
+					}
+				}
+				mpx_judge(m, mtx_t[0], DM_RGBA32F, "mtl-iosurface-swizzle", &want, e, lk);
+			}
+			[ss release];
+		}
+		if (surf != NULL) {
+			CFRelease(surf);
+		}
+	}
+	/* a 3D region with a bytesPerImage that is not the packed one */
+	t = mtx_make(m, MTLTextureType3D, 70, 8, 8, 4, 1, 1, MTLTextureUsageShaderRead, "mtl-3d");
+	if (t != nil) {
+		const unsigned image = 8 * 4 * 10;
+
+		memset(mtx_mem, 0xa5, image * 4);
+		for (unsigned z = 0; z < 4; z++) {
+			tm_fill(mtx_mem + (size_t)z * image, 0, z, 8, 8);
+		}
+		[t replaceRegion:MTLRegionMake3D(0, 0, 0, 8, 8, 4)
+		     mipmapLevel:0
+			   slice:0
+		       withBytes:mtx_mem
+		     bytesPerRow:8 * 4
+		   bytesPerImage:image];
+		static uint8_t all[8 * 8 * 4 * 4], exp[8 * 8 * 4 * 4];
+		[t getBytes:all
+		bytesPerRow:8 * 4
+	      bytesPerImage:8 * 8 * 4
+		 fromRegion:MTLRegionMake3D(0, 0, 0, 8, 8, 4)
+		mipmapLevel:0
+		      slice:0];
+		for (unsigned z = 0; z < 4; z++) {
+			tm_fill(exp + (size_t)z * 8 * 8 * 4, 0, z, 8, 8);
+		}
+		mtx_bytes(m, "mtl-3d-bytesperimage", all, exp, 256, 4, 8, false);
+		[t release];
+	}
+	/* MTLSamplerDescriptor: every address mode, and the border colours */
+	t = mtx_make(m, MTLTextureType2D, 70, 16, 16, 1, 1, 5, MTLTextureUsageShaderRead, "mtl-sampler");
+	if (t != nil) {
+		mtx_fill(t, 16, 5, 1);
+		static const char *const mode_name[6] = {
+			"edge", "mirroredge", "repeat", "mirror", "zero", "border",
+		};
+		for (unsigned a = 0; a < 6; a++) {
+			id<MTLSamplerState> s = mtx_sampler(m, (MTLSamplerAddressMode)a,
+							    MTLSamplerMipFilterNotMipmapped,
+							    MTLSamplerBorderColorTransparentBlack, 0, 1000);
+			snprintf(name, sizeof(name), "mtl-sampler-addr-%s", mode_name[a]);
+			if (s != nil && mtx_draw(m, t, s, 3, 3, -1, -1, name)) {
+				mtx_want_address(&want, a, 3, -1, zero);
+				mpx_judge(m, mtx_t[0], DM_RGBA32F, name, &want, e, false);
+			}
+			[s release];
+		}
+		static const float colours[3][4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 1 }, { 1, 1, 1, 1 } };
+		for (unsigned b = 0; b < 3; b++) {
+			id<MTLSamplerState> s = mtx_sampler(m, MTLSamplerAddressModeClampToBorderColor,
+							    MTLSamplerMipFilterNotMipmapped,
+							    (MTLSamplerBorderColor)b, 0, 1000);
+			snprintf(name, sizeof(name), "mtl-sampler-border-%u", b);
+			if (s != nil && mtx_draw(m, t, s, 3, 3, -1, -1, name)) {
+				mtx_want_address(&want, TM_BORDER, 3, -1, colours[b]);
+				mpx_judge(m, mtx_t[0], DM_RGBA32F, name, &want, e, lk && b != 0);
+			}
+			[s release];
+		}
+		/* the LOD, by the derivatives: a coordinate stepping 4 texels a pixel is level 2,
+		 * and a clamp to [0, 1] makes it level 1. Metal's own default is no clamp. */
+		id<MTLSamplerState> s = mtx_sampler(m, MTLSamplerAddressModeRepeat, MTLSamplerMipFilterNearest,
+						    MTLSamplerBorderColorTransparentBlack, 0, 1000);
+		for (unsigned c = 0; c < 2; c++) {
+			if (c == 1) {
+				[s release];
+				s = mtx_sampler(m, MTLSamplerAddressModeRepeat, MTLSamplerMipFilterNearest,
+						MTLSamplerBorderColorTransparentBlack, 0, 1.0f);
+			}
+			snprintf(name, sizeof(name), c ? "mtl-sampler-lodclamp" : "mtl-sampler-lod");
+			if (s != nil && mtx_draw(m, t, s, 4, 4, 0, 0, name)) {
+				unsigned l = c ? 1 : 2, lw = 16 >> l;
+
+				dm_clear(&want, zero);
+				for (unsigned y = 0; y < DM_H; y++) {
+					for (unsigned x = 0; x < DM_W; x++) {
+						tm_texelf(l, 0,
+							  (unsigned)tm_wrap(TM_REPEAT, ((float)x + 0.5f) / 4.0f, lw),
+							  (unsigned)tm_wrap(TM_REPEAT, ((float)y + 0.5f) / 4.0f, lw),
+							  want.px[y][x]);
+					}
+				}
+				mpx_judge(m, mtx_t[0], DM_RGBA32F, name, &want, e, false);
+			}
+		}
+		[s release];
+		[t release];
+	}
+	/* THE PASS: into level 1 of a mip chain, into slice 2, into a face and a depth plane, the
+	 * neighbours read back. And a pass that draws nothing and only clears one level: hkmetal.m's
+	 * own path through a view. A quad of tsrc nearest, into four attachments of one RGBA8 chain's
+	 * one level would need four; so one attachment with a pipeline of its own format. */
+	{
+		MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+		NSError *err = nil;
+
+		[pd setVertexFunction:m->vtx2d];
+		[pd setFragmentFunction:m->frag2d];
+		[[[pd colorAttachments] objectAtIndexedSubscript:0] setPixelFormat:MTLPixelFormatRGBA8Unorm];
+		id<MTLRenderPipelineState> ps = [m->dev newRenderPipelineStateWithDescriptor:pd error:&err];
+
+		[pd release];
+		static const struct { const char *name; MTLTextureType type; unsigned d, slices, levels;
+				      unsigned level, slice, plane, neighbour; } passes[] = {
+			{ "mtl-pass-level1", MTLTextureType2D, 1, 1, 3, 1, 0, 0, 0 },
+			{ "mtl-pass-slice2", MTLTextureType2DArray, 1, 4, 1, 0, 2, 0, 1 },
+			{ "mtl-pass-face3", MTLTextureTypeCube, 1, 1, 1, 0, 3, 0, 2 },
+			{ "mtl-pass-plane2", MTLTextureType3D, 4, 1, 1, 0, 0, 2, 1 },
+		};
+		for (unsigned i = 0; ps != nil && i < sizeof(passes) / sizeof(passes[0]); i++) {
+			unsigned w = passes[i].levels > 1 ? 32 : 16;
+			unsigned faces = passes[i].type == MTLTextureTypeCube ? 6 : passes[i].slices;
+			id<MTLTexture> p = mtx_make(m, passes[i].type, 70, w, w, passes[i].d, passes[i].slices,
+						    passes[i].levels,
+						    MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget,
+						    passes[i].name);
+			if (p == nil) {
+				continue;
+			}
+			if (passes[i].d > 1) {
+				for (unsigned z = 0; z < passes[i].d; z++) {
+					tm_fill(mtx_mem, 0, z, w, w);
+					[p replaceRegion:MTLRegionMake3D(0, 0, z, w, w, 1)
+					     mipmapLevel:0
+						   slice:0
+					       withBytes:mtx_mem
+					     bytesPerRow:w * 4
+					   bytesPerImage:0];
+				}
+			} else {
+				mtx_fill(p, w, passes[i].levels, faces);
+			}
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			MTLRenderPassColorAttachmentDescriptor *a =
+			    [[rp colorAttachments] objectAtIndexedSubscript:0];
+
+			[a setTexture:p];
+			[a setLevel:passes[i].level];
+			[a setSlice:passes[i].slice];
+			[a setDepthPlane:passes[i].plane];
+			[a setLoadAction:MTLLoadActionLoad];
+			[a setStoreAction:MTLStoreActionStore];
+			id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+			id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+
+			mpx_bind_quad(m, enc, ps, m->tsrc);
+			[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+			[enc endEncoding];
+			if (!mpx_finish(m, cb, passes[i].name)) {
+				[p release];
+				continue;
+			}
+			unsigned lw = w >> passes[i].level;
+
+			/* tsrc is RGBA32F dm_src, sampled nearest onto its own pixels */
+			memset(got, 0, sizeof(got));
+			[p getBytes:got
+			bytesPerRow:lw * 4
+		      bytesPerImage:0
+			 fromRegion:MTLRegionMake3D(0, 0, passes[i].plane, lw, lw, 1)
+			mipmapLevel:passes[i].level
+			      slice:passes[i].slice];
+			for (unsigned y = 0; y < lw; y++) {
+				for (unsigned x = 0; x < lw; x++) {
+					float s[4];
+
+					dm_src(x, y, s);
+					for (unsigned c = 0; c < 4; c++) {
+						mtx_mem[((size_t)y * lw + x) * 4 + c] = (uint8_t)dm_unorm8(s[c]);
+					}
+				}
+			}
+			mtx_bytes(m, passes[i].name, got, mtx_mem, lw * lw, 4, lw, lk);
+			/* a neighbour in the same direction as the pass */
+			snprintf(name, sizeof(name), "%s-neighbour", passes[i].name);
+			unsigned nl = passes[i].levels > 1 ? 0 : passes[i].level;
+			unsigned ns = passes[i].d > 1 ? 0 : (passes[i].levels > 1 ? 0 : passes[i].neighbour);
+			unsigned nz = passes[i].d > 1 ? passes[i].neighbour : 0;
+			unsigned nw = w >> nl;
+
+			[p getBytes:got
+			bytesPerRow:nw * 4
+		      bytesPerImage:0
+			 fromRegion:MTLRegionMake3D(0, 0, nz, nw, nw, 1)
+			mipmapLevel:nl
+			      slice:ns];
+			tm_fill(mtx_mem, nl, passes[i].d > 1 ? nz : ns, nw, nw);
+			mtx_bytes(m, name, got, mtx_mem, nw * nw, 4, nw, lk);
+			[p release];
+		}
+		/* a clear and nothing else, of level 1, slice 1 */
+		id<MTLTexture> cl = mtx_make(m, MTLTextureType2DArray, 70, 16, 16, 1, 2, 2,
+					     MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget,
+					     "mtl-pass-clear");
+		if (cl != nil) {
+			mtx_fill(cl, 16, 2, 2);
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			MTLRenderPassColorAttachmentDescriptor *a =
+			    [[rp colorAttachments] objectAtIndexedSubscript:0];
+
+			[a setTexture:cl];
+			[a setLevel:1];
+			[a setSlice:1];
+			[a setLoadAction:MTLLoadActionClear];
+			[a setClearColor:MTLClearColorMake(0.5, 0.25, 0.75, 1.0)];
+			[a setStoreAction:MTLStoreActionStore];
+			id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+			id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+
+			[enc endEncoding];
+			if (mpx_finish(m, cb, "mtl-pass-clear")) {
+				[cl getBytes:got
+				 bytesPerRow:8 * 4
+			       bytesPerImage:0
+				  fromRegion:MTLRegionMake2D(0, 0, 8, 8)
+				 mipmapLevel:1
+				       slice:1];
+				for (unsigned k = 0; k < 64; k++) {
+					mtx_mem[k * 4 + 0] = 128;
+					mtx_mem[k * 4 + 1] = 64;
+					mtx_mem[k * 4 + 2] = 191;
+					mtx_mem[k * 4 + 3] = 255;
+				}
+				mtx_bytes(m, "mtl-pass-clear", got, mtx_mem, 64, 4, 8, lk);
+				[cl getBytes:got
+				 bytesPerRow:8 * 4
+			       bytesPerImage:0
+				  fromRegion:MTLRegionMake2D(0, 0, 8, 8)
+				 mipmapLevel:1
+				       slice:0];
+				tm_fill(mtx_mem, 1, 0, 8, 8);
+				mtx_bytes(m, "mtl-pass-clear-neighbour", got, mtx_mem, 64, 4, 8, lk);
+			}
+			[cl release];
+		}
+		[ps release];
+	}
+}
+
+/* Every format of tm_formats through Metal's descriptor: its bytes in and out, its texels as
+ * texturedFragment2DFloat reads them where it can (a texture2d<float>, so no integer format), and a
+ * render into it where it renders. The contract's mode of the same name judges the integer ones. */
+static void
+mtx_texfmt(struct mpx *m)
+{
+	static struct dm_picture want;
+	static uint8_t mem[DM_W * DM_H * 16], got[DM_W * DM_H * 16], expect[DM_W * DM_H * 16];
+	char name[80];
+
+	for (unsigned i = 0; i < sizeof(tm_formats) / sizeof(tm_formats[0]); i++) {
+		const struct tm_format *f = &tm_formats[i];
+		const bool is_int = f->kind == TM_UINT || f->kind == TM_SINT;
+		/* the Gallium library's 40-43 by its own mirror, tex_model.h says why */
+		const struct tm_format *mf = m->gallium && tm_gallium_mirror(f->mtl)
+						 ? tm_gallium_mirror(f->mtl) : f;
+		const bool mirrored = mf != f;
+
+		snprintf(name, sizeof(name), "mtlpf-%s", f->name);
+		id<MTLTexture> t = mtx_make(m, MTLTextureType2D, f->mtl, DM_W, DM_H, 1, 1, 1,
+					    MTLTextureUsageShaderRead |
+						(f->renderable ? MTLTextureUsageRenderTarget : 0), name);
+		if (t == nil) {
+			continue;
+		}
+		for (unsigned y = 0; y < DM_H; y++) {
+			for (unsigned x = 0; x < DM_W; x++) {
+				tm_format_texel(f, x, y, mem + ((size_t)y * DM_W + x) * f->bytes);
+			}
+		}
+		[t replaceRegion:MTLRegionMake2D(0, 0, DM_W, DM_H)
+		     mipmapLevel:0
+		       withBytes:mem
+		     bytesPerRow:DM_W * f->bytes];
+		[t getBytes:got
+		bytesPerRow:DM_W * f->bytes
+		 fromRegion:MTLRegionMake2D(0, 0, DM_W, DM_H)
+		mipmapLevel:0];
+		snprintf(name, sizeof(name), "mtlpf-%s-bytes", f->name);
+		mtx_bytes(m, name, got, mem, DM_W * DM_H, f->bytes, DM_W, false);
+		if (!is_int) {
+			snprintf(name, sizeof(name), "mtlpf-%s-sample", f->name);
+			if (mtx_draw(m, t, m->samp, 1, 1, 0, 0, name)) {
+				dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+				/* M5c: an sRGB read against this GPU's measured curve (adreno_srgb.h) */
+				const bool srgb = f->kind == TM_SRGB;
+				dm_srgb_curve = srgb ? dm_adreno_srgb_decode : NULL;
+				for (unsigned y = 0; y < DM_H; y++) {
+					for (unsigned x = 0; x < DM_W; x++) {
+						tm_format_read(mf, mem + ((size_t)y * DM_W + x) * f->bytes,
+							       want.px[y][x]);
+					}
+				}
+				dm_right_word = mirrored ? "gallium-mirror" : srgb ? "adreno-srgb" : "ok";
+				if (mpx_judge(m, mtx_t[0], DM_RGBA32F, name, &want,
+					      srgb ? 1.0f / 65536.0f : tm_format_slop(f), false) &&
+				    mirrored) {
+					m->right--;
+					m->mirror++;
+				}
+				dm_right_word = "ok";
+				dm_srgb_curve = NULL;
+			}
+			if (f->renderable) {
+				MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+				NSError *err = nil;
+
+				[pd setVertexFunction:m->vtx2d];
+				[pd setFragmentFunction:m->frag2d];
+				[[[pd colorAttachments] objectAtIndexedSubscript:0]
+				    setPixelFormat:(MTLPixelFormat)f->mtl];
+				id<MTLRenderPipelineState> ps =
+				    [m->dev newRenderPipelineStateWithDescriptor:pd error:&err];
+
+				[pd release];
+				snprintf(name, sizeof(name), "mtlpf-%s-render", f->name);
+				if (ps == nil) {
+					dm_refused(m->backend, name, err != nil
+						   ? [[err localizedDescription] UTF8String] : "(no reason)");
+					m->refused++;
+				} else {
+					MTLRenderPassDescriptor *rp =
+					    [MTLRenderPassDescriptor renderPassDescriptor];
+					MTLRenderPassColorAttachmentDescriptor *a =
+					    [[rp colorAttachments] objectAtIndexedSubscript:0];
+
+					[a setTexture:t];
+					[a setLoadAction:MTLLoadActionLoad];
+					[a setStoreAction:MTLStoreActionStore];
+					id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+					id<MTLRenderCommandEncoder> enc =
+					    [cb renderCommandEncoderWithDescriptor:rp];
+
+					mpx_bind_quad(m, enc, ps, m->tsrc);
+					[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0
+						vertexCount:4];
+					[enc endEncoding];
+					if (mpx_finish(m, cb, name)) {
+						unsigned bad = 0;
+						const unsigned steps = f->kind == TM_SRGB ? 5 : f->kind == TM_RG11B10 ? 2 : 1;
+
+						[t getBytes:got
+						bytesPerRow:DM_W * f->bytes
+						 fromRegion:MTLRegionMake2D(0, 0, DM_W, DM_H)
+						mipmapLevel:0];
+						for (unsigned y = 0; y < DM_H; y++) {
+							for (unsigned x = 0; x < DM_W; x++) {
+								float v[4];
+								uint8_t *e = expect + ((size_t)y * DM_W + x) * f->bytes;
+
+								dm_src(x, y, v);
+								tm_format_write(mf, v, e);
+								bad += !tm_format_close(mf, got + ((size_t)y * DM_W + x) * f->bytes, e, steps);
+							}
+						}
+						printf("drvtest: draw-result %s %s %s digest %016llx expected %016llx\n",
+						       m->backend, name, bad ? "DIFFERS" : mirrored ? "gallium-mirror" : "ok",
+						       (unsigned long long)dm_fnv(got, (size_t)DM_W * DM_H * f->bytes, 0xcbf29ce484222325ull),
+						       (unsigned long long)dm_fnv(expect, (size_t)DM_W * DM_H * f->bytes, 0xcbf29ce484222325ull));
+						if (bad) {
+							printf("drvtest: draw-diff %s %s %u of 256 texels differ\n", m->backend, name, bad);
+							m->wrong++;
+						} else if (mirrored) {
+							m->mirror++;
+						} else {
+							m->right++;
+						}
+					}
+					[ps release];
+				}
+			}
+		}
+		[t release];
+	}
+}
+
+/* ---- and of --blit --pixels: per level and per slice, and -generateMipmapsForTexture: ---- */
+static void
+mtx_blits(struct mpx *m)
+{
+	static uint8_t got[32 * 32 * 4], above[32 * 32 * 4], lev[32 * 32 * 4], box[32 * 32 * 4];
+	id<MTLTexture> a = mtx_make(m, MTLTextureType2DArray, 70, 16, 16, 1, 3, 3, MTLTextureUsageShaderRead,
+				    "mtl-blit");
+	id<MTLTexture> b = mtx_make(m, MTLTextureType2DArray, 70, 16, 16, 1, 3, 3, MTLTextureUsageShaderRead,
+				    "mtl-blit");
+	id<MTLBuffer> buf = [m->dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+
+	if (a != nil && b != nil && buf != nil) {
+		mtx_fill(a, 16, 3, 3);
+		for (unsigned l = 0; l < 3; l++) {
+			for (unsigned s = 0; s < 3; s++) {
+				unsigned lw = 16 >> l;
+
+				tm_fill(mtx_mem, l, s + 5, lw, lw);
+				[b replaceRegion:MTLRegionMake2D(0, 0, lw, lw)
+				     mipmapLevel:l
+					   slice:s
+				       withBytes:mtx_mem
+				     bytesPerRow:lw * 4
+				   bytesPerImage:0];
+			}
+		}
+		id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+		id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+
+		/* level 1 of slice 2, a region not at the origin, to level 1 of slice 1, elsewhere */
+		[enc copyFromTexture:a
+			 sourceSlice:2
+			 sourceLevel:1
+			sourceOrigin:MTLOriginMake(1, 2, 0)
+			  sourceSize:MTLSizeMake(4, 3, 1)
+			   toTexture:b
+		    destinationSlice:1
+		    destinationLevel:1
+		   destinationOrigin:MTLOriginMake(3, 4, 0)];
+		/* out to a buffer and back in to another slice, with a row wider than the region */
+		[enc copyFromTexture:a
+			 sourceSlice:0
+			 sourceLevel:0
+			sourceOrigin:MTLOriginMake(2, 3, 0)
+			  sourceSize:MTLSizeMake(5, 4, 1)
+			    toBuffer:buf
+		   destinationOffset:64
+	      destinationBytesPerRow:32
+	    destinationBytesPerImage:0];
+		[enc copyFromBuffer:buf
+		       sourceOffset:64
+		  sourceBytesPerRow:32
+		sourceBytesPerImage:0
+			 sourceSize:MTLSizeMake(5, 4, 1)
+			  toTexture:b
+		   destinationSlice:2
+		   destinationLevel:0
+		  destinationOrigin:MTLOriginMake(6, 7, 0)];
+		[enc endEncoding];
+		if (mpx_finish(m, cb, "mtl-blit-level-slice")) {
+			[b getBytes:got
+			bytesPerRow:8 * 4
+		      bytesPerImage:0
+			 fromRegion:MTLRegionMake2D(0, 0, 8, 8)
+			mipmapLevel:1
+			      slice:1];
+			tm_fill(mtx_mem, 1, 6, 8, 8);
+			for (unsigned y = 0; y < 3; y++) {
+				for (unsigned x = 0; x < 4; x++) {
+					tm_texel(1, 2, x + 1, y + 2, mtx_mem + ((size_t)(y + 4) * 8 + x + 3) * 4);
+				}
+			}
+			mtx_bytes(m, "mtl-blit-level-slice", got, mtx_mem, 64, 4, 8, false);
+			[b getBytes:got
+			bytesPerRow:16 * 4
+		      bytesPerImage:0
+			 fromRegion:MTLRegionMake2D(0, 0, 16, 16)
+			mipmapLevel:0
+			      slice:2];
+			tm_fill(mtx_mem, 0, 7, 16, 16);
+			for (unsigned y = 0; y < 4; y++) {
+				for (unsigned x = 0; x < 5; x++) {
+					tm_texel(0, 0, x + 2, y + 3, mtx_mem + ((size_t)(y + 7) * 16 + x + 6) * 4);
+				}
+			}
+			mtx_bytes(m, "mtl-blit-through-buffer", got, mtx_mem, 256, 4, 16, false);
+		}
+	}
+	[a release];
+	[b release];
+	[buf release];
+	/* -generateMipmapsForTexture:, a gradient, each level against the one above as read back */
+	static const struct { const char *name; unsigned fmt; bool srgb; } mips[] = {
+		{ "mtl-mip-rgba8", 70, false }, { "mtl-mip-bgra8", 80, false }, { "mtl-mip-srgb", 71, true },
+	};
+	for (unsigned i = 0; i < sizeof(mips) / sizeof(mips[0]); i++) {
+		id<MTLTexture> t = mtx_make(m, MTLTextureType2D, mips[i].fmt, 32, 32, 1, 1, 6,
+					    MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, mips[i].name);
+		if (t == nil) {
+			continue;
+		}
+		for (unsigned y = 0; y < 32; y++) {
+			for (unsigned x = 0; x < 32; x++) {
+				uint8_t *p = above + ((size_t)y * 32 + x) * 4;
+
+				p[0] = (uint8_t)(x * 8);
+				p[1] = (uint8_t)(y * 8);
+				p[2] = (uint8_t)((x + y) * 4);
+				p[3] = (uint8_t)(255 - x * 7);
+			}
+		}
+		[t replaceRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0 withBytes:above bytesPerRow:32 * 4];
+		id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+		id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+
+		[enc generateMipmapsForTexture:t];
+		[enc endEncoding];
+		if (mpx_finish(m, cb, mips[i].name)) {
+			unsigned aw = 32;
+
+			for (unsigned l = 1; l < 6; l++) {
+				unsigned lw = aw / 2;
+				char name[64];
+				int max = 0;
+
+				snprintf(name, sizeof(name), "%s-L%u", mips[i].name, l);
+				[t getBytes:lev
+				bytesPerRow:lw * 4
+				 fromRegion:MTLRegionMake2D(0, 0, lw, lw)
+				mipmapLevel:l];
+				unsigned bad = tm_box_level(above, aw, aw, lev, lw, lw, mips[i].srgb,
+							    mips[i].srgb ? 2 : 1, &max);
+				memset(box, 0, sizeof(box));
+				printf("drvtest: draw-result %s %s %s digest %016llx expected %016llx\n",
+				       m->backend, name, bad ? "DIFFERS" : "ok",
+				       (unsigned long long)dm_fnv(lev, (size_t)lw * lw * 4, 0xcbf29ce484222325ull),
+				       (unsigned long long)dm_fnv(box, (size_t)lw * lw * 4, 0xcbf29ce484222325ull));
+				printf("drvtest: draw-box %s %s largest difference %d steps, %u values past the tolerance\n",
+				       m->backend, name, max, bad);
+				if (bad) {
+					m->wrong++;
+				} else {
+					m->right++;
+				}
+				memcpy(above, lev, (size_t)lw * lw * 4);
+				aw = lw;
+			}
+		}
+		[t release];
+	}
+}
+
+/* Which of the four a mode asks for: 0 --draw-attrib, 1 --draw-index, 2 --picture, 3 --blit. */
+/* [M5b: and 4 --tex, 5 --texfmt, each with its own form (the head of the section above).] */
+static int
+pixels_path(id<MTLDevice> dev, const char *metallib, unsigned group)
+{
+	static const char *const modes[] = { "draw-attrib", "draw-index", "picture", "blit", "tex", "texfmt" };
+	struct mpx m;
+	NSError *err = nil;
+
+	/* --blit alone leaves the program's default library, which has none of Apple's textured
+	 * functions: these four modes all want the GL renderer's unless told otherwise. */
+	if (strstr(metallib, "AV1SW") != NULL) {
+		metallib = "/System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib";
+	}
+	memset(&m, 0, sizeof(m));
+	m.dev = dev;
+	m.mode = modes[group];
+	m.backend = backend_word();
+	m.gallium = !backend_is_vk();
+	NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:metallib]];
+	NSData *vdata = [NSData dataWithContentsOfFile:
+	    [NSString stringWithUTF8String:attrib_vertex_lib]];
+
+	if (data == nil || vdata == nil) {
+		printf("drvtest: pixels: cannot read %s\n", data == nil ? metallib : attrib_vertex_lib);
+		return 1;
+	}
+	dispatch_data_t dd = dispatch_data_create([data bytes], [data length], NULL,
+						  DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+	dispatch_data_t vd = dispatch_data_create([vdata bytes], [vdata length], NULL,
+						  DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+	id<MTLLibrary> lib = [dev newLibraryWithData:dd error:&err];
+	id<MTLLibrary> vlib = [dev newLibraryWithData:vd error:&err];
+
+	m.vtx2d = [lib newFunctionWithName:@"texturedVertex2D"];
+	m.frag2d = [lib newFunctionWithName:@"texturedFragment2DFloat"];
+	m.stdv = [vlib newFunctionWithName:@"std_vert0_lpf"];
+	if (m.vtx2d == nil || m.frag2d == nil || m.stdv == nil) {
+		printf("drvtest: pixels: texturedVertex2D %s, texturedFragment2DFloat %s, std_vert0_lpf %s\n",
+		       m.vtx2d != nil ? "found" : "MISSING", m.frag2d != nil ? "found" : "MISSING",
+		       m.stdv != nil ? "found" : "MISSING");
+		return 1;
+	}
+	m.queue = [dev newCommandQueue];
+	MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+
+	[sd setMinFilter:MTLSamplerMinMagFilterNearest];
+	[sd setMagFilter:MTLSamplerMinMagFilterNearest];
+	[sd setSAddressMode:MTLSamplerAddressModeClampToEdge];
+	[sd setTAddressMode:MTLSamplerAddressModeClampToEdge];
+	m.samp = [dev newSamplerStateWithDescriptor:sd];
+	[sd release];
+	m.tsrc = mpx_texture(&m, DM_RGBA32F, dm_src);
+	m.tcheck = mpx_texture(&m, DM_RGBA32F, dm_check);
+	m.identity = [dev newBufferWithLength:64 options:0];
+	float *f = [m.identity contents];
+
+	memset(f, 0, 64);
+	for (unsigned k = 0; k < 4; k++) {
+		f[k * 4 + k] = 1.0f;
+	}
+	printf("drvtest: pixels: --%s through Metal on %s, %ux%u\n", m.mode, m.backend, DM_W, DM_H);
+	/* M5b: four RGBA32Float attachments and the sampled pipeline those two modes draw through */
+	if (group >= 3) {
+		static const unsigned f32[4] = { DM_RGBA32F, DM_RGBA32F, DM_RGBA32F, DM_RGBA32F };
+
+		for (unsigned i = 0; i < 4; i++) {
+			mtx_t[i] = mpx_texture(&m, DM_RGBA32F, NULL);
+		}
+		mtx_ps = mpx_pipeline(&m, m.vtx2d, nil, f32, NULL, 0, "texture-pipeline");
+	}
+	switch (group) {
+	case 0: mpx_attrib(&m); break;
+	case 1: mpx_index(&m); break;
+	case 2: mpx_blend(&m); break;
+	case 4: mtx_tex(&m); break;
+	case 5: mtx_texfmt(&m); break;
+	default: mpx_passes(&m); mtx_blits(&m); break;
+	}
+	printf("drvtest: draw-summary %s %s %u ok, %u differ, %u gallium-lacks, %u refused\n",
+	       m.backend, m.mode, m.right, m.wrong, m.lacks, m.refused);
+	if (m.mirror) {
+		printf("drvtest: draw-mirror %s %s %u rows are the Gallium library's mirrored 16-bit table\n",
+		       m.backend, m.mode, m.mirror);
+	}
+	fflush(stdout);
+	return m.wrong ? 1 : 0;
+}
+
+static void
+burst_exit_line(void)
+{
+	const char *both = getenv("AIR_VK_EXIT");
+	unsigned pending = 0, in_flight = 0;
+
+	if (backend_is_vk() && both != NULL && sscanf(both, "%u %u", &pending, &in_flight) == 2) {
+		printf("drvtest: exit vk pending-pairs %u in-flight %u\n", pending, in_flight);
+	} else {
+		printf("drvtest: exit %s pending-pairs - in-flight - (%s)\n",
+		       backend_is_vk() ? "vk" : "gallium",
+		       backend_is_vk() ? "the Vulkan library was not used, or is too old to say"
+				       : "Gallium's fences are not counted here");
+	}
+	fflush(stdout);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -7593,6 +14047,7 @@ main(int argc, char **argv)
 	/* First, before anything: --time reports the distance from here to the first drawn
 	 * pixel, which is what a launching application waits through. */
 	tm_main_entered = tm_now_ns();
+	atexit(burst_exit_line);
 	sa.sa_flags = SA_SIGINFO;
 	sa.sa_sigaction = fault;
 	sigaction(SIGSEGV, &sa, NULL);
@@ -7609,7 +14064,57 @@ main(int argc, char **argv)
 	bool timing = false;
 	bool completion_only = false;
 	unsigned timing_repeats = 32;
+	bool frames = false;
+	unsigned frames_count = 200;
+	const char *frames_target = "owned";
+	unsigned burst_count = 0;
+	bool order_only = false;
+	const char *m5c_library = NULL;   /* --m5c LIB (tools/air/m5c_rows.h) */
+	bool ca_fill_only = false;
 	int next = 1;
+
+	/*
+	 * --backend vk|gallium, FIRST and before anything makes a device: which of the two
+	 * implementations of the compiler library's contract the driver loads (hkmetal.m,
+	 * mesa_available), through HK_METAL_BACKEND, which wins over the boot-arg
+	 * metal_backend=vk. A job line has no environment of its own to set, so this is how
+	 * one boot runs the same test once per back end and compares the digest each prints.
+	 */
+	if (argc > next + 1 && strcmp(argv[next], "--backend") == 0) {
+		if (strcmp(argv[next + 1], "vk") != 0 && strcmp(argv[next + 1], "gallium") != 0) {
+			printf("drvtest: --backend takes vk or gallium, not %s\n", argv[next + 1]);
+			return 2;
+		}
+		setenv("HK_METAL_BACKEND", argv[next + 1], 1);
+		printf("drvtest: HK_METAL_BACKEND=%s\n", argv[next + 1]);
+		next += 2;
+	}
+	/*
+	 * --quiet and --vk-noseen (M4), lifted out wherever they stand, as --gallium-depth-stores
+	 * is below, and before anything makes a device: --vk-noseen is AIR_VK_NOSEEN=1, which
+	 * air_vk.c reads once at rwa_device_open (an imported surface is then not mapped once,
+	 * so the kernel does not clean it at every submission); --quiet makes --draw-all and
+	 * --compute-all timed workloads whose output is held and digested (WHAT A WORKLOAD
+	 * COSTS, near the top).
+	 */
+	for (int i = next; i < argc; ) {
+		bool quiet = strcmp(argv[i], "--quiet") == 0;
+
+		if (!quiet && strcmp(argv[i], "--vk-noseen") != 0) {
+			i++;
+			continue;
+		}
+		if (quiet) {
+			cost_quiet = true;
+		} else {
+			setenv("AIR_VK_NOSEEN", "1", 1);
+			printf("drvtest: AIR_VK_NOSEEN=1 for this run\n");
+		}
+		for (int j = i; j + 1 < argc; j++) {
+			argv[j] = argv[j + 1];
+		}
+		argc -= 1;
+	}
 
 	/*
 	 * --sweep: ask Metal for the system's device and count what every class of the driver
@@ -7640,9 +14145,64 @@ main(int argc, char **argv)
 		blit_only = true;
 		next++;
 	}
+	/* M5a: --pixels after any of --blit, --draw-index, --draw-attrib or --picture is that
+	 * mode's second form (pixels_path): lifted out of the list wherever it stands, at the
+	 * end of the flags below, for --vertexlib's reason. */
+	for (int i = next; i < argc; i++) {
+		if (strcmp(argv[i], "--pixels") == 0) {
+			pixels_only = true;
+			for (int j = i; j + 1 < argc; j++) {
+				argv[j] = argv[j + 1];
+			}
+			argc--;
+			break;
+		}
+	}
+	/* [M5b: --tex and --texfmt with --pixels are a mode and take no kind: pixels_path 4 and 5,
+	 * and no sweep's meaning of either changes without it.] */
+	if (pixels_only && argc > next && strcmp(argv[next], "--tex") == 0) {
+		tex_pixels = 4;
+		next++;
+	} else if (pixels_only && argc > next && strcmp(argv[next], "--texfmt") == 0) {
+		tex_pixels = 5;
+		next++;
+	}
 	if (argc > next && strcmp(argv[next], "--completion") == 0) {
 		completion_only = true;
 		next++;
+	}
+	if (argc > next && strcmp(argv[next], "--stop-compositor") == 0) {
+		pic_stop_compositor = true;
+		next++;
+	}
+	/* --ca-fill: CoreAnimation's solid fill, by its own library and constants */
+	if (argc > next && strcmp(argv[next], "--ca-fill") == 0) {
+		ca_fill_only = true;
+		next++;
+	}
+	/* --m5c LIB: argument buffers, arrays of descriptors, a draw's stores, function constants */
+	if (argc > next + 1 && strcmp(argv[next], "--m5c") == 0) {
+		m5c_library = argv[next + 1];
+		next += 2;
+	}
+	/* --order [METALLIB] (M4-1): -replaceRegion: and a destroy, in order (order_test) */
+	if (argc > next && strcmp(argv[next], "--order") == 0) {
+		order_only = true;
+		metallib = "/System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib";
+		next++;
+	}
+	/* --burst [N] (M4-1): N empty and N small command buffers nobody waits for (burst_test) */
+	if (argc > next && strcmp(argv[next], "--burst") == 0) {
+		burst_count = 256;
+		next++;
+		if (argc > next && argv[next][0] >= '0' && argv[next][0] <= '9') {
+			burst_count = (unsigned)strtoul(argv[next], NULL, 10);
+			next++;
+		}
+		if (burst_count == 0) {
+			printf("drvtest: --burst 0 is nothing to try\n");
+			return 2;
+		}
 	}
 	if (argc > next && strcmp(argv[next], "--draw") == 0) {
 		draw = true;
@@ -7700,6 +14260,52 @@ main(int argc, char **argv)
 		}
 		argc -= 2;
 	}
+	/* --rtfmt NAME is lifted out the same way and for the same reason: --draw's attachment
+	 * format (draw_target_format says what it is for), by name as --texfmt takes one. */
+	for (int i = next; i + 1 < argc; ) {
+		if (strcmp(argv[i], "--rtfmt") != 0) {
+			i++;
+			continue;
+		}
+		MTLPixelFormat f = format_named(argv[i + 1]);
+
+		if (f == 0 || f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float ||
+		    f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatStencil8) {
+			printf("drvtest: --rtfmt %s is not a colour format this test names\n",
+			       argv[i + 1]);
+			return 2;
+		}
+		draw_target_format = f;
+		for (int j = i; j + 2 < argc; j++) {
+			argv[j] = argv[j + 2];
+		}
+		argc -= 2;
+	}
+	/* --clear VALUE, lifted out the same way: --draw's clear colour (draw_clear says why) */
+	for (int i = next; i + 1 < argc; ) {
+		if (strcmp(argv[i], "--clear") != 0) {
+			i++;
+			continue;
+		}
+		draw_clear = strtod(argv[i + 1], NULL);
+		for (int j = i; j + 2 < argc; j++) {
+			argv[j] = argv[j + 2];
+		}
+		argc -= 2;
+	}
+	/* --gallium-depth-stores, lifted out the same way and taking no value (the K28 guard of
+	 * draw_every says what it is for) */
+	for (int i = next; i < argc; ) {
+		if (strcmp(argv[i], "--gallium-depth-stores") != 0) {
+			i++;
+			continue;
+		}
+		gallium_depth_stores = true;
+		for (int j = i; j + 1 < argc; j++) {
+			argv[j] = argv[j + 1];
+		}
+		argc -= 1;
+	}
 	/* --picture [SECONDS]: the draw at the size of the panel, put on the panel. Its own
 	 * flag and not a size for --draw, because what it produces is not a pixel to compare
 	 * but a whole screen, and because it ends in a loop that repaints: a run is over when
@@ -7728,6 +14334,13 @@ main(int argc, char **argv)
 			next++;
 		}
 	}
+	/* --frames N owned|surface (M4, W4): N frames of one full-screen draw (frames_path) */
+	if (argc > next + 2 && strcmp(argv[next], "--frames") == 0) {
+		frames = true;
+		frames_count = (unsigned)strtoul(argv[next + 1], NULL, 10);
+		frames_target = argv[next + 2];
+		next += 3;
+	}
 	/* --draw-depth is the draw with a depth attachment under it, which no pass in this
 	 * port has ever had. Its own flag because what it measures is not a pixel but
 	 * whether a draw was discarded, and that takes four draws of one quad (depth_path
@@ -7749,6 +14362,17 @@ main(int argc, char **argv)
 			next++;
 		}
 	}
+	/* --draw-msaa [N] (M3c-3): its own flag for --draw-depth's reason -- what it measures is
+	 * a resolve, over two passes (msaa_path says why each) -- with the sample count after
+	 * it; --fragment, --rtfmt and --clear choose the shader, the format and the clear. */
+	if (argc > next && strcmp(argv[next], "--draw-msaa") == 0) {
+		draw_msaa = true;
+		next++;
+		if (argc > next && argv[next][0] >= '0' && argv[next][0] <= '9') {
+			msaa_samples = (unsigned)strtoul(argv[next], NULL, 10);
+			next++;
+		}
+	}
 	if (argc > next && strcmp(argv[next], "--draw-all") == 0) {
 		draw = true;
 		draw_all = true;
@@ -7757,6 +14381,28 @@ main(int argc, char **argv)
 			draw_from = (unsigned)strtoul(argv[next], NULL, 10);
 			draw_count = (unsigned)strtoul(argv[next + 1], NULL, 10);
 			next += 2;
+		}
+	}
+	/* --draw-one NAME (M3c-3): --draw-all over the one fragment function of that name */
+	if (argc > next + 1 && strcmp(argv[next], "--draw-one") == 0) {
+		draw = true;
+		draw_all = true;
+		draw_one = argv[next + 1];
+		next += 2;
+	}
+	/* --compute-all [FROM COUNT] [--compute-hangers] (M3d): every kernel of the library
+	 * dispatched, a compute-result line each (compute_every) */
+	if (argc > next && strcmp(argv[next], "--compute-all") == 0) {
+		compute_all = true;
+		next++;
+		if (argc > next + 1 && argv[next][0] >= '0' && argv[next][0] <= '9') {
+			compute_from = (unsigned)strtoul(argv[next], NULL, 10);
+			compute_count = (unsigned)strtoul(argv[next + 1], NULL, 10);
+			next += 2;
+		}
+		if (argc > next && strcmp(argv[next], "--compute-hangers") == 0) {
+			compute_hangers_too = true;
+			next++;
 		}
 	}
 	while (argc > next && (strcmp(argv[next], "--seed-rows") == 0 ||
@@ -7904,11 +14550,32 @@ have_device:
 		return 1;
 	}
 	printf("drvtest: it calls itself \"%s\"\n", [[sys name] UTF8String]);
+	if (tex_pixels != 0) {
+		return pixels_path(sys, metallib, tex_pixels);
+	}
+	if (blit_only && pixels_only) {
+		return pixels_path(sys, metallib, 3);
+	}
+	if (draw_index && pixels_only) {
+		return pixels_path(sys, metallib, 1);
+	}
 	if (blit_only) {
 		return blit_test(sys);
 	}
 	if (completion_only) {
 		return completion_test(sys);
+	}
+	if (burst_count != 0) {
+		return burst_test(sys, burst_count);
+	}
+	if (order_only) {
+		return order_test(sys, metallib);
+	}
+	if (m5c_library != NULL) {
+		return m5c_run(sys, m5c_library, backend_word(), !backend_is_vk());
+	}
+	if (ca_fill_only) {
+		return ca_fill(sys);
 	}
 
 	/* What the device still owes, counted by the runtime on the device rather than guessed
@@ -8028,6 +14695,13 @@ have_device:
 		time_path(sys, metallib, timing_repeats);
 		return 0;
 	}
+	if (frames) {
+		frames_path(sys, metallib, frames_count, frames_target);
+		return 0;
+	}
+	if (picture && pixels_only) {
+		return pixels_path(sys, metallib, 2);
+	}
 	if (picture) {
 		picture_path(sys, metallib, picture_seconds);
 		return 0;
@@ -8035,6 +14709,18 @@ have_device:
 	if (draw_depth) {
 		depth_path(sys, metallib);
 		return 0;
+	}
+	if (draw_msaa) {
+		/* in a pool of its own, for --draw's reason: the command buffers -commandBuffer
+		 * autoreleased give the Vulkan back end's fences back before the last count */
+		@autoreleasepool {
+			msaa_path(sys, metallib);
+		}
+		print_vk_counts("after the msaa passes and their releases");
+		return 0;
+	}
+	if (draw_attrib && pixels_only) {
+		return pixels_path(sys, metallib, 0);
 	}
 	if (draw_attrib) {
 		attrib_path(sys, metallib);
@@ -8048,7 +14734,28 @@ have_device:
 		return 0;
 	}
 	if (draw) {
-		draw_path(sys, metallib);
+		/* in a pool of its own, so the command buffer -commandBuffer autoreleased is
+		 * gone by the second count, and with it the fence the Vulkan back end lent it */
+		@autoreleasepool {
+			draw_path(sys, metallib);
+		}
+		print_vk_counts("after the draw and its releases (the first step's 4096-byte "
+				"buffer above is still held)");
+		return 0;
+	}
+	if (compute_all) {
+		/* --quiet (M4, W3): the sweep is a timed workload with a cost line */
+		char libname[96];
+
+		if (cost_quiet) {
+			cost_begin("W3");
+		}
+		compute_every(sys, mtllib);
+		if (cost_quiet) {
+			cost_end("dispatches", "dispatch", "compute-all %u kernels %s",
+				 compute_every_dispatched,
+				 cost_library_name(metallib, libname, sizeof(libname)));
+		}
 		return 0;
 	}
 	if (only == NULL) {
@@ -8057,3 +14764,116 @@ have_device:
 	compute_path(sys, mtllib, only);
 	return 0;
 }
+
+/*
+ * --ca-fill: CoreAnimation's own solid fill, off its own library with its own constants and vertex
+ * layout (hkmetal's `spec` and `layout` lines): fixed_vert_lph_spc and fixed_frag_lph_cph, which in
+ * run 134123 wrote a different colour every frame into a target whose vertices say opaque black.
+ * It says what comes out for a colour that should come out.
+ */
+static int
+ca_fill(id<MTLDevice> dev)
+{
+   NSError *e = nil;
+   id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"/System/Library/Frameworks/QuartzCore.framework/default.metallib"]
+                                         error:&e];
+   if (lib == nil) {
+      printf("drvtest: ca-fill: no library: %s\n", e ? [[e localizedDescription] UTF8String] : "?");
+      return 1;
+   }
+   static const struct { const char *name; int count; int idx[8]; int val[8]; int attachments; int vs52; } cases[] = {
+      { "fill-A2Xhf", 3, { 4, 6, 30 }, { 1, 2, 0x36 }, 2, 0 },
+      { "fill-A2Xhf-one-target", 3, { 4, 6, 30 }, { 1, 2, 0x36 }, 1, 0 },
+      { "fill-no-fetch", 2, { 6, 30 }, { 1, 0x36 }, 1, 0 },
+      { "fill-vertex-has-texcoord", 3, { 4, 6, 30 }, { 1, 2, 0x36 }, 1, 1 },
+   };
+   id<MTLCommandQueue> q = [dev newCommandQueue];
+   for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+      MTLFunctionConstantValues *fv = [[MTLFunctionConstantValues alloc] init];
+      MTLFunctionConstantValues *vv = [[MTLFunctionConstantValues alloc] init];
+      for (int k = 0; k < cases[c].count; k++) {
+         unsigned char b = (unsigned char)cases[c].val[k];
+         [fv setConstantValue:&b type:(cases[c].idx[k] == 4 ? MTLDataTypeBool : MTLDataTypeUChar) atIndex:(NSUInteger)cases[c].idx[k]];
+      }
+      if (cases[c].vs52) {
+         unsigned char one = 1;
+         [vv setConstantValue:&one type:MTLDataTypeUChar atIndex:52];
+      }
+      id<MTLFunction> ff = [lib newFunctionWithName:@"fixed_frag_lph_cph" constantValues:fv error:&e];
+      id<MTLFunction> vf = [lib newFunctionWithName:@"fixed_vert_lph_spc" constantValues:vv error:&e];
+      MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+      [[vd attributes][0] setFormat:MTLVertexFormatFloat4];
+      [[vd attributes][0] setOffset:0];
+      [[vd attributes][0] setBufferIndex:1];
+      [[vd attributes][1] setFormat:MTLVertexFormatFloat2];
+      [[vd attributes][1] setOffset:16];
+      [[vd attributes][1] setBufferIndex:1];
+      [[vd attributes][2] setFormat:MTLVertexFormatFloat2];
+      [[vd attributes][2] setOffset:24];
+      [[vd attributes][2] setBufferIndex:1];
+      [[vd attributes][3] setFormat:MTLVertexFormatHalf4];
+      [[vd attributes][3] setOffset:32];
+      [[vd attributes][3] setBufferIndex:1];
+      [[vd layouts][1] setStride:48];
+      MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+      [d setVertexFunction:vf];
+      [d setFragmentFunction:ff];
+      [d setVertexDescriptor:vd];
+      [[d colorAttachments][0] setPixelFormat:MTLPixelFormatBGRA8Unorm];
+      if (cases[c].attachments > 1) {
+         [[d colorAttachments][1] setPixelFormat:MTLPixelFormatBGRA8Unorm];
+         [[d colorAttachments][1] setWriteMask:MTLColorWriteMaskNone];
+      }
+      id<MTLRenderPipelineState> p = [dev newRenderPipelineStateWithDescriptor:d error:&e];
+      if (p == nil) {
+         printf("drvtest: ca-fill %s: no pipeline: %s\n", cases[c].name, e ? [[e localizedDescription] UTF8String] : "?");
+         continue;
+      }
+      MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:16 height:16 mipmapped:NO];
+      [td setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
+      id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+      id<MTLTexture> t1 = [dev newTextureWithDescriptor:td];
+      struct vtx { float pos[4]; float tc[4]; uint16_t color[4]; uint32_t junk[2]; };
+      static const float corner[6][2] = { {-1,-1}, {1,-1}, {-1,1}, {1,-1}, {1,1}, {-1,1} };
+      struct vtx verts[6];
+      for (int v = 0; v < 6; v++) {
+         memset(&verts[v], 0, sizeof(verts[v]));
+         verts[v].pos[0] = corner[v][0];
+         verts[v].pos[1] = corner[v][1];
+         verts[v].pos[3] = 1;
+         verts[v].color[0] = 0x3400;   /* 0.25 */
+         verts[v].color[1] = 0x3800;   /* 0.5 */
+         verts[v].color[2] = 0x3a00;   /* 0.75 */
+         verts[v].color[3] = 0x3c00;   /* 1 */
+         verts[v].junk[0] = 0x33f1c6d8;
+         verts[v].junk[1] = 1;
+      }
+      const float identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+      id<MTLBuffer> vb = [dev newBufferWithBytes:verts length:sizeof(verts) options:MTLResourceStorageModeShared];
+      id<MTLBuffer> mb = [dev newBufferWithBytes:identity length:sizeof(identity) options:MTLResourceStorageModeShared];
+      MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      [[rp colorAttachments][0] setTexture:t];
+      [[rp colorAttachments][0] setLoadAction:MTLLoadActionClear];
+      [[rp colorAttachments][0] setStoreAction:MTLStoreActionStore];
+      [[rp colorAttachments][0] setClearColor:MTLClearColorMake(1, 0, 1, 1)];
+      if (cases[c].attachments > 1) {
+         [[rp colorAttachments][1] setTexture:t1];
+         [[rp colorAttachments][1] setLoadAction:MTLLoadActionClear];
+         [[rp colorAttachments][1] setStoreAction:MTLStoreActionDontCare];
+      }
+      id<MTLCommandBuffer> cb = [q commandBuffer];
+      id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+      [enc setRenderPipelineState:p];
+      [enc setVertexBuffer:vb offset:0 atIndex:1];
+      [enc setVertexBuffer:mb offset:0 atIndex:2];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      uint8_t px[4] = { 0 };
+      [t getBytes:px bytesPerRow:64 fromRegion:MTLRegionMake2D(8, 8, 1, 1) mipmapLevel:0];
+      printf("drvtest: ca-fill %s: status %ld b g r a %u %u %u %u (want 191 128 64 255)\n", cases[c].name, (long)[cb status], px[0], px[1], px[2], px[3]);
+   }
+   return 0;
+}
+

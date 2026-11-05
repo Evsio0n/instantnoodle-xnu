@@ -11,6 +11,9 @@
  *                                long it was gone by mach_continuous_time() (which counts the sleep) and by
  *                                mach_absolute_time() (which does not), what woke it and how many cores were off
  *
+ *   power_test hbm N             the panel's high brightness mode for N seconds, 0 off (kern.hackios.hbm: boot-arg hbm=1
+ *                                and the limits of xnu bsd/dev/hk_hbm.c), one "t-hbm:" line
+ *
  * The side button as iOS gets it: rwtouch button lock (/dev/hk-touch). The power key's own interrupt, which wakes
  * the phone from a real press, is only tried by a hand on the key.
  */
@@ -19,6 +22,7 @@
 #include <IOKit/IOKitLib.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
@@ -230,6 +234,18 @@ main(int argc, char **argv)
 		printf("t-top: %s %s\n", argc >= 3 ? argv[2] : "now", text);
 		fflush(stdout);
 		return 0;
+	}
+	if (argc >= 3 && strcmp(argv[1], "hbm") == 0) {
+		/* hbm N: the panel's high brightness mode for N seconds (bsd/dev/hk_hbm.c: boot-arg hbm=1, its limits), 0: off */
+		int seconds = atoi(argv[2]), on = 0;
+		size_t size = sizeof(on);
+		int result = sysctlbyname("kern.hackios.hbm", NULL, NULL, &seconds, sizeof(seconds));
+
+		sysctlbyname("kern.hackios.hbm", &on, &size, NULL, 0);
+		printf("t-hbm: %d s asked: %s; high brightness now %s\n", seconds, result == 0 ? "taken" : strerror(errno),
+		    on ? "ON" : "off");
+		fflush(stdout);
+		return result == 0 ? 0 : 1;
 	}
 	if (argc >= 2 && strcmp(argv[1], "lat") == 0) {
 		char text[96] = "";

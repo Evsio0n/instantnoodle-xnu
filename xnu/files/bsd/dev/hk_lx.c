@@ -209,7 +209,13 @@ lx_os_random(void *buffer, unsigned long size)
 unsigned
 lx_os_option(const char *name)
 {
-	return hk_wifi_option(name);
+	unsigned value = hk_wifi_option(name);
+
+	/* board=instantnoodle: Android's scan dwell for the QCA6390 by default (wifi/lx/src/lx_80211.c; wifi_dwell=0 turns it off) */
+	if (value == 0 && strcmp(name, "wifi_dwell") == 0 && instantnoodle_board() && !PE_parse_boot_argn(name, &value, sizeof(value))) {
+		value = 1;
+	}
+	return value;
 }
 
 int

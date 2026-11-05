@@ -541,7 +541,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# ... and the files of ours it puts there (var/): those under mobile/ belong to the user mobile
 	cp -r var root/var
 	(cd var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
-		case $f in mobile/*) owner=501 ;; *) owner=0 ;; esac
+		# (db/timed/: timed's own, user _timed 266 -- it writes there: "Set Automatically" on, NTP over Wi-Fi, 2026-11-04)
+		case $f in mobile/*) owner=501 ;; db/timed/*) owner=266 ;; *) owner=0 ;; esac
 		printf 'f\t644\t%s\t%s\t/private/var/%s\t/var/%s\n' $owner $owner "$f" "$f"
 	done >> root/etc/var.skel
 	# mobile's own temporary directory, $HOME/tmp, which iOS's template does not have: an application of

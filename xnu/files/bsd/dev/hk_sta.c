@@ -9,20 +9,26 @@
  * request of each kind can wait: a second scan asked for while the first has not begun
  * replaces it, as does a second join.
  *
- * What the last scan heard is kept here, so that it can be read without entering the station
- * side, and so is the list of channels.
+ * What the scans heard is kept here, so that it can be read without entering the station
+ * side, and so is the list of channels. Not the last scan's alone: wifid scans the bands one at a
+ * time (2.4 GHz in 0.6 s, then 5 GHz in 3-4 s, 2026-11-04) and a scan hears a different few each
+ * time, so an access point heard in the last wifi_scan_keep seconds (120; 0: the last scan only)
+ * stays in what is read, with the age it has -- as a driver's scan cache does: Settings' list had
+ * networks missing, and the 5 GHz ones came seconds after the rest.
  *
  * The network the kernel was given in a file is a standing request: joined at the start, and
  * again whenever the radio is turned back on (Settings' switch), until somebody asks for
  * another network -- as iOS itself rejoins the networks it knows. If that other network cannot
  * be joined (a wrong passphrase), the standing one is joined again.
  */
+#include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/hk_input.h>
 #include <sys/hk_sta.h>
@@ -50,20 +56,60 @@ static struct hk_sta_join asked_join_what;
 static struct hk_sta_join standing;        /* the network joined whenever the radio comes on (ssid_length 0: none) */
 static struct hk_sta_join fallback;        /* ... as it was before a join that has not come through yet */
 
-static struct hk_sta_bss *heard;           /* by the last scan that came to an end */
+static struct hk_sta_bss *heard;           /* by the scans that came to an end, the last wifi_scan_keep seconds */
+static uint64_t heard_at[HEARD_MOST];      /* when each was last heard (ns of uptime) */
 static unsigned heard_count;
+static uint64_t heard_keep_ns = 120ull * NSEC_PER_SEC;
+
+static uint64_t
+sta_now_ns(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
 static struct hk_sta_channel channels[CHANNELS_MOST];
 static unsigned channel_count;
 
 static void
-heard_one(const struct hk_sta_bss *bss, __unused void *context)
+heard_one(const struct hk_sta_bss *bss, void *context)
 {
+	uint64_t now = *(const uint64_t *)context, at = now - (uint64_t)bss->age_ms * NSEC_PER_MSEC;
+	unsigned i, oldest = 0;
+
 	/* (only the thread writes the list, and it reads the count without the lock) */
-	if (heard_count < HEARD_MOST) {
-		lck_mtx_lock(&sta_lock);
-		heard[heard_count++] = *bss;
-		lck_mtx_unlock(&sta_lock);
+	for (i = 0; i < heard_count && memcmp(heard[i].bssid, bss->bssid, sizeof(bss->bssid)) != 0; i++) {
+		oldest = heard_at[i] < heard_at[oldest] ? i : oldest;
 	}
+	if (i == heard_count && heard_count == HEARD_MOST) {
+		i = oldest;                     /* (full: the one heard longest ago gives way) */
+	}
+	lck_mtx_lock(&sta_lock);
+	heard[i] = *bss;
+	heard_at[i] = at;
+	heard_count += i == heard_count;
+	lck_mtx_unlock(&sta_lock);
+}
+
+/* Before a scan's are added: those heard longer ago than heard_keep_ns go (all of them with wifi_scan_keep=0). */
+static void
+heard_forget(uint64_t now)
+{
+	unsigned kept = 0;
+
+	lck_mtx_lock(&sta_lock);
+	for (unsigned i = 0; i < heard_count; i++) {
+		if (heard_keep_ns != 0 && now - heard_at[i] <= heard_keep_ns) {
+			if (kept != i) {
+				heard[kept] = heard[i];
+				heard_at[kept] = heard_at[i];
+			}
+			kept++;
+		}
+	}
+	heard_count = kept;
+	lck_mtx_unlock(&sta_lock);
 }
 
 static void
@@ -142,11 +188,28 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			bzero(&fallback, sizeof(fallback));
 			lck_mtx_unlock(&sta_lock);
 		} else if (do_scan) {
+			static unsigned said;
+			uint64_t now;
+			unsigned kept;
+
 			error = ops->scan(&scan);
-			lck_mtx_lock(&sta_lock);
-			heard_count = 0;
-			lck_mtx_unlock(&sta_lock);
-			ops->heard(heard_one, NULL);
+			now = sta_now_ns();
+			heard_forget(now);
+			kept = heard_count;
+			ops->heard(heard_one, &now);
+			if (said < 30) {
+				unsigned low = 0, high = 0, dfs = 0;
+
+				said++;
+				for (unsigned i = 0; i < heard_count; i++) {
+					low += heard[i].frequency < 4000;
+					high += heard[i].frequency >= 4000;
+					dfs += heard[i].frequency >= 5250 && heard[i].frequency <= 5730;      /* (channels 52-144) */
+				}
+				hk_wifi_tell("wifi: a scan of %u channels is over (%d): %u access points to read, %u on 2.4 GHz and %u on 5 GHz "
+				    "(%u of them on DFS channels), %u of them kept from the last %llu s\n", scan.frequency_count, error, heard_count,
+				    low, high, dfs, kept, heard_keep_ns / NSEC_PER_SEC);
+			}
 			hk_apple80211_event(HK_STA_SCAN_DONE, error);
 		}
 
@@ -176,7 +239,12 @@ hk_sta_attach(const struct hk_sta_ops *ops)
 		return;
 	}
 	if (heard == NULL) {
+		uint32_t keep;
+
 		heard = kalloc_data(HEARD_MOST * sizeof(*heard), Z_WAITOK | Z_ZERO);
+		if (PE_parse_boot_argn("wifi_scan_keep", &keep, sizeof(keep))) {
+			heard_keep_ns = (uint64_t)keep * NSEC_PER_SEC;
+		}
 	}
 	if (heard == NULL) {
 		hk_wifi_tell("wifi: no memory for what a scan hears: nobody can ask the radio for a network\n");
@@ -372,11 +440,13 @@ hk_sta_ask_leave(void)
 bool
 hk_sta_heard(unsigned index, struct hk_sta_bss *bss)
 {
+	uint64_t now = sta_now_ns();
 	bool there;
 
 	lck_mtx_lock(&sta_lock);
 	if ((there = index < heard_count)) {
 		*bss = heard[index];
+		bss->age_ms = (uint32_t)((now - heard_at[index]) / NSEC_PER_MSEC);
 	}
 	lck_mtx_unlock(&sta_lock);
 	return there;

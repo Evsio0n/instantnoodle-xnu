@@ -169,23 +169,44 @@ str_eq(const char *a, const char *b)
  */
 static int screen_quiet;
 
+/*
+ * The screen gets the log a line at a time: the firmware's text console draws each call, and a character
+ * a call was 20,000 calls for the 300 lines of a boot (2026-11-04: an installed boot from the flash was
+ * slow on the OnePlus 8's 1080x2400 screen).
+ */
+static char16 screen_line[160];
+static unsigned screen_used;
+
+static void
+screen_flush(void)
+{
+	if (screen_used != 0 && ST->con_out != NULL) {
+		screen_line[screen_used] = 0;
+		ST->con_out->output_string(ST->con_out, screen_line);
+	}
+	screen_used = 0;
+}
+
 static void
 put_char(char c)
 {
-	char16 w[3] = { 0, 0, 0 };
-
 	if (log_len < sizeof(log_buf) - 1) {
 		log_buf[log_len++] = c;
 	}
 	if (ST->con_out != NULL && !screen_quiet) {
 		if (c == '\n') {
-			w[0] = '\r', w[1] = '\n';
+			screen_line[screen_used++] = '\r';
+			screen_line[screen_used++] = '\n';
+			screen_flush();
 		} else {
-			w[0] = (char16)c;
+			screen_line[screen_used++] = (char16)c;
+			if (screen_used >= sizeof(screen_line) / sizeof(screen_line[0]) - 3) {
+				screen_flush();
+			}
 		}
-		ST->con_out->output_string(ST->con_out, w);
 	}
 }
+
 
 /* printf subset: %s %x %d (64-bit values), %% */
 static void
@@ -224,6 +245,12 @@ print(const char *fmt, ...)
 }
 
 #define READ_SYSREG(name) ({ uint64_t _v; __asm__ volatile ("mrs %0, " #name : "=r" (_v)); _v; })
+/* milliseconds since the system counter started: about since power-on (the boot chain before us is in it) */
+static uint64_t
+ms_since_power_on(void)
+{
+	return READ_SYSREG(CNTPCT_EL0) / (READ_SYSREG(CNTFRQ_EL0) / 1000);
+}
 
 /*
  * Write back and drop cached copies of a range. Required for memory the
@@ -3817,6 +3844,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (kernel_mpidr != this_mpidr) {
 		print("the kernel will run on core %x (this is core %x)\n", kernel_mpidr, this_mpidr);
 	}
+	print("time: %d ms since power-on: the kernel next\n", ms_since_power_on());
 	print("jumping to %x\n", entry_va + slide);
 	flush_log();
 	/* From here on the kernel feeds the watchdog (boot-arg hv_wdt_pet, see loader_return.c in XNU). */
@@ -4163,6 +4191,7 @@ static void fb_standalone(void);
 static const char *clock_set(uint64_t now);
 
 static const char *fb_flash_boot(const char *name, const char *want_hex, const uint8_t *img, uint64_t len);
+static const char *fb_part_sha(efi_block_io *bio, char hex[65]);
 
 /* a GPT partition's BlockIo by its name, NULL: none such */
 static efi_block_io *
@@ -4425,6 +4454,25 @@ fb_command(char *cmd)
 			staged_data = last_log;
 			staged_len = str_len(last_log);
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem readpart boot_a") || starts_with(cmd, "oem readpart boot_b")) {
+			/*
+			 * a boot partition, read only: its first 63 MB staged (a UEFI image is a few) and the SHA-256 of all
+			 * of it in the log -- what `oem flashpart` checks: the copy to put back before it is written over
+			 */
+			const char *name = starts_with(cmd, "oem readpart boot_a") ? "boot_a" : "boot_b";
+			efi_block_io *bio = part_bio(name);
+			uint64_t got = part_read_all(name, (uint8_t *)PAYLOAD_BASE, PAYLOAD_MAX_SIZE - 0x100000);
+			const char *why = bio != NULL && got != 0 ? NULL : "no such partition";
+			char hex[65];
+
+			if (why == NULL && (why = fb_part_sha(bio, hex)) == NULL) {
+				print("flash: %s: %d bytes, sha256 %s; the first %d staged\n", name,
+				    (bio->media->last_block + 1) * bio->media->block_size, hex, got);
+			}
+			download_len = 0;
+			staged_data = (const char *)PAYLOAD_BASE;
+			staged_len = why == NULL ? got : 0;
+			fb_reply(why == NULL ? "OKAY" : "FAIL", why == NULL ? "" : why);
 		} else if (starts_with(cmd, "oem readpart logfs") || starts_with(cmd, "oem readpart logdump")) {
 			/* a log partition, read only, whole: logfs holds the stock UEFI's and ABL's own logs (FAT) */
 			const char *name = starts_with(cmd, "oem readpart logfs") ? "logfs" : "logdump";
@@ -4511,6 +4559,7 @@ usb_poll_command(void)
 static void
 usb_command_loop(void)
 {
+	screen_flush();
 	screen_quiet = 1;
 	for (;;) {
 		char cmd[128];
@@ -4636,6 +4685,7 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
 	print("== XNULOADER v3 ==\n");
+	print("time: %d ms since power-on: the loader starts\n", ms_since_power_on());
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 

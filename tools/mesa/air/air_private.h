@@ -37,6 +37,13 @@ enum air_ptr_class {
     * why argument buffers need no addresses here.
     */
    AIR_PTR_ARGBUF,
+
+   /* M5c: a direct array of descriptors (`array<texture2d<float>, 3> t [[texture(0)]]`, a pointer
+    * to the handles, `byval([3 x ptr addrspace(1)])`): .binding is its first Metal index, .offset
+    * the byte offset into the handles, and a load through it RESOLVES as a load through an
+    * argument buffer does (desc_array_load) to a pointer of class .desc_class.
+    */
+   AIR_PTR_DESC_ARRAY,
 };
 
 struct air_ptr {
@@ -45,6 +52,13 @@ struct air_ptr {
    bool is_image;                    /* a texture the shader writes: an image, not a view */
    nir_def *offset;                  /* bytes, 32-bit; NULL means zero */
    const struct air_type *pointee;   /* for sizes, and for loads without a type */
+   /* M5c: the element of an array of descriptors, chosen at run time, counted from .binding; NULL
+    * when .binding alone says it. AIR_PTR_DESC_ARRAY: what its handles are. */
+   nir_def *element;
+   enum air_ptr_class desc_class;
+   /* M5d: a phi of this texture and air.get_null_texture: the choice is a function constant's,
+    * and nothing here knows which way it went (resolve_pointer_phi) */
+   bool maybe_null;
 };
 
 enum air_val_kind {
@@ -103,6 +117,7 @@ struct air_argbuf_member {
    bool read, write;
    const char *name, *type_name;
    const struct air_md *node;   /* the member's own air.indirect_argument descriptor */
+   unsigned span;               /* M5c: how many descriptors: an array's length, or 1 */
 };
 
 struct air_argbuf {
@@ -114,7 +129,26 @@ struct air_argbuf {
    struct air_argbuf_member *members;
 };
 
+/* M5c: one pointer kept in a local's bytes (air_to_nir.c, POINTERS IN A LOCAL) */
+struct air_pointer_slot {
+   uint64_t offset;           /* the scratch byte it was stored at */
+   struct air_val *val;
+   nir_function_impl *impl;   /* whose defs the pointer's offset is */
+   bool conflicted;           /* M5e: a second, different pointer was stored here; refused if it is ever read */
+};
+
+/* M5e: an array of descriptors copied into a local's bytes (air_to_nir.c, POINTERS IN A LOCAL) */
+struct air_desc_copy {
+   uint64_t start, bytes;     /* the scratch bytes */
+   struct air_ptr array;      /* AIR_PTR_DESC_ARRAY */
+};
+
 struct air_ctx {
+   unsigned variables_end;   /* M5d: scratch below this is the module's variables (plan_globals) */
+   struct air_pointer_slot *pointer_slots;
+   unsigned num_pointer_slots;
+   struct air_desc_copy *desc_copies;
+   unsigned num_desc_copies;
    void *mem_ctx;
    const struct air_module *m;
    const struct air_function *fn;
@@ -215,11 +249,28 @@ struct air_ctx {
    char error[256];
 };
 
+/* M5c: the index source of a buffer or image intrinsic. A plain constant is the binding, as it has
+ * always been. With an element chosen at run time it is (binding << 16) + element, which is only
+ * ever read by a back end that says it takes it (air_shader_info.indexed_descriptors): a texture
+ * or sampler has fields for the binding and a source for the element, and these have one source
+ * for both. air_vk.c's desc_index reads it, before anything has moved it.
+ */
+static inline nir_def *
+air_ptr_index(struct air_ctx *c, const struct air_ptr *p)
+{
+   if (!p->element)
+      return nir_imm_int(&c->b, p->binding);
+   return nir_iadd(&c->b, nir_imm_int(&c->b, p->binding << 16), p->element);
+}
+
 bool air_error(struct air_ctx *c, const char *fmt, ...) PRINTFLIKE(2, 3);
 
 /* value bookkeeping */
 struct air_val *air_val_ssa(struct air_ctx *c, nir_def *def);
 struct air_val *air_val_ptr(struct air_ctx *c, struct air_ptr ptr);
+/* M5c: pointers kept in a local's bytes, across a memcpy of them (air_to_nir.c, POINTERS IN A LOCAL) */
+void air_copy_pointer_slots(struct air_ctx *c, struct air_ptr dst, struct air_ptr src, uint64_t bytes);
+bool air_copy_descriptors(struct air_ctx *c, struct air_ptr dst, struct air_ptr src, uint64_t bytes);
 struct air_val *air_get(struct air_ctx *c, const struct air_value *v);
 void air_set(struct air_ctx *c, const struct air_value *v, struct air_val *val);
 
@@ -228,6 +279,14 @@ nir_def *air_get_ssa(struct air_ctx *c, const struct air_value *v);
 
 /* the NIR type of an AIR type: bit size and components */
 unsigned air_nir_bit_size(struct air_ctx *c, const struct air_type *t);
+/* the index a texture op gets for a texture this specialization has not got (texture_op) */
+#define AIR_NO_TEXTURE 127
+/* an integer of a width NIR has not got, which lives masked in the next width it has */
+static inline bool
+air_int_is_narrow(unsigned bits)
+{
+   return bits > 1 && bits < 32 && bits != 8 && bits != 16;
+}
 unsigned air_nir_components(const struct air_type *t);
 
 /* Records that the shader was translated with a caveat: what it asked for and

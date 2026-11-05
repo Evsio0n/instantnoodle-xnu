@@ -48,6 +48,11 @@
  *                  over it with one pitch
  *   the contract   rwa_texture_from_surface (tools/mesa/air/air_metal.h)
  *
+ * [M3e: and on the Vulkan back end the same ID goes the same way into turnip --
+ * tools/mesa/air/air_vk.c imports it as a dma-buf whose "descriptor" is the ID, through the
+ * same drmPrimeFDToHandle -- and the call is looked up in whichever library src/hkmetal.m
+ * chose (rwd_use_library), not in libhackiosair.dylib by name.]
+ *
  * The last of those is new, and it is still looked up rather than linked: an image built
  * before it existed has a library without the symbol, and then this file refuses BY NAME
  * instead of returning a bare nil. That distinction is not tidiness -- get_unused_drawable
@@ -389,6 +394,25 @@ static const struct rwd_format rwd_formats[] = {
 	{  90, 'R10k', 4, 0, "a ten-bit RGB format" },
 	{  94, 'l10r', 4, 1, "a ten-bit RGB format" },
 	{ 115, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Float" },
+	/* [M5d: and what a compute kernel lays over a surface to read or write its words, whatever the
+	 * surface's own FourCC says (VideoToolbox's scaler: R32Uint over a BGRA surface, run 150028), and
+	 * a one- or two-channel surface in the compositor (RG8 over LA08, run 142131). The FourCC here is
+	 * only what a drawable of the format would be made as; these are never that.] */
+	{  13, 'L008', 1, 0, "MTLPixelFormatR8Uint" },
+	{  20, 'L016', 2, 0, "MTLPixelFormatR16Unorm" },
+	{  23, 'L016', 2, 0, "MTLPixelFormatR16Uint" },
+	{  25, 'L00h', 2, 0, "MTLPixelFormatR16Float" },
+	{  30, '2C08', 2, 0, "MTLPixelFormatRG8Unorm" },
+	{  33, '2C08', 2, 0, "MTLPixelFormatRG8Uint" },
+	{  53, 'BGRA', 4, 0, "MTLPixelFormatR32Uint" },
+	{  55, 'BGRA', 4, 0, "MTLPixelFormatR32Float" },
+	{  60, '2C16', 4, 0, "MTLPixelFormatRG16Unorm" },
+	{  63, '2C16', 4, 0, "MTLPixelFormatRG16Uint" },
+	{  65, '2C0h', 4, 0, "MTLPixelFormatRG16Float" },
+	{  73, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Uint" },
+	{  91, 'R10k', 4, 0, "MTLPixelFormatRGB10A2Uint" },
+	{ 110, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Unorm" },
+	{ 113, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Uint" },
 	{ 550, 'b3a8', 4, 1, "a ten-bit XR format" },
 	{ 551, 'b3a8', 4, 1, "a ten-bit XR format" },
 	{ 552, 'w40a', 4, 1, "a ten-bit XR format" },
@@ -500,6 +524,21 @@ typedef struct rwa_texture *(*rwd_import_call)(struct rwa_device *device,
 					       int surface_id, unsigned offset,
 					       unsigned row_bytes, char *why, size_t why_size);
 
+/*
+ * The library src/hkmetal.m chose, when it says (rwd_use_library, hk_drawable.h). Until it
+ * does -- and in a program that links this file without the driver, src/drawable_test.c on
+ * Gallium -- the lookup below is the one it always was. The Vulkan back end exports the same
+ * rwa_texture_from_surface (tools/mesa/air/air_vk.c, M3e), and a name looked up in the
+ * wrong one of the two would hand it a device of the other.
+ */
+static void *rwd_library;
+
+void
+rwd_use_library(void *handle)
+{
+	rwd_library = handle;
+}
+
 static rwd_import_call
 rwd_import(void)
 {
@@ -507,7 +546,8 @@ rwd_import(void)
 	static int looked;
 
 	if (!looked) {
-		void *library = dlopen("/hackios/lib/libhackiosair.dylib", RTLD_NOW | RTLD_NOLOAD);
+		void *library = rwd_library != NULL ? rwd_library :
+		    dlopen("/hackios/lib/libhackiosair.dylib", RTLD_NOW | RTLD_NOLOAD);
 
 		looked = 1;
 		if (library != NULL) {
@@ -590,7 +630,15 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		    id, surface.width, surface.height, want->width, want->height);
 		return NULL;
 	}
-	if (surface.pixelFormat != fourcc) {
+	/* [M5d: what is laid over a surface for its bytes need the bytes to be the right size, not the
+	 * FourCC to be one name: RG8 over LA08, R32Uint over BGRA. A format of a drawable keeps the check.] */
+	const bool any_fourcc = want->pixel_format == 13 || want->pixel_format == 20 || want->pixel_format == 23 ||
+				want->pixel_format == 25 || want->pixel_format == 30 || want->pixel_format == 33 ||
+				want->pixel_format == 53 || want->pixel_format == 55 || want->pixel_format == 60 ||
+				want->pixel_format == 63 || want->pixel_format == 65 || want->pixel_format == 73 ||
+				want->pixel_format == 91 || want->pixel_format == 110 || want->pixel_format == 113;
+
+	if (!any_fourcc && surface.pixelFormat != fourcc) {
 		rwd_say(why, why_size, "surface %u is '%c%c%c%c' and Metal format %u is "
 		    "'%c%c%c%c'", id, (char)(surface.pixelFormat >> 24),
 		    (char)(surface.pixelFormat >> 16), (char)(surface.pixelFormat >> 8),

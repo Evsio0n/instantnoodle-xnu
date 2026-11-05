@@ -71,6 +71,21 @@ cache_slide(void)
 	return (uintptr_t)&MTLCreateSystemDefaultDevice - MTL_CREATE_DEVICE_UNSLID;
 }
 
+/* the image an address is in and the nearest symbol before it (dladdr): for what is outside the cache, as Mesa is */
+static void
+where(const char *what, uintptr_t address)
+{
+	Dl_info dl;
+
+	if (address != 0 && dladdr((void *)address, &dl) != 0 && dl.dli_fname != NULL) {
+		const char *image = strrchr(dl.dli_fname, '/');
+
+		printf("metal_test:       %s in %s +%#lx, %s +%#lx\n", what, image != NULL ? image + 1 : dl.dli_fname,
+		    (unsigned long)(address - (uintptr_t)dl.dli_fbase), dl.dli_sname != NULL ? dl.dli_sname : "?",
+		    dl.dli_saddr != NULL ? (unsigned long)(address - (uintptr_t)dl.dli_saddr) : 0UL);
+	}
+}
+
 static void
 fault(int sig, siginfo_t *info, void *uap)
 {
@@ -87,6 +102,8 @@ fault(int sig, siginfo_t *info, void *uap)
 	printf("metal_test:     signal %d at address %p\n", sig, info != NULL ? info->si_addr : NULL);
 	printf("metal_test:     pc  %#lx unslid (cache slide %#lx)\n", pc - slide, slide);
 	printf("metal_test:     lr  %#lx unslid\n", lr - slide);
+	where("pc", pc);
+	where("lr", lr);
 	for (int i = 0; i < 8 && fp > 0x1000; i++) {
 		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
 
@@ -94,6 +111,7 @@ fault(int sig, siginfo_t *info, void *uap)
 			break;
 		}
 		printf("metal_test:     #%d  %#lx unslid\n", i, ret - slide);
+		where("  ", ret);
 		if (next <= fp) {
 			break;
 		}

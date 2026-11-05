@@ -165,6 +165,19 @@ read_zone(int z)
 	return zone_where[z] == 0xffff ? THERMAL_INVALID : read_sensor(zone_where[z] >> 8 & 1, zone_where[z] & 0xff);
 }
 
+/* For the panel's high brightness mode (hk_hbm.c): the pressure 0..4 and the hottest reading in tenths at the last tick; -1: not running */
+int
+hk_thermal_now(int *hottest_tenths)
+{
+	int pressure;
+
+	lck_mtx_lock(&thermal_mtx);
+	pressure = thermal_running ? thermal_pressure : -1;
+	*hottest_tenths = thermal_hottest;
+	lck_mtx_unlock(&thermal_mtx);
+	return pressure;
+}
+
 /* The GPU's sensors at the last tick (the hotter of the gpuss zones), tenths of a degree; THERMAL_INVALID: none. */
 int
 hk_thermal_gpu_tenths(void)

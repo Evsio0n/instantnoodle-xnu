@@ -11,6 +11,7 @@ behaviour only. Add to these pages when you learn something (see [../../AGENTS.m
 | [kernel-standins.md](kernel-standins.md) | the kernel replacements for IOSurface, framebuffer, KeyStore, AMFI/Sandbox, corecrypto, ramfs; protocols recovered |
 | [hardware-qualcomm.md](hardware-qualcomm.md) | what crashes the phone, SMEM/SMP2P/GLINK/QRTR/AOP/TZ, SMMU, PMIC arbiter, pins, display/GPU register facts, bring-up method |
 | [boot-chain-and-recovery.md](boot-chain-and-recovery.md) | XBL/ABL/UEFI/loader, XNUP container, memory, stock ABL quirks, OnePlus 8 recovery, UEFI port notes |
+| [mdp-driver-plan.md](mdp-driver-plan.md) | our own MDP driver for the OnePlus 8: SMMU options, the pipes and mixers, the steps `mdp=1..8`, risks |
 | [failed-approaches.md](failed-approaches.md) | dead ends and costly mistakes, one line each |
 | [bluetooth-ios.md](bluetooth-ios.md) | QCA6390 UART/firmware and native iOS command-family/vendor integration findings |
 | [checks.md](checks.md) | "how our own checks lie": eleven measurement pitfalls |

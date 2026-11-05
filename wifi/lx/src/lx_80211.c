@@ -1469,11 +1469,50 @@ station_down(struct lx_radio *radio)
 	printf("lx: the interface is removed and the radio stopped\n");
 }
 
+/* One scan by the driver of the channels `request` has, and the wait for it to be over: 0, or an errno. */
+static int
+station_scan_part(struct lx_radio *radio, struct ieee80211_scan_request *request, const uint8_t *name, unsigned name_length,
+    bool quiet)
+{
+	struct ieee80211_hw *hw = &radio->hw;
+	unsigned long long began;
+	int ret;
+
+	radio->scan = 1;
+	began = lx_os_nanoseconds();
+	mutex_lock(&hw->wiphy->mtx);
+	ret = radio->ops->hw_scan(hw, radio->vif, request);
+	mutex_unlock(&hw->wiphy->mtx);
+	printf("lx: THE DRIVER IS ASKED TO SCAN %d channels, %s: %d\n", request->req.n_channels, quiet ? "listening only" :
+	    name_length != 0 ? "asking for one network by name where it may send" : "asking for any network where it may send", ret);
+	if (ret == 0) {
+		lx_os_lock();
+		while (radio->scan == 1 && lx_os_nanoseconds() - began < 40000000000ull) {
+			lx_os_sleep(&radio->scan, 100 * 1000000ull);
+		}
+		lx_os_unlock();
+		printf("lx: %llu ms later the scan is %s\n", (lx_os_nanoseconds() - began) / 1000000ull, radio->scan == 2 ? "OVER" :
+		    radio->scan == 3 ? "GIVEN UP by the driver" : "NOT OVER: the driver has not said so");
+		if (radio->scan == 1 && radio->ops->cancel_hw_scan != NULL) {
+			mutex_lock(&hw->wiphy->mtx);
+			radio->ops->cancel_hw_scan(hw, radio->vif);
+			mutex_unlock(&hw->wiphy->mtx);
+		}
+	}
+	(void)name;
+	return (ret != 0 ? -ret : radio->scan == 2 ? 0 : ETIMEDOUT);
+}
+
 /*
  * A scan of every channel the regulatory domain allows, or of those `what` names. With a name
  * the radio asks for that network on every channel where it may send (a probe request; and the
  * access points that hear it answer); without one it asks for any network there, or, if it
  * is to be `quiet`, only listens. 0 when the driver has said the scan is over.
+ *
+ * With wifi_dwell=1 (40 and 110), or wifi_dwell_active=A and wifi_dwell_passive=P (2026-11-04; and iOS leaving the time on each
+ * channel to the radio) it is two scans by the driver: the channels where it may send, A ms on each, then
+ * those where it only listens (DFS, no-IR), P ms on each -- the driver's own times are 50 and 150 ms,
+ * Android's for this chip about 40 and 110 (the one length mac80211 hands over sets both alike).
  */
 static int
 station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, bool quiet, const struct hk_sta_scan *what)
@@ -1520,31 +1559,54 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 	if (what != NULL && what->dwell_ms != 0) {
 		request->req.duration = what->dwell_ms;
 	}
-	radio->scan = 1;
 	radio->frames = radio->others = radio->heard_count = radio->heard_lost = 0;
 	began = lx_os_nanoseconds();
-	mutex_lock(&hw->wiphy->mtx);
-	ret = radio->ops->hw_scan(hw, radio->vif, request);
-	mutex_unlock(&hw->wiphy->mtx);
-	printf("lx: THE DRIVER IS ASKED TO SCAN %d channels, %s: %d\n", request->req.n_channels, quiet ? "listening only" :
-	    name_length != 0 ? "asking for one network by name where it may send" : "asking for any network where it may send", ret);
-	if (ret == 0) {
-		lx_os_lock();
-		while (radio->scan == 1 && lx_os_nanoseconds() - began < 40000000000ull) {
-			lx_os_sleep(&radio->scan, 100 * 1000000ull);
+	{
+		unsigned active_ms = lx_os_option("wifi_dwell_active"), passive_ms = lx_os_option("wifi_dwell_passive");
+		struct ieee80211_channel *sends[96], *listens[96];
+		unsigned nsends = 0, nlistens = 0, all = request->req.n_channels;
+
+		if (lx_os_option("wifi_dwell")) {     /* (wifi_dwell=1: Android's 40 and 110, unless named one by one) */
+			active_ms = active_ms != 0 ? active_ms : 40;
+			passive_ms = passive_ms != 0 ? passive_ms : 110;
 		}
-		lx_os_unlock();
-		printf("lx: %llu ms later the scan is %s\n", (lx_os_nanoseconds() - began) / 1000000ull, radio->scan == 2 ? "OVER" :
-		    radio->scan == 3 ? "GIVEN UP by the driver" : "NOT OVER: the driver has not said so");
-		say_heard(radio);
-		if (radio->scan == 1 && radio->ops->cancel_hw_scan != NULL) {
-			mutex_lock(&hw->wiphy->mtx);
-			radio->ops->cancel_hw_scan(hw, radio->vif);
-			mutex_unlock(&hw->wiphy->mtx);
+		if (active_ms != 0 && passive_ms != 0 && !quiet && request->req.duration == 0 && all <= 96) {
+			static unsigned said;
+
+			for (unsigned i = 0; i < all; i++) {
+				if (request->req.channels[i]->flags & (IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR)) {
+					listens[nlistens++] = request->req.channels[i];
+				} else {
+					sends[nsends++] = request->req.channels[i];
+				}
+			}
+			ret = 0;
+			for (unsigned part = 0; part < 2 && ret == 0; part++) {
+				unsigned n = part == 0 ? nsends : nlistens;
+				unsigned long long part_began = lx_os_nanoseconds();
+
+				if (n == 0) {
+					continue;
+				}
+				memcpy(request->req.channels, part == 0 ? sends : listens, n * sizeof(request->req.channels[0]));
+				request->req.n_channels = n;
+				request->req.duration = (u16)(part == 0 ? active_ms : passive_ms);
+				ret = station_scan_part(radio, request, name, name_length, quiet);
+				if (said < 48) {
+					said++;
+					lx_tell("lx: a scan's part: %u channels where it %s, %u ms on each: %d, %u access points heard so far, in %llu ms\n",
+					    n, part == 0 ? "may send" : "only listens", part == 0 ? active_ms : passive_ms, ret, radio->heard_count,
+					    (lx_os_nanoseconds() - part_began) / 1000000ull);
+				}
+			}
+		} else {
+			ret = station_scan_part(radio, request, name, name_length, quiet);
 		}
 	}
+	say_heard(radio);
+	(void)began;
 	kfree(request);
-	return (ret != 0 ? -ret : radio->scan == 2 ? 0 : ETIMEDOUT);
+	return (ret);
 }
 
 /* An interface, a scan that only listens, and down again: what the radio hears is said. 0, or an errno. */

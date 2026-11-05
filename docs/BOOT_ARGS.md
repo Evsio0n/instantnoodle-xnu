@@ -5,6 +5,8 @@ Boot-args are given on the kernel command line: `XL_CMDLINE="..." ./xl run`, the
 `PE_parse_boot_argn()`; user space reads `sysctl kern.bootargs`. This page is **generated from the source** (202 kernel
 names via `PE_parse_boot_argn`/`PE_parse_boot_arg_str`, plus the userland ones) and annotated by hand; names marked
 "see the header comment" are diagnostic or tuning knobs whose only documentation is the comment at the top of the named file.
+**The OnePlus 8's own defaults (2026-11-05, pexpert/arm/pe_bootargs.c, kernels from cam-5440d572):** `wifi=1 wifi_bdf_native=1 adsp=1 sound=4 sound_amps=1 haptic=5 cam=5 cam_after=10` are added to the kernel's boot line unless that name is given, so `wifi=0` and the like are off; `kern.bootargs` shows them. board=instantnoodle only.
+
 **When you add a boot-arg, add it here** (see [../AGENTS.md](../AGENTS.md)). Regenerate the name list with:
 
 ```sh
@@ -263,6 +265,8 @@ See [subsystems/bluetooth.md](subsystems/bluetooth.md) for tested scope and firm
 | `sound_below` | Amplifier level in eighths of a dB under Android max (default 240; profile 96). |
 | `sound_gain` | Gain before the guard (default/max 96). |
 | `sound_guard_as` | Test: guard reckons amps N under. |
+| `sound_periods` | Periods queued at the DSP, 2 to 8 (default 8). Measuring; only the default has been listened to. |
+| `sound_period_frames` | Frames in a period, 120 to 1024 (default 480, 10 ms). Measuring. |
 | `sound_park` | 0: do not park the audio path when idle. |
 | `sound_pause` | Bring-up step pause (ms). |
 | `sound_secs` | Seconds for sound=1..3. |
@@ -278,6 +282,12 @@ See [subsystems/bluetooth.md](subsystems/bluetooth.md) for tested scope and firm
 | Boot-arg | Meaning |
 |---|---|
 | `speaker_probe` | 1 pins, 2 amplifier IDs, 3 amplifiers set up alone. |
+
+### `bsd/dev/hk_hbm.c`
+
+| Boot-arg | Meaning |
+|---|---|
+| `hbm` | 1: the panel's high brightness mode may be asked for (`kern.hackios.hbm`: write N for a period of N s, 0 off; `power_test hbm N`). Default 0: never. Limits: 30 s a period, 60 s cooldown, 180 s in any 10 min; refused or ended at a battery of 38 C, a hottest zone of 60 C, a thermal pressure above nominal; always ended when the screen goes dark, iOS sets a brightness, and on the way to the loader or a panic. |
 
 ### `bsd/dev/hk_thermal.c`
 
@@ -479,6 +489,8 @@ See [subsystems/bluetooth.md](subsystems/bluetooth.md) for tested scope and firm
 | `ca_rates=1`, `ca_links=1` | `inject.c`, `inject_sb.c` | diagnostics: list rate methods / display links |
 | `cc_fade=MS` | `inject_sb.c` | check-only workaround: eased Control Center fade |
 | `sb_clock=N` | `inject_sb.c` | status-bar clock centred N points further right (OnePlus camera hole) |
+| `wifi_scan_keep=S` | `hk_sta.c` | a network heard in the last S seconds stays in the scan results wifid reads (default 120; 0: the last scan only) |
+| `wifi_dwell=1`, `wifi_dwell_active=A`, `wifi_dwell_passive=P` | `wifi/lx/src/lx_80211.c` | a scan as two driver scans: channels it may send on A ms each, DFS/no-IR ones P ms (wifi_dwell=1: 40/110; off: the driver's 50/150) |
 | `sb_delay=S` | `inject_sb.c` | SpringBoard start delay so apps register in a stable order (default 8 under `xl run`) |
 | `autounlock=0` | `inject_sb.c` | keep the lock screen (default: dismiss after 10 s) |
 | `siri_orb=0` | `inject_sb.c` | skip Siri orb shader prewarm (diagnostic) |
@@ -486,6 +498,7 @@ See [subsystems/bluetooth.md](subsystems/bluetooth.md) for tested scope and firm
 | `hkprof=1/2` | `hkprof.h` | userland sampling profiler (2: from process start) |
 | `gltrace*`, `glcensus`, `glshaders`, `glshow*`, `glskip`, `glplain`, `glwait`, `glcopy`, `glfetch`, `glgroup`, `vblur`, `glenv`, `glslow` | `eagl.c` | OpenGL ES debugging; see the header of `eagl.c` |
 | `metal_profile=1` | `hkmetal.m` | with `metal=2`: whole system on Metal; `metal_sync=1` fence per draw |
+| `metal_backend=vk` | `hkmetal.m` (`mesa_available`) | Metal over Vulkan: the driver opens `/hackios/lib/libvulkan_freedreno.dylib` (turnip with `tools/mesa/air/air_vk.c`) instead of `libhackiosair.dylib` (Gallium). The environment variable `HK_METAL_BACKEND=vk|gallium` wins over it, for test programs (`metal_drv_test --backend`). M3a only (TODO T38 (12)): draws with no resources |
 | `softpipe`, `llvmpipe` | `gl_osmesa.c` | Mesa software driver choice |
 | `root_apfs`, `var_store`, `var_data`, `var_data_format`, `var_save_every` | `init.c`, `var_store.c` | root and persistence (see storage.md) |
 | `exctrace=1 applog=1 applog_name=APP`, `systrace=1/2 systrace_name=NAME` | kernel `user_exception_trace.c` (`applog` is only mentioned in its comment) | trace failing syscalls / crashes (`usertrap:`, `userabort:` in the kernel log: on the OnePlus 8 read them from the logdump, the loader's live log missed them) |

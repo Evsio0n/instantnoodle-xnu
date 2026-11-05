@@ -222,6 +222,15 @@ way to the loader (backboardd sets level 0 at shutdown; the loader's menu stays 
   `brightness_fixes()` that skips it, but it is switched off because with it backboardd stopped adopting our touch
   service (see [input-peripherals.md](input-peripherals.md)).
 
+### High brightness mode (HBM, for HDR; 2026-11-04, built, not yet tried on the phone)
+
+The AMB655UV01's own commands from Android's device tree (both timings): on = `53 e0`, then `51 0f 60` and 34 ms; off =
+`53 20` and 16 ms, then iOS's brightness again; high-speed mode (`hk_display_hbm()` in `MiniIOMobileFramebuffer.cpp`).
+When and for how long is `bsd/dev/hk_hbm.c`'s, behind boot-arg `hbm=1` and its limits (BOOT_ARGS.md): nothing watches
+an OLED at its peak here but that file. The panel's tree gives `qcom,mdss-dsi-panel-peak-brightness` 4300000 (430
+nits), `hdr-enabled`, `blackness-level` 0x3ff, `bl-max-level` 0x7ff; the light in HBM is not measured. Asked for so far
+only by a test (`power_test hbm N`); iOS's EDR path is not wired to it (TODO T38 (17)).
+
 ## What iOS asks of the framebuffer (research notes)
 
 - Frame period comes from `IOMFBDisplayRefresh`, not `TimingElements` (above).

@@ -99,10 +99,12 @@
 
 #include "hk_drawable.h"
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <time.h>
 #include <unistd.h>
 
 /* The contract with Mesa's side, copied here rather than included: this file is built by
@@ -127,11 +129,21 @@ struct rwa_texture_shape {
 	unsigned pixel_format, type, width, height, depth;
 	unsigned array_length, mip_levels, sample_count, usage;
 };
+/* A view (M5b): the one call the contract grew for it, which the Gallium library has not got, so
+ * dlsym finds nothing there and a view is nil on that back end as it has always been. */
+struct rwa_texture_view_shape {
+	unsigned pixel_format, type;
+	unsigned base_level, level_count, base_slice, slice_count;
+	unsigned swizzle[4];
+};
 struct rwa_sampler_state {
 	unsigned address[3];
 	unsigned min_filter, mag_filter, mip_filter, compare_function, max_anisotropy;
 	unsigned normalized_coordinates;
 	float lod_min, lod_max;
+	/* MTLSamplerDescriptor.borderColor (M5b). Appended: the Gallium library reads the prefix
+	 * and its border is transparent black, which -newSamplerStateWithDescriptor: says. */
+	unsigned border_color;
 };
 struct rwa_bindings {
 	struct rwa_buffer *const *buffers;
@@ -205,6 +217,17 @@ struct rwa_color_blend {
 	unsigned source_alpha_blend_factor, destination_alpha_blend_factor;
 	unsigned write_mask;
 };
+struct rwa_function_constant {
+	unsigned index;
+	uint64_t bits;
+	uint64_t bits_hi;
+};
+struct rwa_function_constant_decl {
+	unsigned index;
+	unsigned required;
+	char type[24];
+	char name[72];
+};
 struct rwa_render_shape {
 	unsigned color_format[8];
 	unsigned color_count;
@@ -223,6 +246,13 @@ struct rwa_render_shape {
 	 * writeMask is All. */
 	struct rwa_color_blend color_blend[8];
 	unsigned color_blend_count;
+	/* M5c, appended: what MTLFunctionConstantValues said (air_metal.h) */
+	const struct rwa_function_constant *vertex_constants;
+	const struct rwa_function_constant *fragment_constants;
+	unsigned vertex_constant_count;
+	unsigned fragment_constant_count;
+	unsigned vertex_constants_given;
+	unsigned fragment_constants_given;
 };
 struct rwa_render_info {
 	unsigned vertex_buffers, fragment_buffers, fragment_textures, fragment_samplers;
@@ -309,6 +339,23 @@ struct rwa_draw {
 	unsigned vertex_buffer_table_count;
 	const struct rwa_buffer_bind *fragment_buffer_table;
 	unsigned fragment_buffer_table_count;
+	/* the encoder's own state (M5a, air_metal.h): the Vulkan library honours these, the
+	 * Gallium library was built against the shorter struct and reads none of them, so
+	 * what it draws does not change. Metal's own numbers; zero or NULL is Metal's default. */
+	const float *blend_color;
+	unsigned cull_mode;
+	unsigned front_winding;
+	const float *viewport;
+	const unsigned *scissor;
+	const float (*color_clears)[4];
+	unsigned color_clear_mask;
+	/* where in each attachment (M5b, air_metal.h): Metal's level, and its slice or depth plane,
+	 * which the type tells apart. Appended, and read by the Vulkan library alone: the Gallium
+	 * one renders level 0, slice 0, and this file says so once when asked for another. */
+	const unsigned *color_level;
+	const unsigned *color_slice;
+	unsigned depth_level;
+	unsigned depth_slice;
 };
 
 /*
@@ -418,7 +465,7 @@ _Static_assert((int)MTLColorWriteMaskNone == 0 && (int)MTLColorWriteMaskAlpha ==
  * the failure that is invisible.
  */
 _Static_assert(sizeof(struct rwa_color_blend) == 32 &&
-		   sizeof(struct rwa_render_shape) == 1052 &&
+		   sizeof(struct rwa_render_shape) == 1088 &&
 		   offsetof(struct rwa_render_shape, vertex_attribute) == 48 &&
 		   offsetof(struct rwa_render_shape, vertex_layout) == 420 &&
 		   offsetof(struct rwa_render_shape, color_blend) == 792 &&
@@ -473,6 +520,9 @@ rw_print(const char *fmt, ...)
 	fflush(stdout);
 }
 
+static void hk_serve_function_constants(void);   /* M5c: FUNCTION CONSTANTS, below */
+static void hk_say_traps(void);                  /* M5d, below */
+
 static struct {
 	void *handle;
 	struct rwa_device *(*device_open)(char *, size_t);
@@ -495,6 +545,18 @@ static struct {
 	int (*depth_read)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
 			  const unsigned[3], float *, uint8_t *, char *, size_t);
 	void (*texture_destroy)(struct rwa_texture *);
+	struct rwa_texture *(*texture_view_create)(struct rwa_texture *,
+						   const struct rwa_texture_view_shape *, char *,
+						   size_t);
+	/* M5c: a library without these has no specialized function (FUNCTION CONSTANTS) */
+	int (*module_function_constants)(struct rwa_device *, const void *, size_t,
+					 struct rwa_function_constant_decl *, unsigned, unsigned *,
+					 char *, size_t);
+	struct rwa_compute *(*compute_create_constants)(struct rwa_device *, const void *, size_t,
+							const char *,
+							const struct rwa_function_constant *,
+							unsigned, struct rwa_compute_info *, char *,
+							size_t);
 	struct rwa_sampler *(*sampler_create)(struct rwa_device *,
 					      const struct rwa_sampler_state *, char *, size_t);
 	void (*sampler_destroy)(struct rwa_sampler *);
@@ -552,6 +614,11 @@ static struct {
 
 /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
  * no library worth loading, and the device object still has to exist. */
+/* Which of the two libraries mesa_available chose. It decides one thing in this file, what is
+ * said about a viewport's rectangle: the Vulkan library honours it (M5a) and Gallium's draws the
+ * whole attachment, and says so as it always has. */
+static bool mesa_is_vulkan;
+
 static bool
 mesa_available(void)
 {
@@ -561,7 +628,45 @@ mesa_available(void)
 		return mesa.handle != NULL;
 	}
 	tried = true;
-	mesa.handle = dlopen("/hackios/lib/libhackiosair.dylib", RTLD_NOW);
+	/*
+	 * WHICH LIBRARY: the contract (tools/mesa/air/air_metal.h) has two implementations
+	 * with the same rwa_* names -- libhackiosair.dylib over freedreno's Gallium driver,
+	 * and libvulkan_freedreno.dylib, Mesa's Vulkan driver with tools/mesa/air/air_vk.c
+	 * linked into it (Metal over Vulkan, milestone M3a). The boot-arg metal_backend=vk
+	 * picks the second for the whole boot. HK_METAL_BACKEND=vk|gallium in the environment
+	 * wins over the boot-arg, and is for test programs: one boot can then run the same
+	 * test once per back end (metal_drv_test --backend sets it before it makes a device).
+	 * Anything else in the variable is said and ignored, rather than read as one of them.
+	 */
+	char bootargs[1024] = "";
+	size_t bootargs_size = sizeof(bootargs) - 1;
+	const char *env = getenv("HK_METAL_BACKEND");
+	bool vk;
+	const char *chosen_by;
+
+	if (env != NULL && strcmp(env, "vk") == 0) {
+		vk = true;
+		chosen_by = "HK_METAL_BACKEND=vk";
+	} else if (env != NULL && strcmp(env, "gallium") == 0) {
+		vk = false;
+		chosen_by = "HK_METAL_BACKEND=gallium";
+	} else {
+		if (env != NULL && *env != '\0') {
+			rw_print("HK_METAL_BACKEND=%s is neither vk nor gallium, so the boot-args "
+			         "decide\n", env);
+		}
+		vk = sysctlbyname("kern.bootargs", bootargs, &bootargs_size, NULL, 0) == 0 &&
+		     strstr(bootargs, "metal_backend=vk") != NULL;
+		chosen_by = vk ? "the boot-arg metal_backend=vk" : "the default";
+	}
+	const char *library = vk ? "/hackios/lib/libvulkan_freedreno.dylib"
+	                         : "/hackios/lib/libhackiosair.dylib";
+
+	mesa_is_vulkan = vk;
+
+	rw_print("the compiler library is %s (%s, by %s)\n", library,
+	         vk ? "Metal over Vulkan" : "Metal over Gallium", chosen_by);
+	mesa.handle = dlopen(library, RTLD_NOW);
 	if (mesa.handle == NULL) {
 		rw_print("no compiler library: %s\n", dlerror());
 		return false;
@@ -623,6 +728,13 @@ mesa_available(void)
 	*(void **)&mesa.clear_color = dlsym(mesa.handle, "rwa_clear_color");
 	*(void **)&mesa.clear_depth_stencil = dlsym(mesa.handle, "rwa_clear_depth_stencil");
 	*(void **)&mesa.resolve_texture = dlsym(mesa.handle, "rwa_resolve_texture");
+	/* not among what makes a library usable: a library without it has no views (M5b) */
+	*(void **)&mesa.texture_view_create = dlsym(mesa.handle, "rwa_texture_view_create");
+	/* and without these it has no specialized function, and Metal's own answer stands (M5c) */
+	*(void **)&mesa.module_function_constants =
+	    dlsym(mesa.handle, "rwa_module_function_constants");
+	*(void **)&mesa.compute_create_constants =
+	    dlsym(mesa.handle, "rwa_compute_create_constants");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -635,7 +747,114 @@ mesa_available(void)
 		mesa.handle = NULL;
 		return false;
 	}
+	/* A drawable's import (src/hkdrawable.m) is looked up in THIS library, the one the
+	 * device is made with: both libraries export rwa_texture_from_surface (Metal over
+	 * Vulkan has it since M3e). On Gallium it is the handle hkdrawable.m found by itself
+	 * before, so nothing there changes. */
+	rwd_use_library(mesa.handle);
+	hk_say_traps();
+	if (mesa.module_function_constants != NULL && mesa.compute_create_constants != NULL) {
+		hk_serve_function_constants();
+	}
 	return true;
+}
+
+/*
+ * A process that dies of a brk in Swift or in RenderBox leaves nothing but launchd's "exited due to SIGTRAP"
+ * in a live log (chronod, run 142910, 27 lives). So where it was, in this process's images, and then
+ * the same death. Only the stack of frame pointers: this runs in a signal handler.
+ */
+static void
+hk_trap_handler(int number, siginfo_t *info, void *context)
+{
+	const ucontext_t *uc = context;
+	uint64_t pc = uc->uc_mcontext->__ss.__pc, fp = uc->uc_mcontext->__ss.__fp;
+	Dl_info where;
+
+	(void)info;
+	for (unsigned i = 0; i < 16; i++) {
+		if (dladdr((const void *)pc, &where) && where.dli_fname != NULL) {
+			const char *leaf = strrchr(where.dli_fname, '/');
+
+			fprintf(stderr, "hk-trap[%s %d]: signal %d #%u %s+%#llx %s\n", getprogname(), getpid(), number, i,
+				leaf != NULL ? leaf + 1 : where.dli_fname,
+				(unsigned long long)(pc - (uint64_t)where.dli_fbase),
+				where.dli_sname != NULL ? where.dli_sname : "");
+		}
+		if (fp == 0 || (fp & 7) != 0) {
+			break;
+		}
+		pc = ((const uint64_t *)fp)[1] & 0x0000000fffffffffull;
+		fp = ((const uint64_t *)fp)[0];
+	}
+	signal(number, SIG_DFL);
+	raise(number);
+}
+
+/*
+ * Every thread of this process, some seconds on: what a process that has stopped getting on with something
+ * is waiting for. Only with /hackios/share/probes/sample in the root; it only reads.
+ */
+extern kern_return_t task_threads(task_t, thread_act_array_t *, mach_msg_type_number_t *);
+extern kern_return_t thread_get_state(thread_act_t, thread_state_flavor_t, thread_state_t,
+				      mach_msg_type_number_t *);
+
+static void
+hk_sample_threads(void)
+{
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t count = 0;
+
+	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		return;
+	}
+	for (mach_msg_type_number_t t = 0; t < count; t++) {
+		arm_thread_state64_t state;
+		mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+		char line[1500];
+		size_t at = 0;
+
+		if (threads[t] == mach_thread_self() ||
+		    thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &n) != KERN_SUCCESS) {
+			continue;
+		}
+		uint64_t pc = __darwin_arm_thread_state64_get_pc(state) & 0x0000000fffffffffull;
+		uint64_t fp = __darwin_arm_thread_state64_get_fp(state);
+
+		for (unsigned i = 0; i < 24 && at + 80 < sizeof(line); i++) {
+			Dl_info where;
+
+			if (dladdr((const void *)pc, &where) && where.dli_fname != NULL) {
+				const char *leaf = strrchr(where.dli_fname, '/');
+
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " %s:%s",
+						       leaf != NULL ? leaf + 1 : where.dli_fname,
+						       where.dli_sname != NULL ? where.dli_sname : "?");
+			}
+			if (fp == 0 || (fp & 7) != 0 || fp < 0x100000000ull) {
+				break;
+			}
+			pc = ((const uint64_t *)fp)[1] & 0x0000000fffffffffull;
+			fp = ((const uint64_t *)fp)[0];
+		}
+		fprintf(stderr, "hk-sample[%s] #%u%s\n", getprogname(), t, line);
+	}
+}
+
+static void
+hk_say_traps(void)
+{
+	struct sigaction action = { 0 };
+
+	action.sa_sigaction = hk_trap_handler;
+	action.sa_flags = SA_SIGINFO;
+	sigaction(SIGTRAP, &action, NULL);
+	if (access("/hackios/share/probes/sample", F_OK) == 0 && strcmp(getprogname(), "SpringBoard") == 0) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 45 * NSEC_PER_SEC),
+			       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+			hk_sample_threads();
+		});
+	}
 }
 
 /*
@@ -1059,6 +1278,144 @@ struct gem_close { uint32_t handle, pad; };
 - (unsigned)vertexElementAttribute:(unsigned)index;
 @end
 
+/*
+ * WHAT A 16-BIT TEXTURE ASKS FOR (M5b), for a later short metal=2 boot on Gallium to read.
+ *
+ * The Gallium library's table for MTLPixelFormat 40-43 is the mirror of real Metal's, red and blue
+ * exchanged, and that mirror is what makes the wallpaper blue through Apple's compositor. Real
+ * Metal, on an M1 Max and not A11, has the first-named channel in the low bits, and the Vulkan
+ * library now does too (tools/mesa/air/tex_model.h). The picture does not show who did the
+ * exchange: a B,G,R,A swizzle on the compositor's texture or view would look exactly like it, and
+ * this file ignored every swizzle until this build. That is a hypothesis, unverified, and this line
+ * is what can test it: one per distinct (format, route, swizzle, fourcc, usage), at most 32, so a
+ * later texture that asks differently is not hidden by the first. Routes: "descriptor"
+ * (-newTextureWithDescriptor:), "iosurface" (-newTextureWithDescriptor:iosurface:plane:) and "view"
+ * (the three view calls, whose descriptor column is the parent's swizzle).
+ *
+ * WHAT THIS BUILD MAY DO TO THE PICTURE ON VK, because its table and its swizzles have both moved. It
+ * could exchange red and blue twice if the compositor does swizzle and the bytes it reads were
+ * written for a reading that already has the exchange in it: the swizzle goes through on this
+ * library's "descriptor" and "view" routes, and the table no longer mirrors. And it could exchange
+ * them once where Gallium does not, drawing the (255, 12, 12) wallpaper, if the compositor asks for
+ * no swizzle at all, or asks on the "iosurface" route (the drawable's own path, which only this line
+ * will show matters; that route honours one too since the build after run 112410). So a picture on vk
+ * of formats 40-43 is a question for this line and not yet a result.
+ */
+/*
+ * WHAT A SYSTEM PIPELINE WAS GIVEN (M5d), for reading a picture that is wrong: the fragment constants
+ * of each CoreAnimation specification once, the ones that are not zero, which is what air2nir
+ * --constants needs to show what that specification compiled to; and each pipeline's first draws
+ * with what was bound, and any draw that samples something the size of the screen.
+ */
+static bool
+hk_tracing(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		on = access("/hackios/share/probes/metal_trace", F_OK) == 0;
+	}
+	return on != 0;
+}
+
+/*
+ * (WHAT A FRAME PUT WHERE) the file frame_dump, for the window server only: one frame in every 300 committed, each draw
+ * with where its vertices are, its scissor, and for each texture its surface. Says why a part of a page is not on the
+ * screen, which no count of frames can.
+ */
+static bool
+hk_frame_dumping(void)
+{
+	static int answer = -1;
+
+	if (answer < 0) {
+		answer = access("/hackios/share/probes/frame_dump", F_OK) == 0 && strcmp(getprogname(), "backboardd") == 0;
+	}
+	return answer != 0;
+}
+
+static void
+hk_note_pipeline_constants(id descriptor, const struct rwa_function_constant *constants, unsigned count)
+{
+	NSString *label = [descriptor label];
+
+	if (!hk_tracing() || constants == NULL || label == nil || ![label hasPrefix:@"com.apple.coreanimation"]) {
+		return;
+	}
+	char line[900];
+	size_t at = (size_t)snprintf(line, sizeof(line), "spec %s %s:", [[label substringFromIndex:29] UTF8String],
+				     [[[descriptor fragmentFunction] name] UTF8String]);
+
+	for (unsigned i = 0; i < count && at + 32 < sizeof(line); i++) {
+		if (constants[i].bits != 0 || constants[i].bits_hi != 0) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " %u=%llx", constants[i].index,
+					       (unsigned long long)constants[i].bits);
+		}
+	}
+	rw_print("%s\n", line);
+}
+
+static void
+hk_note_packed16(const char *route, unsigned format, unsigned usage,
+		 MTLTextureSwizzleChannels descriptor, const MTLTextureSwizzleChannels *view,
+		 void *surface)
+{
+	static struct {
+		unsigned format, usage;
+		uint32_t fourcc, swizzles;
+		const char *route;
+	} seen[32];
+	static unsigned count;
+
+	if (format < 40 || format > 43) {
+		return;
+	}
+	uint32_t fourcc = 0;
+
+	if (surface != NULL) {
+		uint32_t (*pixel_format)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetPixelFormat");
+
+		fourcc = pixel_format != NULL ? pixel_format(surface) : 0;
+	}
+	const uint32_t swizzles = (uint32_t)descriptor.red | (uint32_t)descriptor.green << 3 |
+				  (uint32_t)descriptor.blue << 6 | (uint32_t)descriptor.alpha << 9 |
+				  (view != NULL ? (uint32_t)view->red << 12 | (uint32_t)view->green << 15 |
+						      (uint32_t)view->blue << 18 |
+						      (uint32_t)view->alpha << 21 | 1u << 24 : 0);
+
+	@synchronized([NSObject class]) {
+		for (unsigned i = 0; i < count; i++) {
+			if (seen[i].format == format && seen[i].usage == usage &&
+			    seen[i].fourcc == fourcc && seen[i].swizzles == swizzles &&
+			    seen[i].route == route) {
+				return;
+			}
+		}
+		if (count == sizeof(seen) / sizeof(seen[0])) {
+			return;
+		}
+		seen[count].format = format;
+		seen[count].usage = usage;
+		seen[count].fourcc = fourcc;
+		seen[count].swizzles = swizzles;
+		seen[count].route = route;
+		count++;
+	}
+	char v[32] = "none", f[16] = "none";
+
+	if (view != NULL) {
+		snprintf(v, sizeof(v), "%u %u %u %u", view->red, view->green, view->blue, view->alpha);
+	}
+	if (fourcc != 0) {
+		snprintf(f, sizeof(f), "%c%c%c%c", (char)(fourcc >> 24), (char)(fourcc >> 16),
+			 (char)(fourcc >> 8), (char)fourcc);
+	}
+	rw_print("packed16: format %u route %s descriptor-swizzle %u %u %u %u view-swizzle %s "
+		 "surface-fourcc %s usage 0x%x (MTLTextureSwizzle: 0 zero, 1 one, 2 r, 3 g, 4 b, 5 a)\n",
+		 format, route, descriptor.red, descriptor.green, descriptor.blue, descriptor.alpha, v,
+		 f, usage);
+}
+
 @class HKMetalEvent;
 @interface HKMetalWork : NSObject {
 @public
@@ -1068,6 +1425,9 @@ struct gem_close { uint32_t handle, pad; };
 	unsigned colorCount;
 	float clearColor[4];
 	BOOL clears;
+	/* M5b: the level, and the slice or depth plane, each attachment is rendered at */
+	unsigned colorLevel[8], colorSlice[8];
+	unsigned depthLevel, depthSlice;
 	/* the depth/stencil attachment of the pass, its two load actions and the state
 	 * bound when the draw was encoded. Separate flags per aspect because Metal keeps
 	 * two attachment descriptors over one texture and a pass that clears the depth and
@@ -1080,6 +1440,19 @@ struct gem_close { uint32_t handle, pad; };
 	unsigned stencilReference[2];
 	float depthRange[2];
 	BOOL hasDepthRange;
+	/* the encoder's own state, as it stood when this draw was encoded (M5a, air_metal.h):
+	 * the blend colour, the face of a triangle, the rectangles and each attachment's own
+	 * clear, which the library takes from here where it can (the Vulkan one) and which
+	 * Gallium's never looks at. */
+	float blendColor[4];
+	BOOL hasBlendColor;
+	unsigned cullMode, frontWinding;
+	float viewportRect[4];
+	BOOL hasViewportRect;
+	unsigned scissorRect[4];
+	BOOL hasScissorRect;
+	float attachmentClears[8][4];
+	unsigned attachmentClearMask;
 	unsigned primitive, vertexStart, vertexCount;
 	/* the index buffer of an indexed draw and the three numbers that come with it in
 	 * the same Metal call; indexBuffer nil is -drawPrimitives:, and then vertexCount
@@ -1154,7 +1527,26 @@ enum {
 	struct rwa_texture *_texture;
 	struct rwa_texture_shape _shape;
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
+	/* M5b, a view: what it is a view of, retained as Metal's is, where in it, and its swizzle */
+	id _parent;
+	NSUInteger _parentLevel, _parentSlice;
+	MTLTextureSwizzleChannels _swizzle;
+	/* M5e, a copy of a surface (hkFollowSurface): the surface, what it added up to, and when it was last looked at */
+	void *_followed;
+	uint64_t _followedSum, _followedLooked;
+	BOOL _followedInPlace;   /* (frame_dump: the surface is only remembered, the GPU has its memory itself) */
 }
+/* M5e: this texture is a copy of plane 0 of that surface from now on; and the look that keeps it one */
+- (void)hkFollow:(void *)surface;
+- (void)hkFollowSurface;
+/* frame_dump: remember the surface of a texture over it; and what is known of either kind, for a line */
+- (void)hkRememberSurface:(void *)surface;
+- (size_t)hkDescribeSurface:(char *)out size:(size_t)size;
+/* M5b: the slices Metal counts in this texture, a cube's six in them; and one level and one slice
+ * of it as a texture of its own, or nil on a library without views: how a pass's clear and resolve,
+ * whose calls take no level, say which (air_metal.h). A depth plane is a slice of a 3D texture. */
+- (NSUInteger)hkSlices;
+- (id)hkWindowLevel:(NSUInteger)level slice:(NSUInteger)slice;
 @property (readonly) struct rwa_texture *mesaTexture;
 /* Not part of MTLTexture: the depth or stencil aspect of this texture, one float and one
  * byte per texel. Metal's own -getBytes: has no aspect to name and the compiler library
@@ -1274,6 +1666,372 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 	    MAX([d sampleCount], 1) * rw_format_bytes([d pixelFormat]);
 
 	return [d mipmapLevelCount] > 1 ? bytes + bytes / 3 : bytes;       /* (a full chain is a third more) */
+}
+
+/*
+ * FUNCTION CONSTANTS (M5c).
+ *
+ * -[MTLLibrary newFunctionWithName:constantValues:error:] and its three siblings run inside Metal's
+ * own classes and through -[_MTLDevice compiler], which is nil here, so they answer nil, and most
+ * applications ask them for every pipeline. Metal's classes are the ones an application holds, so
+ * the methods are replaced on the classes when a library that can serve them is loaded:
+ *
+ *   MTLFunctionConstantValues  each setter still does what it did, and what it was told is kept
+ *                              beside it, because nothing public reads it back. +alloc answers an
+ *                              instance of MTLFunctionConstantValuesInternal, which has its own
+ *                              setters, so those are the ones replaced (run 125308: on the public
+ *                              class nothing was told anything, and every constant of every
+ *                              specialized function read as not defined). A copy keeps what the
+ *                              original was told.
+ *   _MTLLibrary                the four that make a specialized function make one of ours.
+ *
+ * WHY A PROXY. -newFunctionWithName: answers the SAME object every time (measured on real Metal, on
+ * an M1: two calls, one pointer), so values kept on it would be the last specialization's for every
+ * pipeline made from it. HKSpecializedFunction is that object as far as anyone can tell, with the
+ * values beside it; hk_function_constants is the one reader. A function nothing specialized has no
+ * values and takes every constant as defined and zero, as every pipeline did until this.
+ *
+ * Unset and not defined: real Metal makes the function when a value is left out, on the M1, so
+ * this does too, and the constant reads as not defined.
+ */
+@interface HKSpecializedFunction : NSProxy {
+@public
+	id _function;
+	NSData *_constants;   /* struct rwa_function_constant, however many */
+}
+@end
+
+@implementation HKSpecializedFunction
+- (id)forwardingTargetForSelector:(SEL)selector { (void)selector; return _function; }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector
+{
+	return [_function methodSignatureForSelector:selector];
+}
+- (void)forwardInvocation:(NSInvocation *)invocation { [invocation invokeWithTarget:_function]; }
+- (BOOL)isKindOfClass:(Class)c { return [_function isKindOfClass:c]; }
+- (BOOL)isMemberOfClass:(Class)c { return [_function isMemberOfClass:c]; }
+- (BOOL)conformsToProtocol:(Protocol *)p { return [_function conformsToProtocol:p]; }
+- (BOOL)respondsToSelector:(SEL)selector { return [_function respondsToSelector:selector]; }
+- (NSString *)description { return [_function description]; }
+- (void)dealloc
+{
+	[_function release];
+	[_constants release];
+	[super dealloc];
+}
+@end
+
+/* What a function was specialized with, or NULL with *given 0 for one nothing specialized. */
+static const struct rwa_function_constant *
+hk_function_constants(id function, unsigned *count, unsigned *given)
+{
+	*count = 0;
+	*given = 0;
+	if (function == nil || object_getClass(function) != [HKSpecializedFunction class]) {
+		return NULL;
+	}
+	NSData *constants = ((HKSpecializedFunction *)function)->_constants;
+
+	*given = 1;
+	*count = (unsigned)([constants length] / sizeof(struct rwa_function_constant));
+	return [constants bytes];
+}
+
+static char hk_constant_values_key;
+
+/* MTLDataType's numbers, public and stable: the first of each run of one to four components. */
+static bool
+hk_constant_type(NSUInteger type, unsigned *bytes, unsigned *stride)
+{
+	static const struct { unsigned first, element; } runs[] = {
+		{ 3, 4 } /* float */, { 16, 2 } /* half */, { 29, 4 } /* int */, { 33, 4 } /* uint */,
+		{ 37, 2 } /* short */, { 41, 2 } /* ushort */, { 45, 1 } /* char */,
+		{ 49, 1 } /* uchar */, { 53, 1 } /* bool */, { 81, 8 } /* long */, { 85, 8 } /* ulong */,
+	};
+	for (unsigned i = 0; i < sizeof(runs) / sizeof(runs[0]); i++) {
+		if (type >= runs[i].first && type < runs[i].first + 4) {
+			unsigned comps = (unsigned)type - runs[i].first + 1;
+
+			*bytes = comps * runs[i].element;
+			*stride = (comps == 3 ? 4 : comps) * runs[i].element;
+			return *bytes <= 16;
+		}
+	}
+	return false;
+}
+
+static void
+hk_constant_told(id values, id key, const void *value, unsigned bytes)
+{
+	NSMutableDictionary *told = objc_getAssociatedObject(values, &hk_constant_values_key);
+
+	if (told == nil) {
+		told = [[NSMutableDictionary alloc] init];
+		objc_setAssociatedObject(values, &hk_constant_values_key, told,
+					 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+		[told release];
+	}
+	[told setObject:[NSData dataWithBytes:value length:bytes] forKey:key];
+}
+
+static void (*hk_real_set_at_index)(id, SEL, const void *, NSUInteger, NSUInteger);
+static void (*hk_real_set_with_name)(id, SEL, const void *, NSUInteger, id);
+static void (*hk_real_set_range)(id, SEL, const void *, NSUInteger, NSRange);
+static void (*hk_real_reset)(id, SEL);
+
+static void
+hk_set_at_index(id self, SEL cmd, const void *value, NSUInteger type, NSUInteger index)
+{
+	unsigned bytes, stride;
+
+	hk_real_set_at_index(self, cmd, value, type, index);
+	if (hk_constant_type(type, &bytes, &stride)) {
+		hk_constant_told(self, @(index), value, bytes);
+	} else {
+		RW_ONCE("a function constant of MTLDataType %lu, which this driver has no size for\n",
+			(unsigned long)type);
+	}
+}
+
+static void
+hk_set_with_name(id self, SEL cmd, const void *value, NSUInteger type, id name)
+{
+	unsigned bytes, stride;
+
+	hk_real_set_with_name(self, cmd, value, type, name);
+	if (hk_constant_type(type, &bytes, &stride)) {
+		hk_constant_told(self, name, value, bytes);
+	} else {
+		RW_ONCE("a function constant of MTLDataType %lu, which this driver has no size for\n",
+			(unsigned long)type);
+	}
+}
+
+static void
+hk_set_range(id self, SEL cmd, const void *values, NSUInteger type, NSRange range)
+{
+	unsigned bytes, stride;
+
+	hk_real_set_range(self, cmd, values, type, range);
+	if (hk_constant_type(type, &bytes, &stride)) {
+		for (NSUInteger i = 0; i < range.length; i++) {
+			hk_constant_told(self, @(range.location + i),
+					 (const char *)values + i * stride, bytes);
+		}
+	}
+}
+
+static void
+hk_values_reset(id self, SEL cmd)
+{
+	hk_real_reset(self, cmd);
+	objc_setAssociatedObject(self, &hk_constant_values_key, nil,
+				 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static id (*hk_real_values_copy)(id, SEL, void *);
+
+static id
+hk_values_copy(id self, SEL cmd, void *zone)
+{
+	id made = hk_real_values_copy(self, cmd, zone);
+	NSDictionary *told = objc_getAssociatedObject(self, &hk_constant_values_key);
+
+	if (made != nil && told != nil) {
+		NSMutableDictionary *kept = [told mutableCopy];
+
+		objc_setAssociatedObject(made, &hk_constant_values_key, kept,
+					 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+		[kept release];
+	}
+	return made;
+}
+
+/* One specialization: the function, and the values the module declares a place for. */
+static id
+hk_specialize(id library, id name, id values, NSError **error)
+{
+	/*
+	 * VideoToolbox's Metal scaler, served (M5e). It was declined for some hours (M5d) because the wallpaper stayed
+	 * black when it succeeded: its pipeline took 2-3 s to make, and the poster extension that decodes the wallpaper is
+	 * killed by launchd at 5 s for hanging on launch. The file vt_decline answers nil again, for a comparison.
+	 */
+	if ([name isEqualToString:@"VTMTSComputeFunction"] && access("/hackios/share/probes/vt_decline", F_OK) == 0) {
+		if (error != NULL) {
+			*error = [NSError errorWithDomain:@"MTLLibraryErrorDomain" code:3 userInfo:@{
+				NSLocalizedDescriptionKey: @"VideoToolbox's scaler is declined here" }];
+		}
+		return nil;
+	}
+	id function = [library newFunctionWithName:name];
+
+	if (function == nil) {
+		if (error != NULL) {
+			*error = [NSError errorWithDomain:@"MTLLibraryErrorDomain" code:5 /* FunctionNotFound */
+						 userInfo:@{ NSLocalizedDescriptionKey:
+							     [NSString stringWithFormat:@"no function named %@", name] }];
+		}
+		return nil;
+	}
+	NSDictionary *told = values != nil ? objc_getAssociatedObject(values, &hk_constant_values_key)
+					   : nil;
+	NSData *air = ((NSData *(*)(id, SEL))objc_msgSend)(function, sel_getUid("bitcodeData"));
+	/* VideoToolbox's VTMTSComputeFunction declares 202 (run 125612) */
+	enum { MOST_DECLS = 1024 };
+	struct rwa_function_constant_decl *decls = calloc(MOST_DECLS, sizeof(*decls));
+	unsigned declared = 0;
+	char why[256] = { 0 };
+
+	if (air == nil || decls == NULL ||
+	    mesa.module_function_constants(NULL, [air bytes], [air length], decls, MOST_DECLS,
+					   &declared, why, sizeof(why)) != 0) {
+		rw_print("the function constants of %s cannot be read: %s\n", [name UTF8String], why);
+		declared = 0;
+	}
+	NSMutableData *constants = [NSMutableData data];
+
+	for (unsigned i = 0; i < declared; i++) {
+		NSData *value = [told objectForKey:@(decls[i].index)];
+
+		if (value == nil) {
+			value = [told objectForKey:[NSString stringWithUTF8String:decls[i].name]];
+		}
+		if (value == nil) {
+			continue;   /* not defined: the header comment says what real Metal does */
+		}
+		struct rwa_function_constant c = { .index = decls[i].index };
+		uint64_t words[2] = { 0, 0 };
+
+		memcpy(words, [value bytes], MIN([value length], sizeof(words)));
+		c.bits = words[0];
+		c.bits_hi = words[1];
+		[constants appendBytes:&c length:sizeof(c)];
+	}
+	free(decls);
+	HKSpecializedFunction *made = [HKSpecializedFunction alloc];
+
+	made->_function = function;   /* -new..., which is +1 */
+	made->_constants = [constants retain];
+	return (id)made;
+}
+
+static id
+hk_new_function_values_error(id self, SEL cmd, id name, id values, NSError **error)
+{
+	(void)cmd;
+	return hk_specialize(self, name, values, error);
+}
+
+static void
+hk_new_function_values_handler(id self, SEL cmd, id name, id values, void (^handler)(id, NSError *))
+{
+	NSError *error = nil;
+	id made = hk_specialize(self, name, values, &error);
+
+	(void)cmd;
+	handler(made, error);
+	[made release];
+}
+
+static id
+hk_new_function_descriptor_error(id self, SEL cmd, id descriptor, NSError **error)
+{
+	(void)cmd;
+	return hk_specialize(self, [descriptor name], [descriptor constantValues], error);
+}
+
+static void
+hk_new_function_descriptor_handler(id self, SEL cmd, id descriptor, void (^handler)(id, NSError *))
+{
+	NSError *error = nil;
+	id made = hk_specialize(self, [descriptor name], [descriptor constantValues], &error);
+
+	(void)cmd;
+	handler(made, error);
+	[made release];
+}
+
+static void
+hk_replace(Class c, const char *selector, IMP with, void **real)
+{
+	Method m = c != Nil ? class_getInstanceMethod(c, sel_getUid(selector)) : NULL;
+
+	if (m == NULL) {
+		rw_print("function constants: %s has no %s\n", c != Nil ? class_getName(c) : "(no class)",
+			 selector);
+		return;
+	}
+	IMP was = method_setImplementation(m, with);
+
+	if (real != NULL) {
+		*real = (void *)was;
+	}
+}
+
+static void
+hk_serve_function_constants(void)
+{
+	static bool done;
+
+	if (done) {
+		return;
+	}
+	done = true;
+	Class values = objc_getClass("MTLFunctionConstantValuesInternal");
+	Class library = objc_getClass("_MTLLibrary");
+
+	if (values == Nil) {
+		values = objc_getClass("MTLFunctionConstantValues");
+	}
+
+	rw_print("function constants: what a specialized function was given is kept from %s\n",
+		 values != Nil ? class_getName(values) : "(no class)");
+	hk_replace(values, "setConstantValue:type:atIndex:", (IMP)hk_set_at_index,
+		   (void **)&hk_real_set_at_index);
+	hk_replace(values, "setConstantValue:type:withName:", (IMP)hk_set_with_name,
+		   (void **)&hk_real_set_with_name);
+	hk_replace(values, "setConstantValues:type:withRange:", (IMP)hk_set_range,
+		   (void **)&hk_real_set_range);
+	hk_replace(values, "reset", (IMP)hk_values_reset, (void **)&hk_real_reset);
+	hk_replace(values, "copyWithZone:", (IMP)hk_values_copy, (void **)&hk_real_values_copy);
+	hk_replace(library, "newFunctionWithName:constantValues:error:",
+		   (IMP)hk_new_function_values_error, NULL);
+	hk_replace(library, "newFunctionWithName:constantValues:completionHandler:",
+		   (IMP)hk_new_function_values_handler, NULL);
+	hk_replace(library, "newFunctionWithDescriptor:error:",
+		   (IMP)hk_new_function_descriptor_error, NULL);
+	hk_replace(library, "newFunctionWithDescriptor:completionHandler:",
+		   (IMP)hk_new_function_descriptor_handler, NULL);
+}
+
+/*
+ * MTLTextureDescriptor.swizzle (M5b). A swizzle is a view's business in the contract and every other
+ * thing about the texture is the texture's, so a descriptor that has one is a texture and a view of
+ * all of it, the view being what the application holds. The Gallium library has no views: it gets the
+ * texture as it always did, and says so. Both routes that take a descriptor come here,
+ * -newTextureWithDescriptor: and -newTextureWithDescriptor:iosurface:plane:.
+ */
+static id
+hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descriptor)
+{
+	MTLTextureSwizzleChannels sw = [descriptor swizzle];
+
+	if (made != nil && (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleGreen ||
+			    sw.blue != MTLTextureSwizzleBlue || sw.alpha != MTLTextureSwizzleAlpha)) {
+		id view = [made newTextureViewWithPixelFormat:(NSUInteger)[descriptor pixelFormat]
+						 textureType:(NSUInteger)[descriptor textureType]
+						      levels:NSMakeRange(0, [made mipmapLevelCount])
+						      slices:NSMakeRange(0, [made hkSlices])
+						     swizzle:sw];
+		if (view == nil) {
+			RW_ONCE("a texture descriptor asks for a swizzle and this compiler library "
+				"has no views: it reads unswizzled\n");
+			return made;
+		}
+		[made release];
+		return view;
+	}
+	return made;
 }
 
 @implementation HKMetalDevice
@@ -1643,6 +2401,39 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 		}
 	}
 
+	/* M5c: what each function was specialized with, if it was (FUNCTION CONSTANTS) */
+	shape.vertex_constants = hk_function_constants(vertex, &shape.vertex_constant_count,
+						       &shape.vertex_constants_given);
+	shape.fragment_constants = hk_function_constants(fragment, &shape.fragment_constant_count,
+							 &shape.fragment_constants_given);
+
+	hk_note_pipeline_constants(descriptor, shape.fragment_constants, shape.fragment_constant_count);
+	if (hk_tracing() && [[descriptor label] hasPrefix:@"com.apple.coreanimation"]) {
+		char line[500];
+		size_t at = (size_t)snprintf(line, sizeof(line), "layout %s:", [[[descriptor label] substringFromIndex:29] UTF8String]);
+
+		for (unsigned i = 0; i < 8 && at + 40 < sizeof(line); i++) {
+			if (shape.vertex_attribute[i].format != 0) {
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " a%u fmt %u +%u buf %u", i,
+						       shape.vertex_attribute[i].format, shape.vertex_attribute[i].offset,
+						       shape.vertex_attribute[i].buffer_index);
+			}
+		}
+		for (unsigned k = 0; k < 4 && at + 24 < sizeof(line); k++) {
+			if (shape.vertex_layout[k].stride != 0) {
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " stride[%u] %u", k, shape.vertex_layout[k].stride);
+			}
+		}
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " vertex constants:");
+		for (unsigned i = 0; i < shape.vertex_constant_count && at + 16 < sizeof(line); i++) {
+			if (shape.vertex_constants[i].bits != 0) {
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " %u=%llx", shape.vertex_constants[i].index,
+						       (unsigned long long)shape.vertex_constants[i].bits);
+			}
+		}
+		rw_print("%s\n", line);
+	}
+
 	char why[512] = { 0 };
 	struct rwa_render_info info = { 0 };
 	struct rwa_render *render = mesa.render_create(_mesa,
@@ -1661,7 +2452,9 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 		 * "refused by name" discipline unobservable from a boot: one pipeline
 		 * specification was declined 80 times over 42 lives of backboardd before the
 		 * vertex layout existed, and that number had to be counted by hand. */
-		RW_AGAIN("this render pipeline is refused: %s\n", why);
+		RW_AGAIN("this render pipeline is refused (%s, %s, %u fragment constants): %s\n",
+			 [[vertex name] UTF8String] ?: "no vertex function", [[fragment name] UTF8String] ?: "?",
+			 shape.fragment_constant_count, why);
 		return [self fail:error with:[NSString stringWithUTF8String:why]];
 	}
 	/* and what the library made of it, in GALLIUM's bits: for any mask but All, None,
@@ -1868,15 +2661,18 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 		.sample_count = (unsigned)[descriptor sampleCount],
 		.usage = (unsigned)[descriptor usage],
 	};
+	hk_note_packed16("descriptor", shape.pixel_format, shape.usage, [descriptor swizzle], NULL, NULL);
 	struct rwa_texture *texture = mesa.texture_create(_mesa, &shape, why, sizeof(why));
 
 	if (texture == NULL) {
 		rw_print("%s\n", why);
 		return nil;
 	}
-	return [[HKMetalTexture alloc] initWithHKDevice:self
-							 texture:texture
-							   shape:&shape];
+	HKMetalTexture *made = [[HKMetalTexture alloc] initWithHKDevice:self
+								texture:texture
+								  shape:&shape];
+
+	return hk_with_descriptor_swizzle(made, descriptor);
 }
 
 /* The sampler's own base class exists and owes its protocol nothing, so this is the cheapest
@@ -1903,7 +2699,30 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 		.normalized_coordinates = [descriptor normalizedCoordinates] ? 1 : 0,
 		.lod_min = [descriptor lodMinClamp],
 		.lod_max = [descriptor lodMaxClamp],
+		/* M5b. lodAverage has no field: "This option is a performance hint. An
+		 * implementation is free to ignore this property" (Apple's MTLSampler.h), and this
+		 * one does. */
+		.border_color = (unsigned)[descriptor borderColor],
 	};
+	if (hk_tracing()) {
+		static unsigned lines;
+
+		if (__atomic_fetch_add(&lines, 1, __ATOMIC_RELAXED) < 16) {
+			rw_print("sampler: address %u %u %u, filter %u %u %u, normalized %u, border %u\n", state.address[0],
+				 state.address[1], state.address[2], state.min_filter, state.mag_filter, state.mip_filter,
+				 state.normalized_coordinates, state.border_color);
+		}
+	}
+	/* The Gallium library reads the shorter struct and has one border, transparent black
+	 * (air_metal.c, sampler_state_from_metal), so a sampler asking for another would read as
+	 * right and be wrong: said, once. The Vulkan library binds it. */
+	if (!mesa_is_vulkan && state.border_color != 0 &&
+	    (state.address[0] == MTLSamplerAddressModeClampToBorderColor ||
+	     state.address[1] == MTLSamplerAddressModeClampToBorderColor ||
+	     state.address[2] == MTLSamplerAddressModeClampToBorderColor)) {
+		RW_ONCE("a sampler clamps to a border colour other than transparent black, which "
+			"the Gallium library has no way to bind: it reads transparent black\n");
+	}
 	struct rwa_sampler *sampler = mesa.sampler_create(_mesa, &state, why, sizeof(why));
 
 	if (sampler == NULL) {
@@ -2283,9 +3102,39 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 
 	char why[512] = { 0 };
 	struct rwa_compute_info info = { 0 };
-	struct rwa_compute *compute = mesa.compute_create(_mesa, [air bytes], [air length],
-							  [[function name] UTF8String], &info,
-							  why, sizeof(why));
+	/* M5c: FUNCTION CONSTANTS */
+	unsigned constant_count = 0, constants_given = 0;
+	const struct rwa_function_constant *constants =
+	    hk_function_constants(function, &constant_count, &constants_given);
+	{
+		/* (WHAT A SYSTEM PIPELINE WAS GIVEN) */
+		static unsigned lines;
+
+		if (hk_tracing() && __atomic_fetch_add(&lines, 1, __ATOMIC_RELAXED) < 60) {
+			char line[900];
+			size_t at = (size_t)snprintf(line, sizeof(line), "compute %s, %u constants:",
+						     [[function name] UTF8String], constant_count);
+
+			for (unsigned i = 0; i < constant_count && at + 32 < sizeof(line); i++) {
+				if (constants[i].bits != 0 || constants[i].bits_hi != 0) {
+					at += (size_t)snprintf(line + at, sizeof(line) - at, " %u=%llx", constants[i].index,
+							       (unsigned long long)constants[i].bits);
+				}
+			}
+			rw_print("%s\n", line);
+		}
+	}
+	const CFAbsoluteTime compute_began = CFAbsoluteTimeGetCurrent();
+	struct rwa_compute *compute = constants_given
+	    ? mesa.compute_create_constants(_mesa, [air bytes], [air length],
+					    [[function name] UTF8String], constants,
+					    constant_count, &info, why, sizeof(why))
+	    : mesa.compute_create(_mesa, [air bytes], [air length],
+				  [[function name] UTF8String], &info, why, sizeof(why));
+	if (CFAbsoluteTimeGetCurrent() - compute_began > 0.25) {
+		rw_print("compute %s took %.1f s to make, %zu bytes of AIR: %s\n", [[function name] UTF8String],
+			 CFAbsoluteTimeGetCurrent() - compute_began, (size_t)[air length], compute != NULL ? "made" : why);
+	}
 	if (compute == NULL) {
 		/* The front end's own sentence, passed through rather than replaced: it says
 		 * which construct it refused, and an application can act on that. */
@@ -2472,6 +3321,120 @@ rw_texture_bytes(MTLTextureDescriptor *d)
  * CoreAnimation does not test what it gets back, so a bare nil becomes a CAMetalDrawable
  * whose -texture is nil, and the application finds out later and somewhere else.
  */
+/* A surface as a texture of its own, which goes on being copied when the surface changes (hkFollowSurface). */
+- (id)hkCopiedTexture:(const struct rwa_texture_shape *)shape surface:(void *)s descriptor:(MTLTextureDescriptor *)d
+{
+	MTLTextureDescriptor *plain =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)shape->pixel_format
+							       width:shape->width height:shape->height
+							   mipmapped:NO];
+	[plain setUsage:MTLTextureUsageShaderRead];
+	id made = [self newTextureWithDescriptor:plain];
+
+	if (made == nil) {
+		return nil;
+	}
+	[made hkFollow:s];
+	return hk_with_descriptor_swizzle(made, d);
+}
+
+/*
+ * MTLPixelFormatYCBCR8_420_2P (M5d), which CoreAnimation asks for by name for a 420f or 420v surface:
+ * the stock wallpaper's Head.HEIC decodes to one, and without it the layer's mask is what shows, as a
+ * red shape. A texture of one format over two planes needs a VkSamplerYcbcrConversion in an immutable
+ * sampler, which no pipeline here can know it needs when it is made. So this texture is a copy, made
+ * once when the surface is asked for, with the chroma interpolated. A surface that goes on changing (a
+ * video) does not go on changing here: that is the limit.
+ *
+ * In RGB, not YCbCr: the pipeline CoreAnimation draws it with, PBGRABsapXm_TimgA2S1Xhf_Ixrg, has no matrix
+ * in it (fc_has_ycbcr_matrix is not set), so sampling this format on Apple's GPU answers colours already.
+ * BT.601 is measured, not assumed: Head.HEIC's middle is Y 105, Cb 141, Cr 83 on the phone (run 141155) and
+ * this Mac's own decoder makes that (42, 133, 128). Real Metal on an M1, format 500 over a surface of those
+ * three, answers exactly that for 420f and (32, 135, 130) for 420v, which is this matrix at each range, with
+ * alpha 1; R8 of plane 0 and RG8 of plane 1 answer the raw bytes. A surface tagged 709 was not tried.
+ */
+- (id)hkBiplanarTexture:(MTLTextureDescriptor *)d surface:(void *)s raw:(BOOL)raw
+{
+	int (*lock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+	int (*unlock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+	size_t (*planes)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
+	void *(*base)(void *, size_t) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddressOfPlane");
+	size_t (*row)(void *, size_t) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRowOfPlane");
+	const NSUInteger w = [d width], h = [d height];
+
+	if (lock == NULL || unlock == NULL || planes == NULL || base == NULL || row == NULL || planes(s) != 2 ||
+	    w == 0 || h == 0) {
+		RW_ONCE("a 420 surface of %lu planes that this driver cannot read\n",
+			planes != NULL ? (unsigned long)planes(s) : 0ul);
+		return nil;
+	}
+	uint8_t *rgba = malloc(w * h * 4);
+
+	if (rgba == NULL || lock(s, 1 /* kIOSurfaceLockReadOnly */, NULL) != 0) {
+		free(rgba);
+		return nil;
+	}
+	const uint8_t *y = base(s, 0), *uv = base(s, 1);
+	const size_t ys = row(s, 0), uvs = row(s, 1);
+	const NSUInteger cw = (w + 1) / 2, ch = (h + 1) / 2;
+	uint32_t (*pixel_format)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetPixelFormat");
+	const bool video = pixel_format != NULL && (pixel_format(s) & 0xff) == 'v';
+	const float y_scale = video ? 255.0f / 219.0f : 1.0f, y_base = video ? 16.0f : 0.0f;
+	const float c_scale = video ? 255.0f / 224.0f : 1.0f;
+
+	for (NSUInteger j = 0; j < h; j++) {
+		const uint8_t *yl = y + j * ys;
+		/* centred chroma, half a texel each way: 3/4 of the near row and 1/4 of the far */
+		const NSUInteger c0 = j / 2;
+		const NSUInteger c1 = (j & 1) ? MIN(c0 + 1, ch - 1) : (c0 > 0 ? c0 - 1 : 0);
+		const uint8_t *near = uv + c0 * uvs, *far = uv + c1 * uvs;
+		uint8_t *out = rgba + j * w * 4;
+
+		for (NSUInteger i = 0; i < w; i++) {
+			const NSUInteger x0 = i / 2;
+			const NSUInteger x1 = (i & 1) ? MIN(x0 + 1, cw - 1) : (x0 > 0 ? x0 - 1 : 0);
+
+			float chroma[2], rgb[3];
+
+			for (unsigned k = 0; k < 2; k++) {
+				chroma[k] = ((9.0f * near[x0 * 2 + k] + 3.0f * near[x1 * 2 + k] + 3.0f * far[x0 * 2 + k] +
+					      far[x1 * 2 + k]) / 16.0f - 128.0f) * c_scale;
+			}
+			if (raw) {
+				const float cb = chroma[0] / c_scale + 128.0f, cr = chroma[1] / c_scale + 128.0f;
+
+				out[i * 4] = (uint8_t)(cr + 0.5f);
+				out[i * 4 + 1] = yl[i];
+				out[i * 4 + 2] = (uint8_t)(cb + 0.5f);
+				out[i * 4 + 3] = 255;
+				continue;
+			}
+
+			const float luma = ((float)yl[i] - y_base) * y_scale;
+
+			rgb[0] = luma + 1.402f * chroma[1];
+			rgb[1] = luma - 0.344136f * chroma[0] - 0.714136f * chroma[1];
+			rgb[2] = luma + 1.772f * chroma[0];
+			for (unsigned k = 0; k < 3; k++) {
+				out[i * 4 + k] = rgb[k] <= 0.0f ? 0 : rgb[k] >= 255.0f ? 255 : (uint8_t)(rgb[k] + 0.5f);
+			}
+			out[i * 4 + 3] = 255;
+		}
+	}
+
+	MTLTextureDescriptor *plain = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+											 width:w height:h mipmapped:NO];
+	[plain setUsage:MTLTextureUsageShaderRead];
+	id made = [self newTextureWithDescriptor:plain];
+
+	[made replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:rgba bytesPerRow:w * 4];
+	free(rgba);
+	RW_ONCE("a 420 surface %lux%lu read into RGB: rows %zu and %zu, at the middle Y Cb Cr %u %u %u\n",
+		 (unsigned long)w, (unsigned long)h, ys, uvs, y[h / 2 * ys + w / 2], uv[h / 4 * uvs + w / 2], uv[h / 4 * uvs + w / 2 + 1]);
+	unlock(s, 1, NULL);
+	return made;
+}
+
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p
 {
 	char why[512] = { 0 };
@@ -2495,15 +3458,98 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 	shape.mip_levels = (unsigned)[d mipmapLevelCount];
 	shape.sample_count = (unsigned)[d sampleCount];
 	shape.usage = (unsigned)[d usage];
+	hk_note_packed16("iosurface", shape.pixel_format, shape.usage, [d swizzle], NULL, s);
+	if (shape.pixel_format == 500 && p == 0) {
+		return [self hkBiplanarTexture:d surface:s raw:NO];
+	}
+	/*
+	 * M5e, format 540: what VideoToolbox asks for a 420f or 420v source, with the matrix in its own shader
+	 * (_FC_src0UseAdvancedMTLPixelFormat). Real Metal on an M1 answers the planes' raw values in the order Cr, Y, Cb,
+	 * alpha 1, for both ranges: 83 105 141 255 over Y 105, Cb 141, Cr 83; centred chroma, by a read as well as a sample
+	 * (rows surface-540-*). The same copy as format 500's, and the same limit, which does not hurt here:
+	 * VideoToolbox makes its texture for one transfer and the source has its picture by then.
+	 */
+	if (shape.pixel_format == 540 && p == 0 && !(shape.usage & MTLTextureUsageShaderWrite)) {
+		return [self hkBiplanarTexture:d surface:s raw:YES];
+	}
+	/*
+	 * A row this GPU cannot read in place (a 120x120 BGRA surface of 480 bytes a row, run 142131:
+	 * a layer's own picture, which the kernel's aligned surfaces are not). A copy that follows the
+	 * surface (hkFollowSurface). Only what is only read.
+	 */
+	{
+		size_t (*bytes_per_row)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+		void *(*base_address)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+		int (*lock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+		int (*unlock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+		const size_t row = bytes_per_row != NULL ? bytes_per_row(s) : 64;
+
+		if (row % 64 != 0 && p == 0 && !(shape.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) && base_address != NULL &&
+		    lock != NULL && unlock != NULL) {
+			id copied = [self hkCopiedTexture:&shape surface:s descriptor:d];
+
+			if (copied != nil) {
+				RW_ONCE("a surface of %zu bytes a row, which this GPU reads only at 64: a copy\n", row);
+				return copied;
+			}
+		}
+	}
+	{
+		/* (WHAT A SYSTEM PIPELINE WAS GIVEN) one line per shape of import */
+		static struct { unsigned format, width, height; unsigned long plane; uint32_t fourcc; } seen[64];
+		static unsigned count;
+		uint32_t (*pixel_format)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetPixelFormat");
+		uint32_t fourcc = pixel_format != NULL ? pixel_format(s) : 0;
+		bool is_new = count < 64;
+
+		@synchronized([NSObject class]) {
+			for (unsigned i = 0; is_new && i < count; i++) {
+				is_new = !(seen[i].format == shape.pixel_format && seen[i].width == shape.width &&
+					   seen[i].height == shape.height && seen[i].plane == p &&
+					   seen[i].fourcc == fourcc);
+			}
+			if (is_new) {
+				seen[count].format = shape.pixel_format;
+				seen[count].width = shape.width;
+				seen[count].height = shape.height;
+				seen[count].plane = p;
+				seen[count++].fourcc = fourcc;
+			}
+		}
+		if (is_new && hk_tracing()) {
+			rw_print("iosurface import: format %u plane %lu %ux%u usage %#x fourcc %c%c%c%c\n",
+				 shape.pixel_format, p, shape.width, shape.height, shape.usage,
+				 (int)(fourcc >> 24 & 0xff), (int)(fourcc >> 16 & 0xff), (int)(fourcc >> 8 & 0xff),
+				 (int)(fourcc & 0xff));
+		}
+	}
 	texture = rwd_texture_for_surface(_mesa, s, p, (const struct rwd_texture_shape *)&shape,
 					  &took, why, sizeof(why));
 	if (texture == NULL) {
+		/*
+		 * M5d: what this GPU cannot have in place but this process can read (a surface over a process's
+		 * own memory, run 152245: a 1125x1905 BGRA, the kernel says so in `why`). A copy that follows the
+		 * surface, as in the misaligned case above; what is written through this texture has to be in place.
+		 */
+		id copied = (p == 0 && !(shape.usage & MTLTextureUsageRenderTarget) &&
+			     !(shape.usage & MTLTextureUsageShaderWrite))
+				? [self hkCopiedTexture:&shape surface:s descriptor:d] : nil;
+
+		if (copied != nil) {
+			RW_ONCE("a surface read as a copy: %s\n", why);
+			return copied;
+		}
 		RW_AGAIN("no drawable: %s\n", why);
 		return nil;
 	}
-	return [[HKMetalTexture alloc] initWithHKDevice:self
-							 texture:texture
-							   shape:&shape];
+	HKMetalTexture *over = [[HKMetalTexture alloc] initWithHKDevice:self
+									   texture:texture
+									     shape:&shape];
+
+	if (hk_frame_dumping()) {
+		[over hkRememberSurface:s];
+	}
+	return hk_with_descriptor_swizzle(over, d);
 }
 - (id)newBufferWithIOSurface:(void *)surface        { (void)surface; return nil; }
 - (id)newBufferWithBytesNoCopy:(void *)bytes
@@ -2911,6 +3957,9 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 
 @end
 
+/* M5e: how often a command buffer was committed, which is as often as a copied surface is looked at (hkFollowSurface) */
+static _Atomic(uint64_t) hk_commits;
+
 @implementation HKMetalTexture
 
 + (void)load
@@ -2947,7 +3996,121 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 	_owner = device;
 	_texture = texture;
 	_shape = *shape;
+	_swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+						 MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
 	return self;
+}
+
+/*
+ * A copy of a surface does not stay right by itself. Whoever draws into the surface draws on, and often no
+ * seed moves (eagl.c's surface_changed found that in hk-gl). Safari's page was copied while it was still
+ * empty and stayed black, run 152737. So once per command buffer committed, when the texture is about to be
+ * drawn with, the surface's memory is added up and copied again if the sum has changed. A frame caught
+ * half drawn is put right by the next look. Each power of ten of copies says what they cost.
+ */
+- (void)hkFollow:(void *)surface
+{
+	_followed = (void *)CFRetain(surface);
+	[self hkFollowSurface];
+}
+
+- (void)hkRememberSurface:(void *)surface
+{
+	_followed = (void *)CFRetain(surface);
+	_followedInPlace = YES;
+}
+
+/* Which surface, how it reaches the GPU, and a look at 25 of its pixels from this processor. */
+- (size_t)hkDescribeSurface:(char *)out size:(size_t)size
+{
+	if (_parent != nil) {
+		return [(HKMetalTexture *)_parent hkDescribeSurface:out size:size];
+	}
+	if (_followed == NULL) {
+		return (size_t)snprintf(out, size, " own");
+	}
+	uint32_t (*surface_id)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+	uint32_t (*seed)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetSeed");
+	size_t (*bytes_per_row)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+	void *(*base_address)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+	int (*lock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+	int (*unlock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+	unsigned nonzero = 0;
+	uint32_t last = 0;
+
+	if (lock(_followed, 1, NULL) == 0) {
+		const uint8_t *base = base_address(_followed);
+		const size_t row = bytes_per_row(_followed);
+
+		for (unsigned y = 1; base != NULL && y <= 5; y++) {
+			for (unsigned x = 1; x <= 5; x++) {
+				uint32_t pixel;
+
+				memcpy(&pixel, base + (size_t)(_shape.height * y / 6) * row + (size_t)(_shape.width * x / 6) * 4, 4);
+				nonzero += pixel != 0;
+				last = pixel != 0 ? pixel : last;
+			}
+		}
+		unlock(_followed, 1, NULL);
+	}
+	return (size_t)snprintf(out, size, " %s#%u seed%u nz%u/%08x", _followedInPlace ? "place" : "copy",
+				surface_id(_followed), seed(_followed), nonzero, last);
+}
+
+- (void)hkFollowSurface
+{
+	static _Atomic(uint64_t) copies, spent_us;
+	const uint64_t now = atomic_load(&hk_commits) + 1;
+
+	if (_parent != nil) {
+		[(HKMetalTexture *)_parent hkFollowSurface];
+		return;
+	}
+	if (_followed == NULL || _followedInPlace || _followedLooked == now) {
+		return;
+	}
+	_followedLooked = now;
+
+	size_t (*bytes_per_row)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+	size_t (*bytes_per_element)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerElement");
+	void *(*base_address)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+	int (*lock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+	int (*unlock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+
+	if (bytes_per_row == NULL || bytes_per_element == NULL || base_address == NULL || lock == NULL ||
+	    unlock == NULL || lock(_followed, 1, NULL) != 0) {
+		return;
+	}
+	const size_t row = bytes_per_row(_followed);
+	const size_t size = row * (_shape.height - 1) + _shape.width * bytes_per_element(_followed);
+	const uint8_t *base = base_address(_followed);
+	uint64_t sum = size, word;
+
+	for (size_t at = 0; base != NULL && at + 8 <= size; at += 8) {
+		memcpy(&word, base + at, 8);
+		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
+		sum ^= sum >> 29;
+	}
+	if (base != NULL && (sum != _followedSum || _followedSum == 0)) {
+		struct timespec a, b;
+
+		clock_gettime(CLOCK_MONOTONIC, &a);
+		_followedSum = sum;
+		[self replaceRegion:MTLRegionMake2D(0, 0, _shape.width, _shape.height) mipmapLevel:0
+			  withBytes:base bytesPerRow:row];
+		clock_gettime(CLOCK_MONOTONIC, &b);
+
+		const uint64_t us = atomic_fetch_add(&spent_us, (uint64_t)((b.tv_sec - a.tv_sec) * 1000000 +
+								 (b.tv_nsec - a.tv_nsec) / 1000));
+		const uint64_t n = atomic_fetch_add(&copies, 1) + 1;
+
+		if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000) {
+			rw_print("a surface's copy made again %llu times so far, this one %ux%u; %llu ms in all\n",
+				 (unsigned long long)n, _shape.width, _shape.height,
+				 (unsigned long long)(us / 1000));
+		}
+	}
+	unlock(_followed, 1, NULL);
 }
 
 - (void)dealloc
@@ -2955,10 +4118,99 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 	if (_texture != NULL) {
 		mesa.texture_destroy(_texture);
 	}
+	[_parent release];
+	if (_followed != NULL) {
+		CFRelease(_followed);
+	}
 	[super dealloc];
 }
 
 - (struct rwa_texture *)mesaTexture { return _texture; }
+
+- (NSUInteger)hkSlices
+{
+	NSUInteger cube = (_shape.type == MTLTextureTypeCube ||
+			   _shape.type == MTLTextureTypeCubeArray) ? 6 : 1;
+
+	return MAX(_shape.array_length, 1) * cube;
+}
+
+- (id)hkViewFormat:(NSUInteger)format
+	      type:(NSUInteger)type
+	    levels:(NSRange)levels
+	    slices:(NSRange)slices
+	   swizzle:(MTLTextureSwizzleChannels)swizzle
+{
+	char why[320] = { 0 };
+
+	/* (said on both back ends, before the library is asked: what it asked for is the point) */
+	hk_note_packed16("view", (unsigned)format, _shape.usage, _swizzle, &swizzle, NULL);
+	if (mesa.texture_view_create == NULL) {
+		RW_ONCE("a texture view is not implemented on this compiler library (the Gallium "
+			"one has no call that makes a second texture over the same memory); nil\n");
+		return nil;
+	}
+	const struct rwa_texture_view_shape vs = {
+		.pixel_format = (unsigned)format,
+		.type = (unsigned)type,
+		.base_level = (unsigned)levels.location,
+		.level_count = (unsigned)levels.length,
+		.base_slice = (unsigned)slices.location,
+		.slice_count = (unsigned)slices.length,
+		.swizzle = { swizzle.red, swizzle.green, swizzle.blue, swizzle.alpha },
+	};
+	struct rwa_texture *view = mesa.texture_view_create(_texture, &vs, why, sizeof(why));
+
+	if (view == NULL) {
+		rw_print("a texture view: %s\n", why);
+		return nil;
+	}
+	struct rwa_texture_shape shape = _shape;
+
+	shape.pixel_format = (unsigned)format;
+	shape.type = (unsigned)type;
+	shape.width = MAX(_shape.width >> levels.location, 1);
+	shape.height = MAX(_shape.height >> levels.location, 1);
+	shape.depth = type == MTLTextureType3D ? MAX(_shape.depth >> levels.location, 1) : 1;
+	shape.mip_levels = (unsigned)levels.length;
+	shape.array_length = (unsigned)((type == MTLTextureTypeCube ||
+					 type == MTLTextureTypeCubeArray)
+					    ? slices.length / 6 : slices.length);
+	HKMetalTexture *made = [[HKMetalTexture alloc] initWithHKDevice:_owner
+								texture:view
+								  shape:&shape];
+	if (made != nil) {
+		made->_parent = [self retain];
+		made->_parentLevel = levels.location;
+		made->_parentSlice = slices.location;
+		made->_swizzle = swizzle;
+	}
+	return made;
+}
+
+- (id)hkWindowLevel:(NSUInteger)level slice:(NSUInteger)slice
+{
+	/* one texel format, and the type of one slice of this one; of a 3D texture, of one plane */
+	NSUInteger type = _shape.type;
+
+	if (type == MTLTextureType1DArray) {
+		type = MTLTextureType1D;
+	} else if (type == MTLTextureType2DArray || type == MTLTextureTypeCube ||
+		   type == MTLTextureTypeCubeArray || type == MTLTextureType3D) {
+		type = MTLTextureType2D;
+	} else if (type == MTLTextureType2DMultisampleArray) {
+		type = MTLTextureType2DMultisample;
+	}
+	id view = [self hkViewFormat:_shape.pixel_format
+				type:type
+			      levels:NSMakeRange(level, 1)
+			      slices:NSMakeRange(slice, 1)
+			     swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,
+								   MTLTextureSwizzleGreen,
+								   MTLTextureSwizzleBlue,
+								   MTLTextureSwizzleAlpha)];
+	return [view autorelease];
+}
 
 - (id)device                       { return _owner; }
 - (NSUInteger)width                { return _shape.width; }
@@ -2972,9 +4224,10 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 - (NSUInteger)usage                { return _shape.usage; }
 - (BOOL)isFramebufferOnly          { return NO; }
 - (BOOL)allowGPUOptimizedContents  { return NO; }
-- (id)parentTexture                { return nil; }
-- (NSUInteger)parentRelativeLevel  { return 0; }
-- (NSUInteger)parentRelativeSlice  { return 0; }
+/* [M5b: a view has one, retained, with where it is in it; a texture that was made has none.] */
+- (id)parentTexture                { return _parent; }
+- (NSUInteger)parentRelativeLevel  { return _parentLevel; }
+- (NSUInteger)parentRelativeSlice  { return _parentSlice; }
 - (id)buffer                       { return nil; }
 - (NSUInteger)bufferOffset         { return 0; }
 - (NSUInteger)bufferBytesPerRow    { return 0; }
@@ -3001,6 +4254,38 @@ rw_texture_bytes(MTLTextureDescriptor *d)
  * report and zero was not a state at all. */
 - (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }
 
+/*
+ * The one recording the compiler library has, and who may touch it. -commit took this and nothing else
+ * did: "uploads and reads (-replaceRegion:, -getBytes:) from a second thread still share the context
+ * unguarded -- take it there too if one shows up", said this comment. On the Vulkan library one does
+ * (M5d): a texel call records into the same command buffer a -commit on another thread is
+ * recording, which Vulkan calls externally synchronised and air_vk.c's record_begin names as the road
+ * left open. A window server's two threads are that road. So the texel calls take it as well,
+ * for the whole call: a read waits for the GPU inside it, and a -commit elsewhere waits behind that.
+ * It is not recursive, and nothing in here calls one of these with it held: -hkRun calls the library.
+ */
+static pthread_mutex_t rw_pipe_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int
+rw_texture_write(struct rwa_texture *t, unsigned level, unsigned slice, const unsigned origin[3],
+		 const unsigned size[3], const void *bytes, size_t stride, char *why, size_t why_size)
+{
+	pthread_mutex_lock(&rw_pipe_lock);
+	int rc = mesa.texture_write(t, level, slice, origin, size, bytes, stride, why, why_size);
+	pthread_mutex_unlock(&rw_pipe_lock);
+	return rc;
+}
+
+static int
+rw_texture_read(struct rwa_texture *t, unsigned level, unsigned slice, const unsigned origin[3],
+		const unsigned size[3], void *bytes, size_t stride, char *why, size_t why_size)
+{
+	pthread_mutex_lock(&rw_pipe_lock);
+	int rc = mesa.texture_read(t, level, slice, origin, size, bytes, stride, why, why_size);
+	pthread_mutex_unlock(&rw_pipe_lock);
+	return rc;
+}
+
 - (void)replaceRegion:(MTLRegion)region
 	  mipmapLevel:(NSUInteger)level
 		slice:(NSUInteger)slice
@@ -3014,8 +4299,37 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 	unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
 			     (unsigned)region.size.depth };
 
-	(void)image;
-	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
+	if ([self pixelFormat] == 115 && size[0] >= 64 && bytes != NULL) {
+		static unsigned said;
+
+		if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 6) {
+			const __fp16 *h = bytes;
+			unsigned last = size[0] - 1, mid = size[0] / 2;
+
+			rw_print("RGBA16F upload %ux%u stride %lu: [0] %.3f %.3f %.3f %.3f [%u] %.3f %.3f %.3f %.3f [%u] %.3f %.3f %.3f %.3f\n",
+				 size[0], size[1], (unsigned long)stride, (double)h[0], (double)h[1], (double)h[2], (double)h[3],
+				 mid, (double)h[mid * 4], (double)h[mid * 4 + 1], (double)h[mid * 4 + 2], (double)h[mid * 4 + 3],
+				 last, (double)h[last * 4], (double)h[last * 4 + 1], (double)h[last * 4 + 2], (double)h[last * 4 + 3]);
+		}
+	}
+	/* [M5b: "(void)image;" stood here, which is the packed case: the contract has one stride
+	 * and a 3D region's images follow each other at stride * height. An application's other
+	 * bytesPerImage is said one plane at a time, where it means the same thing.] */
+	if (region.size.depth > 1 && image != 0 && image != stride * region.size.height) {
+		const uint8_t *from = bytes;
+
+		for (NSUInteger z = 0; z < region.size.depth; z++, from += image) {
+			origin[2] = (unsigned)(region.origin.z + z);
+			size[2] = 1;
+			if (rw_texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size,
+					       from, stride, why, sizeof(why)) != 0) {
+				rw_print("writing texels: %s\n", why);
+				return;
+			}
+		}
+		return;
+	}
+	if (rw_texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
 			       stride, why, sizeof(why)) != 0) {
 		rw_print("writing texels: %s\n", why);
 	}
@@ -3043,8 +4357,22 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 	unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
 			     (unsigned)region.size.depth };
 
-	(void)image;
-	if (mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
+	/* [M5b: as -replaceRegion: above] */
+	if (region.size.depth > 1 && image != 0 && image != stride * region.size.height) {
+		uint8_t *to = bytes;
+
+		for (NSUInteger z = 0; z < region.size.depth; z++, to += image) {
+			origin[2] = (unsigned)(region.origin.z + z);
+			size[2] = 1;
+			if (rw_texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size,
+					      to, stride, why, sizeof(why)) != 0) {
+				rw_print("reading texels: %s\n", why);
+				return;
+			}
+		}
+		return;
+	}
+	if (rw_texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
 			      stride, why, sizeof(why)) != 0) {
 		rw_print("reading texels: %s\n", why);
 	}
@@ -3074,8 +4402,11 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 		         "older than this driver and cannot say what a depth buffer holds\n");
 		return NO;
 	}
-	if (mesa.depth_read(_texture, 0, 0, origin, size, depth, stencil, why,
-			    sizeof(why)) != 0) {
+	pthread_mutex_lock(&rw_pipe_lock);
+	const int depth_rc = mesa.depth_read(_texture, 0, 0, origin, size, depth, stencil, why,
+					     sizeof(why));
+	pthread_mutex_unlock(&rw_pipe_lock);
+	if (depth_rc != 0) {
 		rw_print("reading the depth of a texture: %s\n", why);
 		return NO;
 	}
@@ -3085,7 +4416,17 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 /* A view of a texture is another texture over the same memory, and the compiler library has
  * no call for that yet; nil is the honest answer, and it is better than a view that aliases
  * nothing. */
-- (id)newTextureViewWithPixelFormat:(NSUInteger)format { (void)format; return nil; }
+/* [M5b: the Vulkan library has that call now (rwa_texture_view_create). On the Gallium one this
+ * is still the nil that paragraph says, through hkViewFormat:. A view of everything the texture
+ * has, in another format. */
+- (id)newTextureViewWithPixelFormat:(NSUInteger)format
+{
+	return [self hkViewFormat:format
+			     type:_shape.type
+			   levels:NSMakeRange(0, MAX(_shape.mip_levels, 1))
+			   slices:NSMakeRange(0, [self hkSlices])
+			  swizzle:_swizzle];
+}
 
 /*
  * THE REST OF WHAT <MTLTexture>, <MTLTextureSPI>, <MTLResource> AND <MTLResourceSPI>
@@ -3101,10 +4442,8 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 			     levels:(NSRange)levels
 			     slices:(NSRange)slices
 {
-	(void)format; (void)type; (void)levels; (void)slices;
-	RW_ONCE("a texture view is not implemented (the compiler library has no "
-		"call that makes a second texture over the same memory); nil\n");
-	return nil;
+	/* [M5b: a view's swizzle is its parent's unless it says, as Metal's is] */
+	return [self hkViewFormat:format type:type levels:levels slices:slices swizzle:_swizzle];
 }
 - (id)newTextureViewWithPixelFormat:(NSUInteger)format
 			textureType:(NSUInteger)type
@@ -3112,31 +4451,36 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 			     slices:(NSRange)slices
 			    swizzle:(MTLTextureSwizzleChannels)swizzle
 {
-	(void)swizzle;
-	return [self newTextureViewWithPixelFormat:format textureType:type levels:levels
-					    slices:slices];
+	return [self hkViewFormat:format type:type levels:levels slices:slices swizzle:swizzle];
 }
 - (id)newSharedTextureHandle { return nil; }   /* nothing here is shared between processes */
 
 /* Served out of the shape this texture was made with, which is the only place that
  * knowledge exists: a cube is six faces (MTLTextureTypeCube is 3, CubeArray is 4),
  * everything else is one. */
+/* [M5b: and those two numbers were not those: 3 is MTLTextureType2DArray and 4 is 2DMultisample
+ * (MTLTexture.h: 1D 0, 1DArray 1, 2D 2, 2DArray 3, 2DMultisample 4, Cube 5, CubeArray 6, 3D 7), so a
+ * 2D array said six faces and a cube said one, until a cube was made here. By name.] */
 - (NSUInteger)numFaces
 {
-	return (_shape.type == 3 || _shape.type == 4) ? 6 : 1;
+	return (_shape.type == MTLTextureTypeCube || _shape.type == MTLTextureTypeCubeArray) ? 6 : 1;
 }
 /* The identity swizzle, and it is the truth rather than a default: a texture of this driver
  * is made from a descriptor's format alone and nothing reorders its channels, so red reads
  * as red. MTLTextureSwizzleChannelsDefault is that same quadruple. */
+/* [M5b: a view's own, which is that sentence's quadruple everywhere but on a view that asked.] */
 - (MTLTextureSwizzleChannels)swizzle
 {
-	return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
-					     MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
+	return _swizzle;
 }
 - (unsigned int)swizzleKey { return 0; }   /* the key of "nothing is swizzled" */
 /* Nothing here is a view, so every texture is its own root, and nil is what Apple's own
  * resource answers for one that was allocated rather than derived. */
-- (id)rootResource { return nil; }
+/* [M5b: and a view's root is what it was derived from, all the way up.] */
+- (id)rootResource
+{
+	return _parent != nil ? ([_parent rootResource] ?: _parent) : nil;
+}
 
 /*
  * True by construction, and each is a sentence about this driver rather than a shrug:
@@ -3353,6 +4697,218 @@ rw_texture_bytes(MTLTextureDescriptor *d)
 - (id)device { return _owner; }
 
 @end
+
+/* (WHAT A FRAME PUT WHERE, above) */
+static void
+hk_note_frame_draw(HKMetalWork *work)
+{
+	const uint64_t frame = atomic_load(&hk_commits);
+
+	if (!hk_frame_dumping() || frame % 300 != 0) {
+		return;
+	}
+	NSString *label = [work->render label] ?: @"(none)";
+	id target = work->colorCount > 0 ? work->color[0] : nil;
+	char line[900];
+	size_t at = (size_t)snprintf(line, sizeof(line), "frame %llu %s -> %lux%lu, %u verts", (unsigned long long)frame,
+				     [label hasPrefix:@"com.apple.coreanimation"]
+					 ? [[label substringFromIndex:29] UTF8String] : [label UTF8String],
+				     target != nil ? (unsigned long)[target width] : 0ul,
+				     target != nil ? (unsigned long)[target height] : 0ul, work->vertexCount);
+
+	if (work->hasScissorRect) {
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " sc %u,%u %ux%u", work->scissorRect[0],
+				       work->scissorRect[1], work->scissorRect[2], work->scissorRect[3]);
+	}
+	if (work->vertexBufferCount > 1 && work->vertexBuffers[1] != nil && work->vertexCount <= 64) {
+		const float *v = (const float *)(const void *)((const char *)[work->vertexBuffers[1] contents] +
+							       work->vertexBufferOffsets[1]);
+		float lo[4] = { 1e30f, 1e30f, 1e30f, 1e30f }, hi[4] = { -1e30f, -1e30f, -1e30f, -1e30f };
+
+		for (unsigned i = 0; i < work->vertexCount; i++, v += 12) {
+			const float w = v[3] != 0 ? v[3] : 1;
+			const float each[4] = { v[0] / w, v[1] / w, v[4], v[5] };
+
+			for (unsigned k = 0; k < 4; k++) {
+				lo[k] = MIN(lo[k], each[k]);
+				hi[k] = MAX(hi[k], each[k]);
+			}
+		}
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " at %.1f,%.1f..%.1f,%.1f t %.3f,%.3f..%.3f,%.3f",
+				       (double)lo[0], (double)lo[1], (double)hi[0], (double)hi[1],
+				       (double)lo[2], (double)lo[3], (double)hi[2], (double)hi[3]);
+	}
+	for (unsigned i = 0; i < work->textureCount && at + 80 < sizeof(line); i++) {
+		id t = work->textures[i];
+
+		if (t != nil && [t isKindOfClass:[HKMetalTexture class]]) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " t%u %lux%lu", i, (unsigned long)[t width],
+					       (unsigned long)[t height]);
+			at += [t hkDescribeSurface:line + at size:sizeof(line) - at];
+		}
+	}
+	rw_print("%s\n", line);
+}
+
+/* (WHAT A SYSTEM PIPELINE WAS GIVEN, above) */
+static void
+hk_note_draw(HKMetalWork *work)
+{
+	if (!hk_tracing()) {
+		return;
+	}
+	static NSMutableDictionary *seen;
+	static unsigned lines;
+	NSString *label = [work->render label] ?: @"(none)";
+	bool big = false;
+	static NSMutableSet *textures_seen;
+	static unsigned fills;
+
+	for (unsigned i = 0; i < work->textureCount; i++) {
+		id t = work->textures[i];
+
+		big = big || (t != nil && [t width] * [t height] >= 400000);
+	}
+	@synchronized([HKMetalWork class]) {
+		if (textures_seen == nil) {
+			textures_seen = [[NSMutableSet alloc] init];
+		}
+		for (unsigned i = 0; i < work->textureCount; i++) {
+			id t = work->textures[i];
+			NSValue *key = t != nil ? [NSValue valueWithPointer:t] : nil;
+
+			if (t != nil && [t width] >= 100 && [t height] >= 100 && ![textures_seen containsObject:key]) {
+				[textures_seen addObject:key];
+				rw_print("new texture t%u %lu %lux%lu usage %#lx in %s\n", i, (unsigned long)[t pixelFormat],
+					 (unsigned long)[t width], (unsigned long)[t height], (unsigned long)[t usage],
+					 [label UTF8String]);
+			}
+		}
+		/* the words of the first vertices of a whole-attachment fill, and of what draws a ramp */
+		bool ramp = false;
+
+		for (unsigned i = 0; i < work->textureCount; i++) {
+			ramp = ramp || (work->textures[i] != nil && [work->textures[i] pixelFormat] == 115);
+		}
+		/* and the matrix a vibrancy pipeline reads out of its constant buffer: half4 rows at 0x80 */
+		if ([label rangeOfString:@"Bvcm"].location != NSNotFound && work->count > 1 && work->buffers[1] != nil) {
+			static unsigned matrices;
+
+			if (matrices++ < 4) {
+				const __fp16 *h = (const __fp16 *)((const char *)[work->buffers[1] contents] +
+								   work->bufferOffsets[1] + 0x80);
+				rw_print("matrix %s at +%lu: %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f\n",
+					 [[label substringFromIndex:MIN([label length], 29u)] UTF8String],
+					 (unsigned long)work->bufferOffsets[1], (double)h[0], (double)h[1], (double)h[2], (double)h[3],
+					 (double)h[4], (double)h[5], (double)h[6], (double)h[7], (double)h[8], (double)h[9], (double)h[10],
+					 (double)h[11], (double)h[12], (double)h[13], (double)h[14], (double)h[15], (double)h[16],
+					 (double)h[17], (double)h[18], (double)h[19]);
+			}
+		}
+		if (work->vertexBufferCount > 1 && work->vertexBuffers[1] != nil && work->vertexCount == 6 &&
+		    fills < 24 && (ramp || [label hasPrefix:@"com.apple.coreanimation.draw.PBGRAXm_A2Xhf"])) {
+			const uint32_t *w = (const uint32_t *)((const char *)[work->vertexBuffers[1] contents] +
+							       work->vertexBufferOffsets[1]);
+			fills++;
+			rw_print("vertices %s: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				 [[label substringFromIndex:MIN([label length], 29u)] UTF8String], w[0], w[1], w[2], w[3],
+				 w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
+		}
+	}
+	@synchronized([HKMetalWork class]) {
+		unsigned n;
+		static CFAbsoluteTime first;
+		static unsigned settled;
+
+		if (seen == nil) {
+			seen = [[NSMutableDictionary alloc] init];
+			first = CFAbsoluteTimeGetCurrent();
+		}
+		/* and, once the screen has settled, 150 draws in a row: a whole frame, in order */
+		if (CFAbsoluteTimeGetCurrent() - first > 30 && settled < 150) {
+			settled++;
+		} else {
+			n = [[seen objectForKey:label] unsignedIntValue];
+			if (n >= (big ? 6u : 1u) || lines >= 300) {
+				return;
+			}
+			[seen setObject:@(n + 1) forKey:label];
+			lines++;
+		}
+	}
+	char line[700];
+	id target = work->colorCount > 0 ? work->color[0] : nil;
+	size_t at = (size_t)snprintf(line, sizeof(line), "draw %s -> %lu %lux%lu, %u verts:",
+				     [label hasPrefix:@"com.apple.coreanimation"]
+					 ? [[label substringFromIndex:29] UTF8String] : [label UTF8String],
+				     target != nil ? (unsigned long)[target pixelFormat] : 0ul,
+				     target != nil ? (unsigned long)[target width] : 0ul,
+				     target != nil ? (unsigned long)[target height] : 0ul, work->vertexCount);
+
+	for (unsigned i = 0; i < work->textureCount && at + 48 < sizeof(line); i++) {
+		id t = work->textures[i];
+
+		if (t != nil) {
+			MTLTextureSwizzleChannels sw = [t swizzle];
+
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " t%u %lu %lux%lu l%lu s%u%u%u%u", i,
+					       (unsigned long)[t pixelFormat], (unsigned long)[t width],
+					       (unsigned long)[t height], (unsigned long)[t mipmapLevelCount],
+					       sw.red, sw.green, sw.blue, sw.alpha);
+		}
+	}
+	for (unsigned i = 0; i < work->count && at + 24 < sizeof(line); i++) {
+		if (work->buffers[i] != nil) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " b%u+%lu", i,
+					       (unsigned long)work->bufferOffsets[i]);
+		}
+	}
+	rw_print("%s\n", line);
+}
+
+static void
+hk_note_dispatch(HKMetalWork *work)
+{
+	if (!hk_tracing()) {
+		return;
+	}
+	static unsigned lines;
+	char line[500];
+	NSString *label = [work->pipeline label];
+
+	if (__atomic_fetch_add(&lines, 1, __ATOMIC_RELAXED) >= 80) {
+		return;
+	}
+	size_t at = (size_t)snprintf(line, sizeof(line), "dispatch %s %ux%ux%u of %ux%ux%u:", label != nil ? [label UTF8String] : "(no label)",
+				     work->groups[0], work->groups[1], work->groups[2], work->size[0], work->size[1], work->size[2]);
+
+	/* what the dispatch was given: its buffers' first words (M5e, VideoToolbox's scale writes zeros) */
+	for (unsigned i = 0; i < work->count && lines < 24; i++) {
+		if (work->buffers[i] != nil && [work->buffers[i] contents] != NULL) {
+			const uint32_t *w = (const uint32_t *)(const void *)((const char *)[work->buffers[i] contents] + work->bufferOffsets[i]);
+			const size_t words = MIN(([work->buffers[i] length] - work->bufferOffsets[i]) / 4, 24u);
+			char hex[300];
+			size_t h = 0;
+
+			for (size_t k = 0; k < words; k++) {
+				h += (size_t)snprintf(hex + h, sizeof(hex) - h, " %08x", w[k]);
+			}
+			rw_print("  buffer %u, %lu bytes +%zu:%s\n", i, (unsigned long)[work->buffers[i] length],
+				 work->bufferOffsets[i], hex);
+		}
+	}
+
+	for (unsigned i = 0; i < work->textureCount && at + 40 < sizeof(line); i++) {
+		id t = work->textures[i];
+
+		if (t != nil) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " t%u %lu %lux%lu", i,
+					       (unsigned long)[t pixelFormat], (unsigned long)[t width],
+					       (unsigned long)[t height]);
+		}
+	}
+	rw_print("%s\n", line);
+}
 
 @implementation HKMetalRenderPipeline
 
@@ -3831,6 +5387,7 @@ hk_fence_queue(void)
 	NSUInteger _protectionOptions;  /* what the window server asked for; see -setProtectionOptions: */
 	NSUInteger _next;               /* the work item -hkRun goes on from (an event's wait stops it) */
 	NSMutableArray *_signals;       /* event signals run, made visible once this buffer is complete */
+	NSMutableArray *_hkWatched;     /* (trace: a dispatch's textures, read back when complete: hkWatchReport) */
 	NSCondition *_ran;              /* ... and whether all of it has run (-waitUntilCompleted waits for that) */
 	BOOL _hasRun;
 }
@@ -4023,9 +5580,7 @@ hk_fence_queue(void)
 - (void)enqueue { }
 
 /* Metal's own rule, kept: the recorded dispatches run here and not when they were encoded. */
-/* shortcut: only -commit takes it; uploads and reads (-replaceRegion:, -getBytes:) from a
- * second thread still share the context unguarded -- take it there too if one shows up. */
-static pthread_mutex_t rw_pipe_lock = PTHREAD_MUTEX_INITIALIZER;
+/* [M5d: rw_pipe_lock is further up now, and the texel calls take it.] */
 
 /* An event's signal, run: the buffers it lets go on are added to `ready` (made if NULL). */
 static NSMutableArray *
@@ -4046,6 +5601,7 @@ rw_signal(HKMetalWork *work, NSMutableArray *ready, NSMutableArray *signals)
 
 - (void)commit
 {
+	atomic_fetch_add(&hk_commits, 1);
 	_status = RW_CB_COMMITTED;
 	[self hkRun];
 }
@@ -4121,12 +5677,38 @@ rw_signal(HKMetalWork *work, NSMutableArray *ready, NSMutableArray *signals)
 		 * through rwa_dispatch, and then a kernel with a set is refused by name
 		 * there and every offset is read as zero -- which is what an older library
 		 * did with one in any case, out loud. */
+		hk_note_dispatch(work);
+		if (hk_tracing()) {
+			[self hkWatch:work];
+		}
+		const CFAbsoluteTime dispatch_began = CFAbsoluteTimeGetCurrent();
+		/* (WHAT A SYSTEM PIPELINE WAS GIVEN) a dispatch that does not come back says where it is:
+		 * only with /hackios/share/probes/watchdog in the root, because this kills the process */
+		static _Atomic(uint64_t) dispatch_serial;
+		static _Atomic(uint64_t) dispatch_done;
+		const uint64_t this_dispatch = ++dispatch_serial;
+		pthread_t dispatching = pthread_self();
+
+		if (access("/hackios/share/probes/watchdog", F_OK) == 0) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),
+				       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+				if (dispatch_done < this_dispatch) {
+					rw_print("a dispatch has not come back in 20 s; where it is:\n");
+					pthread_kill(dispatching, SIGTRAP);
+				}
+			});
+		}
 		int rc = mesa.dispatch_buffers != NULL
 			    ? mesa.dispatch_buffers([work->pipeline compute], &bindings,
 						    table, work->count, work->groups,
 						    work->size, why, sizeof(why))
 			    : mesa.dispatch([work->pipeline compute], &bindings, work->groups,
 					    work->size, why, sizeof(why));
+		dispatch_done = this_dispatch;
+		if (CFAbsoluteTimeGetCurrent() - dispatch_began > 0.25) {
+			rw_print("a dispatch took %.1f s: %s\n", CFAbsoluteTimeGetCurrent() - dispatch_began,
+				 [[[work->pipeline label] description] UTF8String] ?: "(no label)");
+		}
 		if (rc != 0) {
 			rw_print("the dispatch failed: %s\n", why);
 			_error = [[NSError errorWithDomain:@"HKMetal" code:2
@@ -4265,6 +5847,8 @@ done:
 	for (unsigned i = 0; i < work->samplerCount; i++) {
 		fragment_samplers[i] = [work->samplers[i] mesaSampler];
 	}
+	hk_note_draw(work);
+	hk_note_frame_draw(work);
 	struct rwa_draw draw = {
 		.color = color,
 		.color_count = work->colorCount,
@@ -4316,6 +5900,19 @@ done:
 		.vertex_buffer_table_count = work->vertexBufferCount,
 		.fragment_buffer_table = fragment_table,
 		.fragment_buffer_table_count = work->count,
+		/* The encoder's own state (M5a, air_metal.h). */
+		.blend_color = work->hasBlendColor ? work->blendColor : NULL,
+		.cull_mode = work->cullMode,
+		.front_winding = work->frontWinding,
+		.viewport = work->hasViewportRect ? work->viewportRect : NULL,
+		.scissor = work->hasScissorRect ? work->scissorRect : NULL,
+		.color_clears = work->attachmentClears,
+		.color_clear_mask = work->attachmentClearMask,
+		/* where in each attachment (M5b, air_metal.h) */
+		.color_level = work->colorLevel,
+		.color_slice = work->colorSlice,
+		.depth_level = work->depthLevel,
+		.depth_slice = work->depthSlice,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
@@ -4329,6 +5926,70 @@ done:
 		rw_print("the draw failed: %s\n", why);
 		[self failWith:why];
 		return NO;
+	}
+	/*
+	 * (WHAT A SYSTEM PIPELINE WAS GIVEN) Once the screen has settled, what each draw left at two
+	 * places in the attachment, for a picture that is wrong: the draw that changes it is the one
+	 * to read. It waits for the GPU at every draw, so only for 240 of them, and only with
+	 * metal_probe in the boot-args.
+	 */
+	{
+		static int enabled = -1;
+		static unsigned probes;
+		static CFAbsoluteTime first;
+
+		if (enabled < 0) {
+			char args[1024] = "";
+			size_t args_size = sizeof(args) - 1;
+
+			enabled = sysctlbyname("kern.bootargs", args, &args_size, NULL, 0) == 0 &&
+				  (strstr(args, "metal_probe") != NULL || access("/hackios/share/probes/metal_probe", F_OK) == 0) &&
+				  getprogname() != NULL && strcmp(getprogname(), "backboardd") == 0;
+			first = CFAbsoluteTimeGetCurrent();
+		}
+		id target = work->colorCount > 0 ? work->color[0] : nil;
+
+		if (enabled && target != nil && [target width] == 1125 && probes < 1500) {
+			struct rwa_fence *fence = NULL;
+			struct rwa_device *device = [[_queue device] mesaDevice];
+			char quiet[160] = { 0 };
+			uint8_t a[4] = { 0 }, b[4] = { 0 };
+			const unsigned at_a[3] = { 62, 660, 0 }, at_b[3] = { 1090, 122, 0 }, one[3] = { 1, 1, 1 };
+
+			probes++;
+			if (mesa.flush != NULL && mesa.flush(device, &fence, quiet, sizeof(quiet)) == 0 && fence != NULL) {
+				mesa.fence_wait(device, fence, quiet, sizeof(quiet));
+				mesa.fence_release(device, fence);
+			}
+			int ra = mesa.texture_read(color[0], 0, 0, at_a, one, a, 4, quiet, sizeof(quiet));
+			int rb = mesa.texture_read(color[0], 0, 0, at_b, one, b, 4, quiet, sizeof(quiet));
+			NSString *label = [work->render label] ?: @"(none)";
+
+			static uint8_t was[12];
+			uint8_t second[4] = { 0 }, tex[4] = { 0 };
+			id second_target = work->colorCount > 1 ? work->color[1] : nil;
+			id t3 = work->textureCount > 3 ? work->textures[3] : nil;
+
+			if (second_target != nil && [second_target pixelFormat] == 80) {
+				mesa.texture_read(color[1], 0, 0, at_a, one, second, 4, quiet, sizeof(quiet));
+			}
+			if (t3 != nil && [t3 pixelFormat] == 80) {
+				const unsigned mid[3] = { (unsigned)[t3 width] / 2, (unsigned)[t3 height] / 2, 0 };
+
+				mesa.texture_read([t3 mesaTexture], 0, 0, mid, one, tex, 4, quiet, sizeof(quiet));
+			}
+			if (memcmp(was, a, 4) != 0 || memcmp(was + 4, b, 4) != 0 || memcmp(was + 8, second, 4) != 0) {
+				memcpy(was, a, 4);
+				memcpy(was + 4, b, 4);
+				memcpy(was + 8, second, 4);
+				rw_print("probe %s verts %u t3 %lu %lux%lu mid %u %u %u %u: att0(bgra) %u %u %u %u top %u %u %u %u att1 fmt %lu: %u %u %u %u%s%s\n",
+					 [[label substringFromIndex:MIN([label length], 29u)] UTF8String], work->vertexCount,
+					 (unsigned long)[t3 pixelFormat], (unsigned long)[t3 width], (unsigned long)[t3 height],
+					 tex[0], tex[1], tex[2], tex[3], a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3],
+					 (unsigned long)[second_target pixelFormat], second[0], second[1], second[2], second[3],
+					 ra || rb ? " read failed: " : "", ra || rb ? quiet : "");
+			}
+		}
 	}
 	return YES;
 }
@@ -4438,6 +6099,56 @@ done:
 	}
 	[self hkWaitFence];
 	[self hkSignalsDone];
+	[self hkWatchReport];
+}
+
+/*
+ * (M5e, VideoToolbox's scale writes zeros: where they begin.) With the trace on, the first dispatches' textures are read back
+ * when their buffer is complete: the corner, the middle and the far corner, as this processor sees them through -getBytes:.
+ */
+- (void)hkWatch:(HKMetalWork *)work
+{
+	static _Atomic(unsigned) budget;
+
+	for (unsigned i = 0; i < work->textureCount; i++) {
+		if (work->textures[i] != nil && atomic_fetch_add(&budget, 1) < 40) {
+			if (_hkWatched == nil) {
+				_hkWatched = [[NSMutableArray alloc] init];
+			}
+			[_hkWatched addObject:@[ @(i), work->textures[i] ]];
+		}
+	}
+}
+
+- (void)hkWatchReport
+{
+	NSArray *watched;
+
+	@synchronized (self) {
+		watched = _hkWatched;
+		_hkWatched = nil;
+	}
+	for (NSArray *one in watched) {
+		id t = [one objectAtIndex:1];
+		const NSUInteger format = [t pixelFormat], w = [t width], h = [t height];
+		const size_t bytes = format == 125 ? 16 : format == 115 ? 8 : format == 53 || format == 80 || format == 70 ? 4 : 0;
+		const NSUInteger at[3][2] = { { 0, 0 }, { w / 2, h / 2 }, { w - 1, h - 1 } };
+		char line[220];
+		size_t n = (size_t)snprintf(line, sizeof(line), "back t%u format %lu %lux%lu:", [[one objectAtIndex:0] unsignedIntValue],
+					    (unsigned long)format, (unsigned long)w, (unsigned long)h);
+
+		for (unsigned k = 0; bytes != 0 && k < 3; k++) {
+			uint32_t texel[4] = { 0 };
+
+			[t getBytes:texel bytesPerRow:bytes fromRegion:MTLRegionMake2D(at[k][0], at[k][1], 1, 1) mipmapLevel:0];
+			n += (size_t)snprintf(line + n, sizeof(line) - n, " %08x", texel[0]);
+			for (unsigned q = 1; q * 4 < bytes; q++) {
+				n += (size_t)snprintf(line + n, sizeof(line) - n, ",%08x", texel[q]);
+			}
+		}
+		rw_print("%s\n", line);
+	}
+	[watched release];
 }
 
 - (void)hkSignalsDone
@@ -4481,6 +6192,19 @@ done:
 			return;
 		}
 		_status = RW_CB_COMPLETED;   /* the fence has been paid, and only now */
+		/* ... and given back now, not at -dealloc. Nothing asks a completed buffer's fence
+		 * anything again (the test above returns first), and the back end keeps the
+		 * submission's command buffer with it: run 020900's --draw-all held 208 of each
+		 * until its autorelease pool drained, which an application that keeps finished
+		 * command buffers would hold for as long as it keeps them. A failed wait keeps
+		 * its fence: the GPU may still be reading that command buffer, and -dealloc gives
+		 * it back as before. Whatever is ever read OUT of the fence (GPUStartTime and
+		 * GPUEndTime, when they come: M4) is read here, before this, into the buffer's own
+		 * fields. */
+		if (_fence != NULL) {
+			mesa.fence_release(device, _fence);
+			_fence = NULL;
+		}
 	}
 }
 
@@ -4646,6 +6370,11 @@ done:
 	BOOL _clearsAttachment[8];
 	float _attachmentClear[8][4];
 	id _resolveTo[8];               /* each attachment's resolveTexture, if it asks for a resolve */
+	/* M5b: where in each attachment, and where in its resolve texture: a level, and a slice or
+	 * a depth plane (Metal keeps two numbers, of which a type uses one) */
+	unsigned _colorLevel[8], _colorSlice[8];
+	unsigned _resolveLevel[8], _resolveSlice[8];
+	unsigned _depthLevel, _depthSlice;
 	BOOL _drew;                     /* a draw has been recorded: it carried the pass's clears */
 	id _depth;
 	id _depthStencilState;
@@ -4655,6 +6384,15 @@ done:
 	unsigned _stencilReference[2];
 	float _depthRange[2];
 	BOOL _hasDepthRange;
+	/* the encoder's own state (M5a): Metal's defaults until a setter says otherwise, which
+	 * is a zero, a NO, or MTLWindingClockwise and MTLCullModeNone, whose numbers are zero */
+	float _blendColor[4];
+	BOOL _hasBlendColor;
+	unsigned _cullMode, _frontWinding;
+	float _viewportRect[4];
+	BOOL _hasViewportRect;
+	unsigned _scissorRect[4];
+	BOOL _hasScissorRect;
 	id _vertexBuffers[RW_MAX_BUFFERS];
 	NSUInteger _vertexBufferOffsets[RW_MAX_BUFFERS];
 	id _fragmentBuffers[RW_MAX_BUFFERS];
@@ -4687,6 +6425,19 @@ done:
 		}
 		_color[i] = texture;
 		_colorCount = i + 1;
+		/* M5b: where in it. The Vulkan library renders there; the Gallium one renders
+		 * level 0, slice 0 of a 2D texture whatever this says, and that is said here
+		 * rather than read as a picture of the wrong level. */
+		_colorLevel[i] = (unsigned)[attachment level];
+		_colorSlice[i] = (unsigned)([attachment slice] + [attachment depthPlane]);
+		_resolveLevel[i] = (unsigned)[attachment resolveLevel];
+		_resolveSlice[i] = (unsigned)([attachment resolveSlice] +
+					      [attachment resolveDepthPlane]);
+		if (!mesa_is_vulkan && (_colorLevel[i] != 0 || _colorSlice[i] != 0)) {
+			RW_ONCE("a pass renders into level %u, slice %u of an attachment, and the "
+				"Gallium library renders into level 0 and slice 0\n",
+				_colorLevel[i], _colorSlice[i]);
+		}
 		/*
 		 * A resolve is the one thing a multisample pass asks for that this driver
 		 * cannot do, and it is said out loud rather than ignored. The compiler
@@ -4749,6 +6500,14 @@ done:
 		         "pass is encoded with neither\n");
 	} else {
 		_depth = ztex != nil ? ztex : stex;
+		/* M5b: where in it, from whichever descriptor carries it */
+		if (ztex != nil) {
+			_depthLevel = (unsigned)[za level];
+			_depthSlice = (unsigned)([za slice] + [za depthPlane]);
+		} else if (stex != nil) {
+			_depthLevel = (unsigned)[sa level];
+			_depthSlice = (unsigned)([sa slice] + [sa depthPlane]);
+		}
 		if (ztex != nil && [za loadAction] == MTLLoadActionClear) {
 			_clearDepth = (float)[za clearDepth];
 			_clearsDepth = YES;
@@ -4757,6 +6516,13 @@ done:
 			_clearStencil = (unsigned)[sa clearStencil];
 			_clearsStencil = YES;
 		}
+	}
+	/* M5b: layered rendering, [[render_target_array_index]] over this many slices, is in neither
+	 * library and no shader of the corpus writes that index */
+	if ([descriptor renderTargetArrayLength] > 1) {
+		RW_ONCE("a pass asks for %lu layers of rendering (renderTargetArrayLength): every "
+			"draw goes to the one slice each attachment names\n",
+			(unsigned long)[descriptor renderTargetArrayLength]);
 	}
 	return self;
 }
@@ -4841,6 +6607,9 @@ done:
 	if (index >= RW_MAX_BUFFERS) {
 		return;
 	}
+	if ([texture isKindOfClass:[HKMetalTexture class]]) {
+		[texture hkFollowSurface];
+	}
 	_fragmentTextures[index] = texture;
 	if (index + 1 > _fragmentTextureCount) {
 		_fragmentTextureCount = (unsigned)index + 1;
@@ -4877,22 +6646,40 @@ done:
 	id first = _colorCount > 0 ? _color[0] : _depth;
 	NSUInteger w = [first width], h = [first height];
 
+	/* [M5a: on the Vulkan library the rectangle is real and goes with the draw (rwa_draw.viewport);
+	 * this sentence is about the Gallium library, whose draw still covers the attachment.] */
 	if ((viewport.originX != 0.0 || viewport.originY != 0.0 ||
 	     (NSUInteger)viewport.width != w || (NSUInteger)viewport.height != h) &&
-	    !_complained) {
+	    !_complained && !mesa_is_vulkan) {
 		rw_print("a viewport rectangle is not implemented (asked for "
 		         "%gx%g at %g,%g of a %lux%lu attachment); the draw covers the whole "
 		         "attachment\n", viewport.width, viewport.height, viewport.originX,
 		         viewport.originY, (unsigned long)w, (unsigned long)h);
 		_complained = YES;
 	}
+	_viewportRect[0] = (float)viewport.originX;
+	_viewportRect[1] = (float)viewport.originY;
+	_viewportRect[2] = (float)viewport.width;
+	_viewportRect[3] = (float)viewport.height;
+	_hasViewportRect = YES;
 	_depthRange[0] = (float)viewport.znear;
 	_depthRange[1] = (float)viewport.zfar;
 	_hasDepthRange = YES;
 }
-- (void)setScissorRect:(MTLScissorRect)rect           { (void)rect; }
-- (void)setCullMode:(NSUInteger)mode                  { (void)mode; }
-- (void)setFrontFacingWinding:(NSUInteger)winding     { (void)winding; }
+/* [M5a: these three were `{ (void)rect; }` and went nowhere. They are recorded now, as the
+ * depth range is, and go with each draw; the Gallium library reads none of them, so a draw there
+ * is what it always was, and the Vulkan one honours them (air_vk.c, THE DRAW PATH). The numbers
+ * are the contract's 32 bits, a rectangle past them being one no attachment has. */
+- (void)setScissorRect:(MTLScissorRect)rect
+{
+	_scissorRect[0] = rect.x > UINT32_MAX ? UINT32_MAX : (unsigned)rect.x;
+	_scissorRect[1] = rect.y > UINT32_MAX ? UINT32_MAX : (unsigned)rect.y;
+	_scissorRect[2] = rect.width > UINT32_MAX ? UINT32_MAX : (unsigned)rect.width;
+	_scissorRect[3] = rect.height > UINT32_MAX ? UINT32_MAX : (unsigned)rect.height;
+	_hasScissorRect = YES;
+}
+- (void)setCullMode:(NSUInteger)mode                  { _cullMode = (unsigned)mode; }
+- (void)setFrontFacingWinding:(NSUInteger)winding     { _frontWinding = (unsigned)winding; }
 - (void)setTriangleFillMode:(NSUInteger)mode          { (void)mode; }
 
 /* The depth/stencil state, recorded like the pipeline state: nothing runs at encode time,
@@ -4909,9 +6696,16 @@ done:
 	}
 	_depthStencilState = state;
 }
+/* [M5a: recorded and sent with each draw, for the Vulkan library's vkCmdSetBlendConstants. The
+ * Gallium library refuses the factors that read it when the pipeline is made, as it always has,
+ * so what it draws does not change.] */
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a
 {
-	(void)r; (void)g; (void)b; (void)a;
+	_blendColor[0] = r;
+	_blendColor[1] = g;
+	_blendColor[2] = b;
+	_blendColor[3] = a;
+	_hasBlendColor = YES;
 }
 
 - (void)recordDraw:(NSUInteger)primitive
@@ -4962,7 +6756,11 @@ done:
 	work->colorCount = _colorCount;
 	for (unsigned i = 0; i < _colorCount; i++) {
 		work->color[i] = [_color[i] retain];
+		work->colorLevel[i] = _colorLevel[i];
+		work->colorSlice[i] = _colorSlice[i];
 	}
+	work->depthLevel = _depthLevel;
+	work->depthSlice = _depthSlice;
 	work->clears = _clears;
 	for (unsigned i = 0; i < 4; i++) {
 		work->clearColor[i] = _clearColor[i];
@@ -4978,6 +6776,25 @@ done:
 	work->depthRange[0] = _depthRange[0];
 	work->depthRange[1] = _depthRange[1];
 	work->hasDepthRange = _hasDepthRange;
+	/* The encoder's own state as it stands at this draw (M5a), and each attachment's own
+	 * clear, for the first draw of the pass: the library takes these and not the one colour
+	 * below where it can. The first draw carries the load actions, as the comment at the
+	 * end of this method says. */
+	memcpy(work->blendColor, _blendColor, sizeof(work->blendColor));
+	work->hasBlendColor = _hasBlendColor;
+	work->cullMode = _cullMode;
+	work->frontWinding = _frontWinding;
+	memcpy(work->viewportRect, _viewportRect, sizeof(work->viewportRect));
+	work->hasViewportRect = _hasViewportRect;
+	memcpy(work->scissorRect, _scissorRect, sizeof(work->scissorRect));
+	work->hasScissorRect = _hasScissorRect;
+	for (unsigned i = 0; i < _colorCount && !_drew; i++) {
+		if (_clearsAttachment[i]) {
+			work->attachmentClearMask |= 1u << i;
+			memcpy(work->attachmentClears[i], _attachmentClear[i],
+			       sizeof(work->attachmentClears[i]));
+		}
+	}
 	work->primitive = (unsigned)primitive;
 	work->vertexStart = (unsigned)start;
 	work->vertexCount = (unsigned)count;
@@ -5013,6 +6830,29 @@ done:
 	_drew = YES;
 }
 
+/*
+ * M5b: one level and one slice of an attachment, as what a call that takes neither is given: the
+ * clear and the resolve at either end of a pass. A texture that has only the one is itself, which
+ * is every pass before this, and the only thing the Gallium library can do; there, asking for
+ * another is said once and goes to level 0, where its draw would have gone too.
+ */
+- (id)hkOnly:(id)texture level:(unsigned)level slice:(unsigned)slice
+{
+	if (level == 0 && slice == 0 && [texture mipmapLevelCount] == 1 && [texture hkSlices] == 1 &&
+	    [texture textureType] != MTLTextureType3D) {
+		return texture;
+	}
+	id window = [texture hkWindowLevel:level slice:slice];
+
+	if (window == nil) {
+		RW_ONCE("a pass's clear or resolve is of level %u, slice %u, and this compiler "
+			"library has no view to say that with: level 0 of the whole texture\n",
+			level, slice);
+		return texture;
+	}
+	return window;
+}
+
 /* -endEncoding's half of the pass: the clears of a pass that drew nothing, then the resolves. */
 - (void)recordPassEnd
 {
@@ -5024,7 +6864,8 @@ done:
 			HKMetalWork *work = [[[HKMetalWork alloc] init] autorelease];
 
 			work->blit = RW_BLIT_CLEAR;
-			work->blitTo = [_color[i] retain];
+			work->blitTo = [[self hkOnly:_color[i] level:_colorLevel[i]
+					       slice:_colorSlice[i]] retain];
 			work->clears = YES;
 			memcpy(work->clearColor, _attachmentClear[i], sizeof(work->clearColor));
 			[_commandBuffer recordWork:work];
@@ -5033,7 +6874,8 @@ done:
 			HKMetalWork *work = [[[HKMetalWork alloc] init] autorelease];
 
 			work->blit = RW_BLIT_CLEAR;
-			work->blitTo = [_depth retain];
+			work->blitTo = [[self hkOnly:_depth level:_depthLevel
+					       slice:_depthSlice] retain];
 			work->clearsDepth = _clearsDepth;
 			work->clearsStencil = _clearsStencil;
 			work->clearDepth = _clearDepth;
@@ -5049,8 +6891,10 @@ done:
 		HKMetalWork *work = [[[HKMetalWork alloc] init] autorelease];
 
 		work->blit = RW_BLIT_RESOLVE;
-		work->blitFrom = [_color[i] retain];
-		work->blitTo = [_resolveTo[i] retain];
+		work->blitFrom = [[self hkOnly:_color[i] level:_colorLevel[i]
+					 slice:_colorSlice[i]] retain];
+		work->blitTo = [[self hkOnly:_resolveTo[i] level:_resolveLevel[i]
+				       slice:_resolveSlice[i]] retain];
 		[_commandBuffer recordWork:work];
 		_resolveTo[i] = nil;
 	}
@@ -5296,7 +7140,10 @@ done:
 }
 - (void)setScissorRects:(const MTLScissorRect *)rects count:(NSUInteger)count
 {
-	(void)rects; (void)count;
+	/* [M5a: the first of them, as -setViewports: takes the first viewport] */
+	if (count >= 1 && rects != NULL) {
+		[self setScissorRect:rects[0]];
+	}
 }
 /* MTLDepthClipModeClip is what the library's rasterizer state does (depth_clip_near and
  * _far are both on); MTLDepthClipModeClamp, which keeps a primitive outside the depth range
@@ -5312,7 +7159,14 @@ done:
 }
 - (void)setDepthBias:(float)bias slopeScale:(float)scale clamp:(float)clamp
 {
-	(void)bias; (void)scale; (void)clamp;
+	/* Neither back end carries it yet (M5d), and an application would otherwise draw wrong with no way to find out
+	 * why: said once a process, and only when it asks for something other than none. */
+	static int said;
+
+	if ((bias != 0.0f || scale != 0.0f) && !__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED)) {
+		rw_print("setDepthBias:%g slopeScale:%g clamp:%g is not carried to the GPU: depth bias is dropped\n",
+		    (double)bias, (double)scale, (double)clamp);
+	}
 }
 /* The stencil reference, which Metal keeps on the encoder and not in the state object, so
  * it is recorded with the draw like the clear colour. */
@@ -6088,6 +7942,9 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 		rw_print("texture index %lu is past this driver's %d\n",
 		         (unsigned long)index, RW_MAX_BUFFERS);
 		return;
+	}
+	if ([texture isKindOfClass:[HKMetalTexture class]]) {
+		[texture hkFollowSurface];
 	}
 	_textures[index] = texture;
 	if (index + 1 > _highestTexture) {

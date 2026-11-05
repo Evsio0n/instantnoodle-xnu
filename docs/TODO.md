@@ -438,6 +438,710 @@ ISP ("roadmap修相機 ->其他 -> 最后trustzone和Titan 480 IFE").**
 - **Next:** with the owner's consent: a timed sleep with the cable out, read gauge before/after through `power_test status`/`battery_test`. Needed to judge T12, T20, T21.
 
 ### T38 The owner's list for after the camera — Mixed · Not Started (after T07) · P1
+- **(1) Wi-Fi list / 5 GHz delay / status-bar bars and (16) the clock: fixed in RAM 2026-11-04** (scan cache, wifi_dwell=1, event 39, sb_clock=28; HANDOFF). Not installed: the owner, 18:3x, "不用停和寫ufs" -- the bundle `out/instantnoodle-wifi-bars.img` waits.
+- **(3) the wallpaper: after (12) Metal** (the owner, 2026-11-04: "那就把它放在metal後面再做"). Found so far: iOS 16's Settings -> Wallpaper ->
+  Add New opens PosterBoard's gallery/editor, whose remote context our window server does not draw (the poster switcher's
+  black, research/ios-userland.md); hypothesis (unverified): PosterBoard renders its posters with Metal (CAMetalLayer) in its
+  own process, so an empty context while whole-system Metal is off. Fallback idea: an image straight into the wallpaper store
+  (the pre-16 `SBSUIWallpaperSetImages`/`SBSUIWallpaperSetImageAsWallpaperForLocations`; the Apple Wiki lists the latter up
+  to 16.0 -- check in 20F66). UI automation note: without cam=5 the home screen has no Camera icon and Settings sits at
+  (0.613, 0.71); with it at (0.847, 0.72). In Settings (run 190357, screenshots): "Display & Brightness" at (0.4, 0.90) on its
+  first page; after one swipe (0.5 0.75 -> 0.5 0.35) "Accessibility" at (0.4, 0.156) and "Wallpaper" at (0.4, 0.207).
+- **(6) the clock ~2 s behind: fixed in RAM 2026-11-04** (run 191643, screenshots + timed's os_log): Settings had no "Set
+  Automatically" because timed's `TMAutomaticTimeEnabled` was never set (Setup Assistant does it; we skip it). With
+  `/private/var/db/timed/com.apple.timed.plist` (TMAutomaticTimeEnabled = TMAutomaticTimeOnlyEnabled = true, owner _timed 266)
+  the switch is there and on, and timed fetched NTP over Wi-Fi: "Setting system time ... from TMTimeSynthesizer", settimeofday
+  adjust +16.5 s, then ntp_adjtime. Done in the tree: userland/var/db/timed/com.apple.timed.plist (the skeleton; build.sh: db/timed/*
+  owned by 266), init.c timed_prefs() (a kept volume gets it once if missing). Time Zone spins (no Location Services): cosmetic.
+  Left: the loader's whole seconds (wait for the PMIC clock's next second, xl settime in ms) for the time before the network.
+- **(5) Bold Text hangs: does not any more** -- owner-verified in RAM run 190737 (kernel ee290d6a, the installed root):
+  "是，粗體不卡了". What changed is not established (no SpringBoard relaunch or GPU hang seen in that log). The bundle it hung on
+  (1793719359) ran `gpu_pt=0 gpu_recover=0`; the installed camera bundle 1793779669 and the RAM runs have both on (GPU hang
+  recovery) -- the likeliest difference, unverified. Web: iOS relaunches SpringBoard for Bold Text.
+- **(2) no sound / no vibration: fixed in RAM 2026-11-04** (the owner: "聲音正常", run 185457; HANDOFF: args, fw-audio, hk_adsp_fw_file, IO_MAP_SIZE 64 MB). Not installed.
+- **The kernel command line is near the loader's limit:** BOOT_LINE_LENGTH 608 (Apple's boot_args), the loader's prefix 187 B; the
+  installed set with sound and items 1/16 is 584 B, RAM runs 604. Next: board defaults in the kernel for board=instantnoodle
+  (gpu_irq=0, gpu_dcvs=0, gpu_sleep=0, gpu_hwcg=0, syssleep=0, buttons_voldown_pullup, board_gpu_zap...) or shorter names.
+- **(4) no Camera app: fixed** (the owner, 2026-11-04: "4. 解決了，fix"; T07, the MobileGestalt cache and /var made anew).
+- **(17) the screen's HDR, with (11)** (the owner: "和11 一起做吧"): the panel's device tree says hdr-enabled, ~430 nits peak, 8-bit,
+  bl-max 2047, an HBM command (0x53=0xe0, 0x51=0x0f60); eagl.c:3017 ignores CoreAnimation's EDR (the supervisor's notes,
+  outputs/相機完成後待修.txt #17). Not started.
+- **(7) screenshots: work in RAM 2026-11-04** -- by rwtouch's `chord volup lock` and by the physical keys (the owner, run
+  192832: "有截圖"), and saved on an HFS+ /var (run 192253, `hk_data=2`, a PNG in /private/var/mobile/Media/DCIM/100APPLE).
+  Not explained for the installed boot; that /var was made anew at 16:49 (T07), which may be what fixed it. Recheck on the
+  installed boot at the next install. rwtouch now has `chord NAME NAME [MS]` (userland/src/rwtouch.c).
+- **(18) the sound's delay: quick fix done in RAM 2026-11-04** (the owner: "聲音延遲比較高", "先試快速改法"; then "晚点和dsp
+  处理"). Measured (runs 193817-195427, hk_sound.c's new lines: each sound after silence with its time and the ring ahead of
+  it, underflows as they come, the ring's longest wait): a keyboard click was heard ~0.76 s after iOS wrote it -- the parked
+  ring had filled with the silence iOS writes from the moment Search opens its keyboard (32768 frames, 682 ms) and that
+  backlog never drained (both sides 48 kHz) -- plus 8 x 20 ms at the DSP. Now: 8 x 10 ms at the DSP (80 ms); silence not kept
+  while parked, the first sound clears what is older; silence over 43 ms at the ring's front dropped (sound never); the
+  amplifiers off after 30 s of silence, not 3; after a park 60 ms of silence lead the sound (the amplifiers come up 54-69 ms
+  after the write). Result: 0-10 ms in the ring, 0 underflows, no HAL complaints, a 2 s tone and the boot sound whole;
+  touch to iOS's write 95-128 ms (iOS's own), then 80 ms. Left for the DSP group at the end: the ADSP's low-latency path
+  (ULL ASM) and iOS's ~0.1 s from the touch to the HAL's write. Not installed.
+  **DSP round, 2026-11-05 (the owner: "晚点和dsp 处理"; stopped for MDP, RAM, amplifiers down, numbers from logs only, nothing heard or measured at the speaker):** **a correction: the "95-128 ms touch to write" above includes 55 ms of the test.** rwtouch takes its mark's time, prints the line to the console, then posts, constant (touch_lat=1, run 181527). Split: kernel's post to the window server's hand-over 0.1-0.8 ms; hand-over to iOS's write 39-60 ms, median 45; so that part is iOS's own and nothing on our side stands in it. A real finger's scan and I2C read come before the post and are not measured (interrupt-driven at priority 92). Baseline run 180858, 8 x 10 ms: ring 0-9 ms, DSP 80 ms, 0 underflows. Run 181527, `sound_periods=4` (40 ms): 0 underflows, but the ring went to 19-29 ms, so 40 ms less queue gave about 20 ms; post to the queue's end about 108 ms against about 130. From a park, 60 ms of lead silence more (UNPARK_LEAD_MS, now counted over more than one filling). The default is still 8 x 10 ms: nothing shorter has been listened to. **Next:** `sound_periods=2`; silence kept in the ring, now up to 43 ms (RING_WAIT_MOST; make it an argument, try about 11 ms); iOS's IO size (the HAL logs a 512-frame request, the plug-in's Latency and SafetyOffset are 0); then ASM's low-latency and ultra-low-latency session flags and ADM's 0x2000 and 0x4000 ([Linux q6asm's enum](https://kunit.googlesource.com/linux/+/03535f4b32f2a11ba6c5bb07290995ecd77c69ac/sound/soc/qcom/qdsp6/q6asm.c), [msm's flags](https://gitlab.e.foundation/e/devices/android_kernel_fairphone_fp5/-/commit/42c2b29a1992e5d2518a33d3f4d4633f6ef07cc4)), not tried. A hardware reference: a short tone played and heard back through the microphone (mic=4), evening only, one run; waits for the supervisor. **Camera speed (item 14) not started:** nothing measured in this round; record stands at 981 ms to open, 3-4 s from the owner.
+  **mediaserverd kills itself 23.2-23.45 s after it starts, sometimes:** launchd says `exited due to SIGKILL | sent by mediaserverd[N]`, in 180530 and 180858 of today's four, and in the Metal boots 151633-170709 (with camera and sound off in those, so neither is the cause); not in 180414 and 181527. Nothing of ours sends it. Its own log (`medialog`, run 180858) goes quiet 1.2 s after its start but for one line at 9.4 s, CVAPortraitVideoPipeline's "MTLCreateSystemDefaultDevice() is nil", which the second instance logs as well and lives, and Metal boots have a device and die too. Why is not known. Respawned at once and done by about 29 s of uptime, so numbers taken after 30 s are not disturbed. `mediastacks` (ustacks=mediaserverd ustacks_at=20) printed nothing: its lines go to the kernel's own log unless `ustacks_tname=*` is given too.
+- **(11) 45 Hz: Safari's own cap, measured in RAM 2026-11-04** (run 200057, the owner: "還是45"): with TestUFO open in Safari
+  the compositor drew 44-47 frames a second (225 every 5 s) and TestUFO's strips read 23 and 11 fps (45/2, 45/4); the
+  system's own gestures were 84-88 fps (home-screen pages), 81 (Control Center), 55-65 (Settings' list); the panel's TE is
+  11111 us (90 Hz). Cause (web + 20F66's dyld cache): WebKit's PreferPageRenderingUpdatesNear60FPSEnabled (on by default)
+  renders pages near 60, and iOS picks a rate dividing the panel's 90: 45. **Proven in RAM run 201209:** with
+  WebKitExperimentalPreferPageRenderingUpdatesNear60FPSEnabled (and the legacy WebKitPreferPageRenderingUpdatesNear60FPSEnabled)
+  false through cfprefsd (`userland/src/prefs_set.c`, in mobile's global domain and com.apple.mobilesafari) TestUFO read
+  68/34/17 fps and the owner saw "間歇性60-90fps" -- not steady: TestUFO's box red (stutter), the compositor's driver time
+  3-6.6 ms and GPU waits 1-4.5 ms a frame on Safari's page (our GL path; with Metal later, item 8/12). Not a default yet:
+  the owner chooses (steady 45, or 60-90 uneven). Settings > Safari does not open here (19), so the switch would be set at
+  boot (prefs_set in rc.jobs, or init). The Settings list at 55-65 fps against the home screen's 84-88: per-app cost, to
+  look at again after Metal.
+- **(17) HDR: research done 2026-11-04** (read-only, 20F66's dyld cache; inferred where it says so): QuartzCore lists the
+  iPhone X's A11 (0x8015) among chips without a hardware EDR factor, so CoreAnimation scales SDR down itself on the GPU
+  (its Metal function `edr_scale`, our function 61, skipped in eagl.c: right while the factor is 1). EDR is only offered
+  when CoreBrightness (in backboardd) sees hardware max nits above the user's: it reads `backlight-calibration-parameters`
+  (lMaxPanel/lMidPanel/lMinPanel, milliAmps2NitsScaleFactor, user-accessible-max-nits, ...), `new-backlight-architecture`
+  from AppleARMBacklight, which our stand-in (MiniAppleARMBacklight.cpp) does not publish; backboardd logs "EDRServerContext:
+  displays 1 context not found". Overrides exist: CA_DISPLAY_EDR_HEADROOM, CA_FRAMEBUFFER_EDR_HEADROOM. Steps: (1) the
+  env override in backboardd as a quick look; (2) the calibration keys on the backlight stand-in (user max ~430 nits, the
+  HBM max to be measured); (3) the part above SDR to HBM (DCS 0x53=0xe0, 0x51) with a time limit and a temperature cutoff;
+  (4) function 61 in eagl.c (linear multiply, dither). HDR video may still need 10-bit HEVC and HDRProcessing.
+  Sources: WWDC22 "Explore EDR on iOS", WWDC21 "HDR rendering with EDR", UIScreen currentEDRHeadroom docs.
+  Done since (RAM): CA_DISPLAY_EDR_HEADROOM=2 in backboardd's environment reaches CoreAnimation -- function 61's numbers
+  [inf 1 0 0] became [inf 0.5 0 0] (the second is 1/headroom), run 202252; nothing dims because eagl.c skips it. HBM is
+  built (`bsd/dev/hk_hbm.c`, `hk_display_hbm()`, boot-arg `hbm=1`, `power_test hbm N`; display.md), not yet run; a first
+  5 s pulse waits for the supervisor's OK of its limits (out/rc.jobs.hbm, run flag `hbm`). CoreBrightness's calibration
+  keys: being read out of 20F66 (types and units) before the backlight stand-in publishes any (a wrong type could take
+  backboardd down).
+  **HBM verified on the phone 2026-11-04** (run 204007, three 5 s pulses, kernel 7862f749, hbm=1): the owner "有很亮，不錯",
+  "有，很明顯"; each OFF at 5014-5015 ms, battery 25 C, hottest 44.6-49.2 C, TE 11373-11377 us before/during/after (HBM
+  does not move it; it is 87.9 Hz there, not 90: see (11)); the way to the loader sent the off-command (logdump).
+  **The EDR step verified** (run 203539): with CA_DISPLAY_EDR_HEADROOM=2 the Calendar widget's white went 255 -> 188 =
+  sRGB(0.5 in linear light). The GL library with it is in the shared root (nothing changes while the factor is 1).
+  **CoreBrightness's new architecture (edr=1, test-only):** MiniAppleARMBacklight.cpp publishes new-backlight-architecture,
+  the nine calibration numbers (x65536), user-accessible-max-nits (16.16 LE data) and a marketing table (2..600 nits);
+  CoreBrightness takes it (no crash), drives the panel by brightness-nits (16.16; hk_display_set_nits: <= 430 linear to
+  0x7ff, above -> hk_hbm_hold, never above brightness-nits-cap). Found (runs 204813-210942, RE of 20F66): "[1] Unexpected
+  nits type" is CoreBrightness's own message on every committed step (harmless); DisplayBrightness / NitsPhysical are only
+  reports (applying them too made two drivers fight: the owner's broken Control Center curve, run 210107); floating-point
+  CFNumbers reach the kernel as their IEEE bits in an OSNumber of "31 bits". **Not working yet:** the slider with edr=1 --
+  at each drag CoreBrightness's slider position jumps between 1 and 0 (its nits -> slider lookup in the marketing table
+  fails: _DisplayLogicalToSliderBrightnessInternal returns its floor or top), so the panel sweeps oddly; and a fresh /var
+  starts at 2 nits and fades up over a minute. With edr=0 (the shared and installed set) the slider is smooth (run 210543,
+  the owner "平順變亮"). Next: read how CoreBrightness reads the marketing table (entry type and count, the brightness
+  factor at offset 324) and fix the table; then HDR content.
+  **Fixed (kernel fb3ad081, RAM run 212539, self-checked from the log):** the cause was ExtrabrightEDR -- with
+  user-accessible-max-nits under lMaxPanel, libEDR takes brightness-nits over (raising the backlight up to 4x for
+  CoreAnimation to dim, which it did not) and its ramps met CoreBrightness's own. Now edr=1 is the new architecture
+  without it (lMax 430, a 17-entry table 2..430, no user-accessible-max-nits: the slider's top is 0x7ff, HBM out of
+  reach) and edr=2 adds ExtrabrightEDR (600 over 430) for HDR later. Control Center swept in ten drags of 0.031 of the
+  screen (~9.5% each): 4-5, 7-8, 14-15, 25, 43-47, 69-78, 111-123, 175-189, 258-297 nits, monotonic, no 0/1 snaps.
+  The owner (2026-11-04 21:3x): "亮度目前測試是OK的". Next: edr=2 with HDR content, CoreAnimation's factor and HBM.
+  **HDR content is blocked (runs 213232-215718):** SpringBoard's PhotoKit import fails (3301) because assetsd crashes
+  rendering the HEIC -- its log: "No sandbox extension ... for filePath", "[api] No Metal renderer available", "[render]
+  Unable to get macro state for the GLContext: 0x0", then "assetsd starting up" with a new pid; and Files does not list
+  files placed in the LocalStorage provider's container (userland/src/files_drop.c puts them there, as file-N, and can
+  open one by a shareddocuments:// URL, which opened Files on Recents): the location view stays empty. Every route to
+  an HDR picture on screen (Photos, Quick Look, an app's EDR layer) wants CoreImage's GPU path: Metal, (12). edr=2 is
+  ready for it (ExtrabrightEDR published); the coupling of CoreAnimation's factor with HBM goes through hk_hbm_hold.
+  **Photos' HDR view (runs 224931-230437, 2026-11-04):** without libhackios-gl in MobileSlideShow, Photos ends at every
+  start once the library has photos. With it, Photos ended within 0.1 s when it decoded an HDR gain map (on opening a
+  photo, or for the grid at start).
+  - exctrace, 14 times: pc 0 in CI::GLContext::init+204, reached from -[PHImageResult setHighDynamicRangeGainMap:...]
+    through +[PFImageMetadata createImageRefFromAuxiliaryImagePixelBuffer:...] and +[CIContext contextWithOptions:].
+    With no Metal ("[api] No Metal renderer available"), CoreImage falls back to OpenGL ES on its own: two
+    EAGLContexts of API 3 per CIContext (CI::GLContext's constructor, the second sharing the first).
+  - The cause was eagl.c's context table, which had no lock. Photos decodes two gain maps at once on two threads; both
+    took the same place, so one context was not found again. Its -API gave 0 ("no context of API 0"), its
+    getMacroContextPrivate gave NULL ("[render] Unable to get macro state"), and init called glDisable through a
+    zeroed table.
+  - Fixed in GL library a5074b37: the table under a mutex, a place taken before the slow part, 32 places. **Verified
+    on the phone, run 231531:** no usertrap in the whole run; the photo opens full size (the owner: "現在不會閃退").
+  - **The first complete EDR ramp (run 231531):** CoreAnimation's factor went 0.993 -> 0.500 in about 2 s while
+    brightness-nits rose with it, 70 -> about 140 nits (ExtrabrightEDR: SDR white stays, highlights get 2x). At 20 %
+    brightness it reached 0.486. The headroom is about 2 at both levels, so the photo's own headroom is the limit. No
+    hbm lines (nothing over 430).
+  - **Open: the full-size photo shows without colour** (the owner: "顯示黑白了"; the thumbnails are in colour). It
+    reaches backboardd as a two-plane YCbCr surface (plane 0 GL_R8, plane 1 GL_RG8 at half size), drawn by
+    CoreAnimation's own shader, `ycbcr_matrix * vec3(t0.r + ycbcr_bias.x, t1.rg + ycbcr_bias.yz)`: Mesa has no
+    GL_APPLE_texture_ycbcr_basic_formats. The gain maps (L008) appear only in Photos' CoreImage contexts.
+    - Either the chroma plane is neutral from the decoder: Photos logs "PHFigDecoder - failed async decode ... -12914",
+      VideoToolbox's kVTImageRotationNotSupportedErr, so it may be on a fallback decode.
+    - Or the matrix/bias do not reach the shader as meant.
+    - GL library 17af903e logs the planes' bytes, glUniformMatrix3fv's values and the YCbCr shader's text to tell
+      which (run 98).
+    - **Answered (runs 232852, 233935): what shows is the gain map; the base never decodes at full size.**
+      - The compositor's YCbCr path is right: the wallpaper's '420f' surface carries chroma 63-195, and ycbcr_matrix
+        arrives as full-range BT.601. Thumbnails and previews (512x384, 500x376, 168x126, 95x127) decode in colour.
+      - Each open of a photo: CoreImage textures only its gain maps (L008 240x180, 1024x768, 2016x1512); PHFigDecoder
+        logs -12914 for the base; no two-plane surface appears in the full-size view. The supervisor's pixel comparison
+        on a Mac (screenshot against the photo's base and gain map) agrees.
+      - Not the angle alone: the landscape photo needs no turn and fails too.
+      - In 20F66's VideoToolbox, 13 places give -12914, all on the rotation path (VTPixelRotationSession*,
+        VTPixelTransferNodeRotationDoTransfer, vt_Rotate_y420, vt_Rotate_Celeste). VTImageRotationSessionCreate sets
+        kVTPixelRotationPropertyKey_EnableGPUAcceleratedTransfer; a CPU path exists (vImageRotate90_Planar8).
+        VideoToolbox reaches FigSignalErrorAt through stub islands, so there is no table to hook.
+      - userland/src/vt_test.c (run 234735) asked VideoToolbox each case directly, and all returned 0: 420f at three
+        sizes up to 5712x4284, 10-bit 'xf20', BGRA and L008; 0 and 90 degrees; GPU left alone, asked for or
+        refused; scales to 1125 wide. ImageIO decoded both HEICs with their orientation applied (up to 4096). So
+        VideoToolbox works; the failure is the path Photos' PHFigDecoder takes through CMPhoto. Its options
+        (_figDecodeOptionsFromContext) are AccelerationMode, TiledDownsampling, ForceHighSpeed, UseEvenScalingMode,
+        ApplyTransform, MaxPixelSize, OutputPixelFormat, HighPriority and a SourceCropRect. CMPhoto probes
+        AppleM2ScalerCSCDriver and IOSurfaceAccelerator's capabilities, has "heifhw" queues and a tiled-layer Metal
+        conversion, and links Metal and MPS.
+      - No supported switch: allowFallbackDecoder and preferSWDecode are per-request flags in Photos' code
+        (_PHDecodeImageFromURLForRequest), and CMPhoto reads no preference that would turn its acceleration off.
+        Only one library photo's decode logged -12914; the other HEIC logged nothing and showed grey too, so the
+        HDR composite without Metal may fall back as well.
+      - **Decided with the supervisor (2026-11-05 00:xx): the HDR display side is done; the full-size HDR content
+        view waits for Metal (12).** KNOWN_ISSUES K27. A possible interim (hooking Photos to its PHImageIODecoder)
+        is not done (the supervisor's call): it would likely show the SDR base in colour only, since the HDR
+        highlights need Tungsten's Metal renderer ("[Tungsten] Metal Device is nil ... degraded experience"). The kept-contexts teardown mitigation matters only where libhackios-gl is injected outside
+        backboardd, which is in test roots only today (assetsd, MobileSlideShow); it waits with the real teardown
+        fix for Metal, unless the assetsd line goes into the installed inject.conf first.
+      - **Blocker found for the HDR content view (2026-11-05, read from the code, M3e planning; unverified on the
+        phone):** an RGBA16Float IOSurface the GPU imports must have rows aligned to 128 bytes (freedreno's pitch rule
+        pitchalign = cpp_shift + 4, at least 6: 64 B for texels up to 4 B, 128 B for 8 B, 256 B for 16 B; turnip has
+        the same rule). The kernel aligns every surface's rows to 64 only, so a full-screen 1080-wide RGBA16Float
+        drawable (8640-byte rows) is refused by both Metal back ends, and Gallium's refusal sentence blames the
+        surface instead of the pitch rule. Fix, which changes the kernel and so needs a round of its own: the surface
+        allocation (iokit/Kernel/HKGPU.cpp / MiniIOSurface) aligns 8-byte-texel rows to 128 and 16-byte ones to 256;
+        and the Gallium refusal sentence (air_metal.c's import path / hkdrawable.m) is corrected to name the pitch
+        rule, in the same round.
+      - **Kernel item, same round: GPU writes, CPU reads, and nobody invalidates the CPU's cache (2026-11-05, read from
+        the code during M3e; both Metal back ends and GL alike).** HKGPU.cpp submit() cleans and invalidates (DC CIVAC) a
+        surface's lines only at submission (when its seed moved, it was mapped, or 4 ms passed); kMsmWaitFence and
+        kMsmGemCpuPrep only wait, MiniIOSurface lockCommon only moves the seed (IOSurfaceLock(ReadOnly) does nothing for
+        the cache), hk_adreno.c hk_gpu_done cleans only the fence word. So a CPU that read a surface before the GPU
+        wrote it can read stale lines afterwards, when the next submission comes within 4 ms: screenshots, CoreImage
+        read-backs, the camera's CPU post-processing. Rare and hard to reproduce. Fix: invalidate at fence signal for
+        the submission's surfaces, or at IOSurfaceLock(ReadOnly). air_metal_test --surface self measures it (pre-read,
+        GPU write, post-fence read: "stale k gap U us"). **Observed on the phone (run 054947), on both back ends:**
+        Gallium BGRA8 100x64 6384/6400 stale with a 5062 us gap (past 4 ms: the clean happens at submission, not after
+        the GPU wrote), RGBA16F 64x64 1728/4096 at 2482 us; vk BGRA8 1080/6400 at 525 us, RGBA16F 616/4096 at 290 us;
+        1080x2400 0 on both (the surface is larger than the cache). A DC CIVAC from EL0 afterwards makes every read right.
+    - Photos' first launch on a new /var puts "What's New in Photos" and a notifications alert in front; a scripted
+      run must answer both before it can open a photo.
+  - Cost: with the teardown mitigation, each CIContext keeps its 2 Mesa contexts when released, one CIContext per HDR
+    gain map decoded. The teardown's real fix (below, (12)) bounds this.
+  - The EDR factor in those 0.1 s: 0.993 then 0.999 with brightness-nits 70.0 -> 70.5 -> 70.0. This is libEDR's ramp
+    cut off by Photos' end, not a small grant. libEDR's "EDRServerEnableSBIM: IORegistryEntrySetCFProperty() =>
+    0xe00002c7" is the framebuffer refusing its enableSBIM property (MiniIOMobileFramebuffer has no setProperties);
+    not yet known to matter.
+- **(12) Metal, 2026-11-04 (the owner: "開始做 Metal"; "Metal 轉成 Vulkan 繼續，我們要gpu cost 最小"):**
+  **First milestone done in RAM (run 223014):** CoreImage over our OpenGL ES, not Metal -- iOS 16.5's CoreImage has a
+  real GL backend (CI::GLContext), and eagl.c already replaces the EAGLContext methods it needs; assetsd only lacked the
+  library: a test root's inject.conf line `/hackios/lib/libhackios-gl.dylib assetsd` made the photo import work and
+  Photos show a HEIC (the owner: "有顯示"); metal_test ci-eagl: "backend: OpenGL ES (CI::GLContext)", "CoreImage
+  rendered: first pixel 0 229 255 255" (the linear-light inversion of sRGB orange: right). A teardown SIGSEGV
+  (CoreImage releasing the EAGLContext on a thread where it was not current: my_dealloc -> hk_gl_destroy ->
+  OSMesaDestroyContext, run 223900, named by metal_test's new dladdr lines and exctrace) is fixed in eagl.c (the
+  context made current first, then destroyed); retest run 93. Not yet in the shared inject.conf.
+  **The Metal backend (assessed read-only):** turnip from the same Mesa 25.0.7 tree over HKGPU through the existing
+  libdrm shim (sync objects emulated on the single in-order ring, mmap, IOSurface import, device discovery; no kernel
+  change for a first step), AIR -> NIR handed to turnip directly (no SPIR-V), behind `metal_backend=vk` (default off);
+  the compositor stays on OpenGL ES. Milestones: M1 vkCmdFillBuffer over HKGPU read back; M2 a clear and a triangle;
+  M3 a Metal clear/draw through turnip (the 263/271 fragment-shader corpus as the regression); M4 the same Metal
+  workload on gallium and turnip: GPU time per submission (kHKGPUWorked) and CPU time per frame, on the same kernel.
+  Expected: GPU cost about the same (same ir3, same hardware; turnip skips GMEM loads by Metal's load/store actions),
+  CPU per frame lower (encoding at record time, any thread).
+  **M1 passed on the phone, 2026-11-05 (run 002111; the owner: "Metal first"):** "Turnip Adreno (TM) 650", Vulkan
+  1.3.305, one host-visible coherent memory type, one queue family. The device is made in 30 ms. A 1 MB vkCmdFillBuffer
+  takes 112 us to submit and 142 us more to signal, and every word reads back right, twice. No trap, no GPU fault or hang,
+  no ENOSYS request from the shim. backboardd's frames are unchanged around it.
+  - Run 001544 first stopped at SIGILL: turnip read ctr_el0 for the cache line size, which XNU does not let a program
+    read. On Darwin the size is 0 now: no cached non-coherent memory (HKGPU's buffers are WC), and
+    tu_bo_sync_cache returns early.
+  - The build is in docs/BUILD.md.
+  **M2 passed on the phone, 2026-11-05 (run 002902):** in vk_test after M1, a 64 x 64 picture cleared to blue by a
+  render pass and a red triangle drawn from two SPIR-V shaders (userland/src/vk_test_shaders.h, made by glslangValidator
+  15.1). Result: 512 red, 3584 blue, 0 other, in all three of turnip's ways, each a new process:
+  - sysmem without UBWC;
+  - sysmem;
+  - GMEM forced.
+  The pipeline compiles (SPIR-V -> NIR -> ir3, on the phone) in 2.1-2.7 ms; the draw and copy take 5.2-5.7 ms. No trap,
+  no GPU recovery, backboardd's frames unchanged. (TU_DEBUG's startup line leaves out its runtime flags, sysmem and
+  gmem; they were set.) The fill fences took 6-8 ms here, against 0.14 ms in run 002111: to look at for M4.
+  **M3a passed on the phone, 2026-11-05 (run 012447):** a Metal draw through turnip, AIR -> NIR, no SPIR-V.
+  - tools/mesa/air/air_vk.c is a second implementation of the rwa_* contract (air_metal.h), over Vulkan, built into
+    libvulkan_freedreno.dylib with the AIR frontend. tu_hackios.cc gives it turnip's nir options. It exports only
+    vk_icd*, rwa_* and rwa_vk_counts (tu_hackios_exports.txt).
+  - The NIR goes in by VkPipelineShaderStageNirCreateInfoMESA, with dynamic rendering and a generated full-screen
+    vertex stage.
+  - hkmetal.m picks the library: HK_METAL_BACKEND=vk|gallium for test programs, otherwise boot-arg metal_backend=vk;
+    the default is unchanged.
+  - Results, both back ends in one boot:
+    - QuartzCore's path_rect_frag_lpf, attachments cleared to 0.25, reads back 0 on both, with equal digests (the shader
+      ran and wrote).
+    - The hand-written fragPos (tools/air/fragpos.ll, `return pos;`), through air_metal_test --gpu built against each
+      library, reads (0.5 0.5 0 1) at pixel (0,0) and (3.5 3.5 0 1) at (3,3) on both: the same origin and y.
+    - Nothing leaks (0 command buffers, fences and images after release). No trap or GPU fault.
+  - Run 011617 first read 0 from both with a 0 clear, which proved nothing; hence --clear.
+  - 19 rwa_* calls are real. The other 25 refuse by name: textures written by the processor, samplers, copies,
+    compute, argument buffers, texture_from_surface.
+  - Next: M3b, resources. A NIR pass from Metal's flat indices to Vulkan descriptors (push descriptors), then
+    texture_write, samplers and copies, then the corpus (--draw-all) against Gallium.
+  **M3b passed on the phone, 2026-11-05 (runs 020036 and 020900):** buffers, textures and samplers through turnip.
+  - air_vk.c (4104 lines) lowers Metal's flat indices onto one push-descriptor set for both stages (Vulkan allows one a
+    pipeline). Binding = stage (fragment 0, vertex 256) + kind (buffers 0, textures 32, samplers 160) + the Metal
+    index. A buffer is a UBO when it fits (maxUniformBufferRange), otherwise a read-only SSBO. A read-only buffer bound at
+    an offset Vulkan's alignment does not allow is copied into aligned memory first; a written one is refused. Barriers
+    and layout changes come before each pass. 29 of 44 rwa_* calls are real; 15 refuse by name with "(M3b)": compute
+    (4), texture_from_surface, depth (4), resolve, argument buffers (5).
+  - Turnip's limits as printed on the phone: minUniformBufferOffsetAlignment 64, minStorageBufferOffsetAlignment 4,
+    maxUniformBufferRange 65536, maxPushDescriptors 32.
+  - Run 020036 (out/rc.jobs.m3b), each pair Gallium then vk in one boot: clearFragment20 (15 uniform buffers) with the
+    generated vertex stage and with Apple's clearVertex, both THE SAME as softpipe (2458616957 2930221209 3401825461
+    3873429713, digest fc5fe79f32951325); texturedFragment2DUInt with an RGBA32Uint 2D texture, 101 201 302 400 on both
+    (digest de42bcc64cd36125); air_metal_test --gpu clearFragment20, all 16 pixels and FNV-1a the same.
+  - --argbuf: the [[buffer(0)]] encoder is nil on both (Apple's shaders declare no argument buffer). The application-
+    described 3-member encoder records 3 of 3 on Gallium; vk records 0 of 3 (rwa_module_argbufs and
+    rwa_argbuf_encode_* refuse). Expected: argument buffers are not in air_vk yet.
+  - The corpus, all 271 fragment shaders of AppleMetalGLRenderer's default.metallib on both back ends. --draw-all draws
+    60 unless given FROM COUNT (metal_drv_test.m draw_count), so run 020036 drew 0-59 and run 020900 (out/rc.jobs.m3b2)
+    `--draw-all 60 211`. Joined on name:
+    - same, all three attachments' digests: 259.
+    - differs only in channels the shader leaves undefined: 1. texturedFragment2DStencil returns one i16 (.r of a uint
+      sample, by llvm-dis) into an RGBA32Uint target. R is 101 on both; G/B/A hold whatever each GPU leaves.
+    - real differences: 0.
+    - vk refused alone: 3, texturedFragment3DFloat/Int/UInt. rwa_texture_create makes only MTLTextureType2D.
+    - both failed: 8. Six multisample textures (texture2d_ms, depth2d_ms) neither back end makes;
+      texturedFragment2DDepth stores [[depth]] with no depth attachment; texturedFragment3DDepth (depth on Gallium, 3D
+      on vk).
+    No trap, GPU fault or hang. Every vk object is released (0 command buffers, fences, images after release).
+  - Wall clock by rwtouch marks, process start included (not the M4 measurement): 60 shaders, Gallium 0.28 s and vk
+    0.50 s; 211 shaders, 1.80 s and 1.32 s.
+  - Next: M3c. First 3D textures in rwa_texture_create (the three vk-only refusals). Then depth attachments and
+    [[depth]], multisample and resolve, vertex streams and index buffers, blending, compute, argument buffers,
+    texture_from_surface (IOSurface). Then M4.
+  **M3c-1 passed on the phone, 2026-11-05 (run 023037):** 3D textures, and fences given back at completion.
+  - air_vk.c (4284 lines): rwa_texture_create makes MTLTextureType3D (VK_IMAGE_TYPE_3D, a 3D view, maxImageDimension3D
+    checked); texture_region, rwa_texture_read/write, rwa_copy_texture and the buffer<->texture copies carry depth
+    (bytesPerImage -> bufferImageHeight). Refused by name "(M3c)": a 3D colour attachment (Gallium refuses it too) and a
+    pixel-coordinate sampler on a texture3d (Vulkan forbids it). Still one sample, one level, one slice.
+  - hkmetal.m -hkWaitFence gives the rwa fence back once it is paid, not at -dealloc (both back ends). Run 020900's
+    --draw-all had 208 command buffers and fences in use, because each finished MTLCommandBuffer, autoreleased in a loop
+    with no pool of its own, held its fence and with it the back end's command buffer. A failed wait keeps its fence.
+    Anything read out of a fence later (GPU times, M4) must be read there, before the release.
+  - metal_drv_test.m: --texslots N=3d:FMT binds a 3D texture (the single draw used to drop the kind and bind 2D) and
+    reads the 4x4x4 volume back whole; --draw-all prints vk's in-use counts every 50 shaders and the peak.
+  - Results: clearFragment20 THE SAME on both. texturedFragment3DFloat (5c568146688f9365), 3DInt and 3DUInt
+    (da5663e328d32a25) the same on both, 64 of 64 texels read back on both. --draw-all 5-211: Gallium 206 of 207
+    identical to M3b, the other being texturedFragment2DStencil, whose undefined channels move from run to run on
+    Gallium too; vk against Gallium 203 same, 1 undefined-only, 0 different, 0 vk-only refusals, 3 failed on both.
+    vk in use during --draw-all: 0 command buffers and 0 fences at every 50-shader point (208 before); 10-12 images,
+    the textures the autoreleased command buffers still hold (the test's behaviour); 0 after release.
+  - Indices 0-4 and 212-270 were not redrawn on this library. Projected over 271: 262 same, 1 undefined-only, 0
+    different, 0 vk-only, 8 failed on both (6 multisample, texturedFragment2DDepth, 3DDepth).
+  - Next: M3c-2, depth: depth/stencil formats, a depth attachment and depth-stencil state, [[depth]] stores; then
+    multisample and resolve, compute, argument buffers, texture_from_surface.
+  **M3c-2 passed on the phone (vk), 2026-11-05 (runs 030433 + 030853):** depth and stencil.
+  - air_vk.c (5173 lines): Metal 250/252/253/260 -> D16_UNORM, D32_SFLOAT, S8_UINT, D32_SFLOAT_S8_UINT (255, 261, 262
+    refused by name, as on Gallium); depth textures with a sampling view (one aspect) and a pass view (all aspects);
+    rwa_depth_read per aspect; rwa_clear_depth_stencil; copies with aspect masks (depth<->colour refused: Vulkan needs
+    maintenance8); rwa_depth_stencil_create/_destroy; pDepthStencilState and 8 dynamic states; pDepth/StencilAttachment
+    at the draw; [[depth]] stores accepted where there is a depth attachment. 48 exports.
+  - metal_drv_test.m: --draw-depth ends in a depth-result line on both back ends; texturedFragment2DDepth's depth2d is
+    bound a Depth32Float (both back ends bound it an RGBA32Float before); --draw-all retries a [[depth]]-storing shader
+    with a Depth32Float attachment and adds "d HEX".
+  - Results: --draw-depth clearFragment20 the same on both for Depth32Float, Depth32Float_Stencil8 and Depth16Unorm
+    (bit for bit); Stencil8 stops by name on both. vk: texturedFragment2DDepth stores the sampled 0.0859375 and it reads
+    back in all 16 texels; 3DDepth stores 0.3359375. The corpus, 271/271 in two boots: 262 same, 1 undefined-only
+    (2DStencil), 0 different, 0 vk-only failures, 2 Gallium-only failures, 6 multisample on both. Gallium 269/271
+    identical to runs 020036/020900/023037. vk peak in use 0 command buffers and fences.
+  - New Gallium bug (KNOWN_ISSUES K28): a fragment shader storing [[depth]] times the GPU out on the Gallium path
+    (2DDepth, 3DDepth; the kernel recovers the core, 4 times in run 030433). Never ran before, since both refused it.
+  - Hang recovery seen again (for docs/subsystems/gpu.md, whose "3 hangs of 3 recovered" line this extends; that file
+    holds another session's uncommitted edits, so it is not changed here): run 030433 had 4 hangs, all 4 recovered
+    ("THE 3D CORE IS RECOVERED (n times in this run)"), and every job after them ran normally, the Vulkan back end and
+    the window server included.
+  - K28 is not freedreno Gallium itself: `gl_test fragdepth z32f|z16` (userland/src/gl_test.c, GLSL ES 3.00
+    gl_FragDepth through libOSMesa, the window server's driver, FD650) stores 0.25 and the depth test reads it, in 1.8 ms,
+    with no hang (run 034547). So the fault is in the Metal AIR -> Gallium path (air_metal.c or the NIR it hands Gallium).
+  - Next: M3c-3, multisample textures and resolve (the 6 shaders both back ends fail); then compute, argument
+    buffers, texture_from_surface (IOSurface); then M4.
+  **M3c-3 passed on the phone, 2026-11-05 (run 034547):** multisample textures, passes and resolves.
+  - Gallium never refused multisample: the six shaders failed on both back ends because metal_drv_test's
+    draw_texture_descriptor asked for a MTLTextureType2DMultisample of sampleCount 1 (Metal's own rule refuses it).
+  - air_vk.c (5813 lines): 2D multisample textures of the counts turnip offers for the format and usage (1, 2, 4 on
+    a6xx, printed at device open); processor reads/writes and mixed-count copies refused in Gallium's words;
+    rwa_resolve_texture real (an empty dynamic-rendering pass with a resolve view: AVERAGE for float colour,
+    SAMPLE_ZERO for integer and depth; vkCmdResolveImage when the destination is not a render target);
+    rasterizationSamples from the pipeline; Gallium's attachment_shape_fits at the draw; sampleRateShading on.
+    hkmetal.m unchanged (it already passes the counts and the colour resolves; a depth attachment's resolveTexture is
+    not routed: on Gallium that would be a depth-writing blit, K28).
+  - metal_drv_test.m: texture2d_ms/depth2d_ms slots get a 4-sample texture filled by a Clear pass, and the drawall line
+    ends in "ms match|differs" against the value computed from it; --draw-msaa N (msaa-result line); --draw-one NAME;
+    a [[depth]]-storing shader refused by name on Gallium in sweeps (K28) unless --gallium-depth-stores.
+  - Results: --draw-msaa 4 and 2 SAMPLE_ZERO and 4 AVERAGE equal on both back ends and to the computed values, ulps 0;
+    a triangle edge resolves to exactly half with AVERAGE, to no half with SAMPLE_ZERO. All six MS shaders "ms match" on
+    both (DepthMultisample on vk only). vk drew all 271 corpus shaders: 266 the same as Gallium, 2 differing only in
+    undefined channels (2DStencil, 2DStencilMultisample: one ushort), 0 different, 3 Gallium-only failures (K28).
+  - Left of M3c: compute (4 calls), argument buffers (5), texture_from_surface (IOSurface), mip levels and array slices,
+    [[stencil]] stores, depth<->colour copies, depth resolve. Next: compute, then IOSurface (the HDR content view
+    needs it, T38 (17)), then argument buffers; then M4 (GPU time, CPU time and submissions against Gallium).
+  **M3d run on the phone, 2026-11-05 (runs 043116 + 043536): compute on vk, 45 of 52 the same as Gallium.**
+  - air_vk.c (6653 lines, section COMPUTE in its header): rwa_compute_create, rwa_dispatch, rwa_dispatch_buffers
+    real; no compute call refuses with "(M3b)" any more. A VkPipeline per threadgroup size (up to 8 kept), from the
+    same NIR through VkPipelineShaderStageNirCreateInfoMESA, with ALLOW_VARYING_SUBGROUP_SIZE (Gallium's wave
+    contract). Bindings in one push set at 512 + kind + index; storage images (write/read_write textures of a
+    kernel) as STORAGE_IMAGE in GENERAL, image_* rewritten to image_deref_*, image_levels = 1; threadgroup memory
+    as the frontend lays it out; system values left to turnip's own lowering. Refused by name "(M3d)": more than
+    maxPushDescriptors bindings, more than maxComputeSharedMemorySize, a group or grid past Vulkan's limits, one
+    texture index both sampled and written. Dynamic threadgroup buffers refused as on Gallium. 48 exports.
+  - Tests: metal_drv_test prints `drvtest: compute-result BACKEND NAME ...` for every dispatch, and
+    --compute-all [FROM COUNT] sweeps a library's kernels (the 14 PortraitFilters kernels that loop on buffer
+    values are left out unless --compute-hangers); air_metal_test's kernel mode prints its own compute-result line
+    and takes GROUPS THREADS; tools/air/sysvals.ll (new) writes every system value (expected b0 877fc70d892fc565).
+    Jobs: out/rc.jobs.m3d1, out/rc.jobs.m3d2.
+  - Results (52 kernel x program pairs, AV1SW's 11, PortraitFilters' 36 less the 14 that loop on buffer values, the
+    rc.jobs.metal1/2/3 kernels with their own textures): 45 the same on both back ends, the 11 AV1SW kernels' 16-bit
+    storage-texture writes included; every kernel run twice gave the same result twice on each back end, but one.
+    - vk refused alone: 6, MetalFaceMask_Dilate/ErodeCube{Luma,Chroma1,Chroma2}: a texture3d sampled with its own
+      sampler in pixel coordinates, which Vulkan forbids (unnormalizedCoordinates is 1D/2D only); Gallium runs them.
+      Being lowered (normalized coordinates, a normalized sampler): M3d-2.
+    - fbs_pcg_iter2 differs between back ends and from run to run on EACH (Gallium 5b148712/a3b0220f, vk
+      48bbb488/d6a7ba41 in one boot): global atomic adds and an atomic store across threadgroups, a race in the
+      kernel; it uses no simd_/quad_ intrinsic. Not a back-end difference.
+    - Limits as printed: maxComputeWorkGroupInvocations 2048 (1024 reported to Metal), shared memory 32768,
+      subgroups 64..128 (threadExecutionWidth 64 on vk, 32 on Gallium). No GPU timeout, no recovery, no trap.
+    - sysvals did not test the multi-group values: air_metal_test_gl/_vk had been built (04:19) before GROUPS/THREADS
+      went into air_metal_test.c (04:24), so both dispatched one 4x4x1 group and agreed (c328822e3e7f90a5). Rebuilt:
+      air_metal_test_gl d9bda7cac120df35, air_metal_test_vk b5b8954bc4332d5c. Check a binary against its source's
+      time before a run.
+  **M3d-2 run on the phone, 2026-11-05 (run 050912):** a kernel's own pixel-coordinate sampler on a texture3d is lowered
+    to normalized coordinates (air_vk.c pixel_to_normalized: coord x 1/txs, no half-texel offset; r must clamp; a
+    normalized VkSampler); libvulkan_freedreno 5b8f2bdd4d8592ff, which prints "air_vk: built from air_vk.c of <mtime>".
+  - sysvals over 2x2x1 groups of 4x2x2: b0 877fc70d892fc565 on both back ends, the host's value.
+  - tools/air/sample3d.ll (new; air_metal_test's new "index" fill, R = x + 4y + 16z): texel centres, 8-texel linear
+    blends, clamp_to_edge and clamp_to_zero out of range on r and x: b0 064eaea90e929282 on both, the host model's.
+    That is also the first check by value of Gallium's 3D pixel-coordinate path (freedreno's hardware unnormalized mode,
+    r included): right.
+  - The six Dilate/ErodeCube kernels now get a pipeline on vk. Dilate t1 the same on both (weak: it saturates). Erode
+    (a product of three fast-half samples, offsets x-1/x+1) differs: Gallium 891419c8, vk a8786e22, each uniform over
+    its three variants; with texels of 100+ the product overflows half, so it is overflow handling or the offsets on
+    the normalized path. Open: air_metal_test ErodeCubeLuma/Chroma2 with the index fill (exact products, 9240 at
+    texel (1,1,1) if offsets are applied) and with the default fill, printing texels.
+  - fbs_pcg_iter2 three runs per back end, three different values on each: a race in the kernel.
+  - Erode settled (run 054947, air_metal_test, texels printed): sample3d_off (tools/air/sample3d_off.ll, texel offsets
+    on the normalized 3D path, constant and computed) reads b0 caf0c000f2f22a7c on both back ends, the host's value;
+    ErodeCube's (1,1,1) is 9240 = 20*21*22 on both. A host model reproduces all four Erode digests: every product that
+    fits is the same on both; a half product that overflows is +inf (0x7C00, IEEE binary16) on vk and 65504 (0x7BFF,
+    saturated) on Gallium. A Gallium deviation (KNOWN_ISSUES K29), not a vk bug.
+  **M3e run on the phone, 2026-11-05 (run 054947): textures over an IOSurface on vk.**
+  - air_vk.c (7302 lines): rwa_texture_from_surface imports the surface ID as a dma-buf into a LINEAR image at the
+    surface's offset and pitch, with Gallium's refusals and the pitch rule by texel size; "(M3e)" refusals for YCbCr,
+    depth, and a device without external_memory_fd/dma_buf/drm_format_modifier. Mesa tree: msm_bo_init_dmabuf takes
+    the size from hk_drm_surface, tu_AllocateMemory does not close the "fd" (a surface ID); turnip-darwin.patch 333
+    lines, regenerated from pristine, applied to a pristine copy: no diff against the tree. Every other use of an
+    imported fd in turnip and the runtime checked (export fails, ENOSYS). hkdrawable.m rwd_use_library: the import
+    goes to the loaded back end's library (it was looked up in libhackiosair by name, so vk had no drawables).
+  - Results: air_metal_test --surface self (CPU-computed expectations): BGRA8 100x64 stride 512 and 1080x2400 stride
+    4352, RGBA16Float 64x64 stride 1024: clears and copies match on both, row padding kept; fragPos into BGRA8 the same
+    on both; RGBA16F 100x64 stride 832 refused on both (vk names the pitch rule). drawable_test 1080x2400: 0 of 26
+    checks failed, the same digest on both. No SMMU fault.
+  - Open: a draw (fragPos) into the RGBA16Float imported surface DIFFERS from the model on vk (fd7efe83 against
+    8f100801; Gallium matches); clears and copies into it are right.
+    - Run 060507 (pixel dump, out/rc.jobs.m3e2): the same draw into a vk-owned texture, read back through the GPU,
+      matches on every variant; into the imported surface, read by the CPU after a clean+invalidate, vk default
+      matched this time, TU_DEBUG=sysmem left 1024 texels, sysmem,noubwc 664, gmem 504 -- every one of them the
+      pre-draw value in all four channels, the first at x = 8/16/24 (64-byte lines); every written texel is
+      bit-exact. So not rendering, format, import or GMEM: some GPU writes are not yet in memory when the CPU reads
+      after the fence, at random, a cache line at a time. Hypothesis (unchecked): turnip's CCU colour clean is a TS
+      event the kernel's closing CACHE_FLUSH_TS fence write does not wait for. It would also hit the compositor
+      reading a vk-rendered surface. Next: a post-fence delay to confirm, and a waiting end-of-buffer flush in
+      air_vk behind a switch.
+    - **Settled, run 061800 (out/rc.jobs.m3e3, each case 3 times on vk sysmem): not a vk bug; stale CLEAN CPU lines.**
+      A 20 ms delay after the fence: 1/3 right (not late GPU write-back). A full flush + wait at the end of the command
+      buffer (AIR_VK_HOSTFLUSH=wfi) and TU_DEBUG=flushall,syncdraw: no help (not turnip's flush order). A clean of the
+      surface plus a seed move right before the draw: 3/3 right. Reading after evicting the CPU caches with 16 MB of
+      reads: 6/6 right, while the plain read before the eviction was stale every time -- memory held the GPU's
+      picture; the CPU's cache held step 8's clean lines of the pattern. Why vk and not Gallium (inferred): Gallium's
+      reads and writes map the buffer through HKGPU, which marks it seen, and the kernel then cleans/invalidates it
+      at every submission; turnip never maps an imported buffer, so a submission within 4 ms of the last, with no
+      seed move, leaves it alone. And the test's own post-fence sys_dcache_flush did not drop the stale lines
+      (eviction did): XNU's D-cache-flush platform syscall is removed here (machine_routines.c platform_syscall
+      case 1), so libplatform does it at EL0, and here it evidently does not invalidate -- open (a one-line test:
+      inline `dc civac; dsb sy` against sys_dcache_flush). M3e counts as passed on vk; the fix is the kernel item
+      under T38 (17): every surface imported to the GPU, mapped or not, cleaned/invalidated at its submissions and
+      invalidated after the GPU writes it. AIR_VK_HOSTFLUSH=wfi is useless and is to be removed from air_vk.c.
+      The fix, in two layers (agreed with the supervisor, 2026-11-05):
+      - now, in userland, as Gallium does: air_vk's import does once what gets a Gallium buffer marked seen by the
+        kernel (its CPU map through HKGPU), so the kernel cleans/invalidates the surface at every submission on vk
+        too. It does not cover a CPU reading during the GPU's write, nor GPU-writes-then-CPU-reads with no
+        submission in between;
+      - the kernel round (with the RGBA16F row alignment): every surface imported to the GPU, mapped or not, cleaned
+        and invalidated at the submissions that use it, and invalidated after the GPU writes it (at fence retire or
+        IOSurfaceLock(ReadOnly)), so "GPU writes, CPU reads" is covered;
+      - the tests: sys_dcache_flush is not trusted to invalidate here; air_metal_test gets an inline `dc civac; dsb
+        sy` read (--read-civac) and libplatform's implementation is to be read, so a "flushed ... match" means what
+        it says. Run 054947's flushed matches were partly luck (the lines happened to be gone).
+      - **sys_dcache_flush is a no-op on this system (read 2026-11-05 from 20F66's dyld cache, read-only):**
+        libsystem_platform's sys_dcache_flush is two instructions, a barrier and a return: no cache maintenance at
+        all -- Apple's GPUs are I/O-coherent, so iOS needs none -- and XNU's own platform syscall for it is removed. Every "flushed" read of
+        the surface test before --read-civac was a plain read; and nothing iOS does with sys_dcache_flush maintains
+        the cache on our non-coherent Adreno. GPU-shared memory's coherency has to come from the kernel.
+      - **Userland mitigation, verified on the phone (run 062853):** air_vk's import maps the memory once (vkMapMemory ->
+        hk_drm_map -> HKGPUUserClient::clientMemoryForType, which sets the buffer's `seen`, HKGPU.cpp:1414), so
+        submit() cleans/invalidates it at every submission as Gallium's buffers are (AIR_VK_NOSEEN=1 turns it off).
+        Cost note for M4: turnip names every buffer of the process in every submission, so a seen surface is cleaned
+        at every vk submission, while Gallium pays only where the surface is named.
+        Run 062853: with it, the RGBA16F draw into the imported surface matched 9/9 (vk sysmem, default, gmem x3) and
+        the stale-read check read 0 stale; with AIR_VK_NOSEEN=1 the old failure came back (1/3), and air_metal_test's
+        --read-civac (inline `dc civac` + `dsb sy`) read it right 3/3 -- a real invalidate, unlike sys_dcache_flush.
+        **M3e passes on vk** (import, clears, copies, draws, refusals, drawable_test). libvulkan_freedreno
+        a2b44a1c63233269, air_metal_test_gl/_vk 6aea8d8e/852e457b; out/rc.jobs.m3e4.
+  **M4-1 verified on the phone, fixed clocks, 2026-11-05 (runs 084829, 085237, 085644; 525 MHz, cpufreq_gov=0, gpu_irq=0;
+  libvulkan_freedreno cba626e5552d5aa9, metal_drv_test c28bc6e6687e45c4).** No fault, recovery or throttling. W4 per
+  frame, us (wall / user+sys / GPU): owned texture vk 742 / 306 / 428, Gallium 1005 / 305 / 746 (vk was 625 / 652 / 428:
+  the busy poll is gone, and sleeping at gpu_irq=0's granularity costs about 117 us of wall); imported surface vk seen
+  1432 / 738 / 792, vk not seen 1215 / 334 / 800, Gallium 1306 / 327 / 998. So vk's GPU time is 0.57-0.79x Gallium's,
+  its CPU equal but for the seen surface's kernel clean (about 390 us a frame, the kernel round). W2: wall 1096 against
+  595 ms, draws at 1.0 submissions each on both, but read-backs in the harness are a round trip each on vk (1926 against
+  275 submissions), and pipelines cost 779 against 155 ms (about 5x: a pipeline cache is the fix, not yet done). W3: wall
+  945/1282 (AV1SW) and 1852/2921 ms (PortraitFilters), vk's submissions from 11.8k/36.1k to 189/375; its net GPU totals
+  (9.8/74.9, 35.5/229.8 ms) are far lower because Gallium's row-by-row texture writes go through the GPU (about 65 and
+  220 ms outside the dispatch phase) and vk's are CPU copies plus one batched copy. vk's "dispatch phase" reads higher
+  (raw 16 against 11 ms, 34 against 12.5 ms) because the deferred uploads are submitted with the first dispatch, so a
+  kernel's own GPU cost on vk against Gallium is still unmeasured: --compute-all needs a second dispatch with no uploads
+  between. Per-dispatch net figures are mostly noise (a 10 ms phase against an 8 ms baseline). W1: equal. Order and
+  burst tests right on both.
+  To do from this: a VkPipelineCache, persisted under /var (pipeline creation is about 5x Gallium's; a real app feels it
+  at launch and on each new screen).
+  **M4 at default DCVS and governor (runs 090249, 090657, 091116), closed:** no fault, recovery or throttling. W4 ramps
+  from 305 to 525 MHz within its 200 frames on both back ends; W1-W3 stay at 305. W4 per frame (wall / user+sys / GPU, us):
+  owned vk 1032 / 707 / 428, Gallium 1806 / 846 / 746; surface vk seen 2834 / 1819 / 1106, not seen 2568 / 1986 / 817,
+  Gallium 2282 / 1089 / 1017 (CPU clocks move under the governor, so the surface row's CPU is noisy: not read further
+  without a larger sample). W3 wall vk 980/1902 against 1327/2981 ms; W1 2879 against 3390 ms; W2 2487 against 3162 ms
+  with big swings. Energy: only a rough estimate is available (GPU-busy time at the clock seen, no power measurement):
+  W4 owned, vk about 0.57x Gallium's GPU active time per frame. Conclusion: Metal over Vulkan costs less GPU than
+  over Gallium in steady drawing (0.57x owned, about 0.8x imported at fixed clocks), CPU no worse apart from the seen
+  surface's kernel clean.
+  **The owner's decision, 2026-11-05 (relayed): Metal goes over Vulkan; no more cost comparison** ("做完这轮没必要比较了
+  ... 我们无论如何都要做了"). So no gpu_irq=1 comparison and no per-kernel GPU measurement (a second dispatch with no
+  uploads); an obvious performance problem met in the work is simply fixed. The VkPipelineCache stays on this list.
+  Correctness is still checked: each feature keeps a per-pixel model, and Gallium as a reference where it can be.
+  **M5a built, NOT run on the phone (2026-11-05): the draw path of air_vk.c.** Blending (every factor Gallium serves, plus the blend
+  colour, per attachment, sRGB), [[stage_in]] (49 vertex formats, offsets, strides, Constant / PerVertex / PerInstance and the rate),
+  indexed draws (16, 32, offsets, base vertex, base instance, instances, restart on the two strip types as Metal has it), cull and
+  winding (dynamic, not reversed: air_vk.c, THE DRAW PATH, ORIENTATION), a viewport with an origin, scissor, Bresenham lines as Gallium
+  programs them, per-attachment clears. Contract: seven fields appended to rwa_draw (air_metal.h, hkmetal.m), no new export; the Gallium
+  library reads none of them and is not rebuilt. Refusals "(M5a)" are listed in the section. Not carried, because Gallium has none:
+  indirect draws, depth bias, depth clamp, fill mode, dual-source blending (refused by name).
+  - Tests: tools/mesa/air/draw_model.h (the CPU model, shared); tools/air/m5a_*.ll (ten modules: userland/obj/m5a_*.bc must be at
+    /hackios/share/probes); air_metal_test --pixels DIR after --draw-blend, --draw-attrib, --attrib-sweep, --draw-index, --draw-vertex;
+    metal_drv_test --pixels after --picture, --draw-attrib, --draw-index, --blit (Apple's functions, through the encoder).
+    Lines: drvtest: draw-result BACKEND CASE ok|DIFFERS|gallium-lacks|refused digest HEX expected HEX; draw-diff, draw-map, draw-summary.
+    Jobs: out/rc.jobs.m5a1 (the pictures), m5a2 + m5a3 (the corpus, split).
+  - Measured on a host softpipe (Linux in the build container, a throwaway build of the same air_metal.c; not the phone): 128 of 128
+    blends right including all six formats' sRGB and rgba32f exactly; 49 of 49 vertex formats; everything but the three Gallium's
+    software path does not do (base instance in [[instance_id]], the shallow line's rule), so the models and the modules are checked,
+    and vk itself has only been compiled.
+  - Found on the way, not changed (Gallium keeps its behaviour): air_metal.c's restart is off where Metal's is on; one
+    MTLDepthStencilState with two references uses the front's on Gallium when the two faces' states are equal (stencil[1].enabled);
+    its rasterizer state leaves point_size_per_vertex and line_width at 0; the clear of a pass is one colour for all attachments.
+  - Next: run m5a1. On a DIFFERS read draw-diff and draw-map first. Then M5b.
+  **Owner's decision, 2026-11-05 ("先补充metal", relayed): complete Metal on vk before the phone goes to the MDP session.**
+  The plan, M5: (a) blending, vertex attributes, index buffers; (b) mip levels, array slices, 1D/2DArray/Cube textures,
+  generate_mipmaps, more pixel formats; (c) argument buffers, fragment/vertex storage writes, runtime-indexed resources;
+  (d) a real app: rw_pipe_lock around -replaceRegion:/-getBytes:, triangle_app --layer --backend vk, then metal=2
+  metal_backend=vk. Framebuffer fetch, [[stencil]] stores, depth resolve, depth<->colour copy only if an app needs them.
+  Each with a test whose output varies per pixel, a CPU/host model, and Gallium as the reference where it can be.
+  The kernel round stays after this unless M5d needs it sooner.
+  Added by the supervisor: M5a also orientation (asymmetric triangle, winding and cull, viewport, scissor, primitive
+  types), pass state (Load, MRT, several encoders), blend constant, sRGB, baseVertex/baseInstance, strip restart; M5b also
+  sampler state (LOD clamp, mip filter, anisotropy, compare, border colour), texture views with swizzle, per-level and
+  per-slice blits, ASTC/ETC2 if Gallium has them; M5c also function constants, and the MetalPerformanceShaders metallib
+  through --compute-all (HDR's content view runs through CMPhoto and MPS); M5d: the Photos HDR full-size view is the last
+  target, where the RGBA16F 8640-byte rows force the kernel round (say so before reaching it); metal=2 boots with
+  exctrace and short secs, a failure read from its log, not retried.
+  **M5b built, NOT run on the phone (2026-11-05): textures, samplers and formats of air_vk.c.** Section TEXTURES, LEVELS AND SLICES there. Contract: `border_color`
+  appended to rwa_sampler_state, `color_level`, `color_slice`, `depth_level`, `depth_slice` appended to rwa_draw, one new symbol `rwa_texture_view_create` (49 exports). The Gallium
+  library reads none of it and is not rebuilt. Tests: air_metal_test `--textures|--pixel-formats|--blit --pixels DIR`, metal_drv_test `--tex|--texfmt|--blit --pixels`; models
+  tools/mesa/air/tex_model.h; probes tools/air/m5b_*.ll; jobs out/rc.jobs.m5b1-4. Open questions for those runs: clamp_to_zero on a format with no alpha (Apple says
+  (0,0,0,1)) and turnip's blit rounding against the one-step box model. Blend model: quantizes first; sRGB colour alone keeps a measured band (linear 2^-10), the hardware's curves
+  being not the book's. Measured on real Metal on an M1 Max, not A11 (the reviewer, public API): packed 16-bit has the first-named channel in the low bits, so air_vk.c has that and
+  air_metal.c's table is its mirror, kept on purpose (its rows print `gallium-mirror`); and the LOD clamp applies at an explicit level, whatever Apple's header says. OPEN: who does the
+  exchange the compositor's wallpaper shows; a B,G,R,A swizzle would look the same (hypothesis). hkmetal.m logs a `packed16:` line per distinct 16-bit texture for a short metal=2 boot
+  on Gallium to read; until then a vk picture of formats 40-43 is a question and not a result.
+  **M5a run on the phone, 2026-11-05 (runs 094931, 095351, 095811; libvulkan_freedreno 9617015acea9d0c5): the draw path.**
+  No fault, recovery or usertrap. vk: 252 draw-results ok, 15 differ, 2 refused on purpose. Orientation (asymmetric
+  triangle, all four cull/winding combinations with both triangle directions), viewport, scissor, pass state, MRT, indexed
+  (scrambled grid, base vertex, base instance, restart on strips), vertex_id/instance_id, vertex formats: ok against
+  the CPU model. The 15: 14 blends where vk's digest EQUALS Gallium's and the model is off by just over one unorm step
+  (0.85098 against 0.85502, 12 of 256 pixels; sRGB reverse-subtract and subtract likewise), which is the hardware's
+  rounding, so the model's tolerance is to widen; and the line list, 2 of 250 pixels at a line's first pixel (x=14,
+  y=2), a line-end convention in the model. Corpus 271/271 on vk: 264 identical to the earlier digests, the other 7
+  expected (the MS shaders against older lines, 2DStencil's undefined channels). Gallium control: identical but those.
+  sysvals 877fc70d, surface right, depth and msaa right. Found: Gallium draws no lines or points (KNOWN_ISSUES K30).
+  M5a counts as passed (the supervisor concurs). To carry into the next build: the model following the blender's path
+  (quantize dst first, then blend, then round: not a wider tolerance), the line-end rule, a coverage map always printed for
+  orient-asymmetric, and the -setDepthBias: notice and restart sources already in the sources.
+  **M5b's results, runs 111109, 111530, 111950, 112410 (2026-11-05, phone, kernel cam-fb3ad081): no fault, no recovery, no usertrap on any.**
+  vk: 864 ok, 16 DIFFERS, 5 refused by name. Of the 16: render-from-own-level was my expectation (the coordinate lands on the edge at 2x + 1 and the floor
+  takes it; real Metal gives the phone's bytes); 13 are sRGB decode rows, of which 12 have the same digest on Gallium, up to 0.0028 linear from the book where
+  an M1 is within 0.00012, inferred Adreno's precision and measured next by `--srgb-curve`; blend-*srgb-sub (2 rows, 5 pixels) the same curve, by the same
+  reasoning and the same digest on Gallium, 0.0027 past a 2^-10 taken from two samples. orient-asymmetric's corner: top left, x 2..12, y 1..11, 61 pixels, one
+  map on both back ends and on an M1. Corpus against 095351/095811: Gallium 39 of 40 identical, vk 269 of 271, the rest Stencil's undefined G/B/A (R stays 101).
+  sysvals, sample3d and the surface as before. **Criterion 4 (corpus and compute) is met for DRAWS ONLY:** --compute-all ran --quiet, so AV1SW and PortraitFilters
+  have ran counts and no output comparison here; M5c runs it without --quiet, kernel by kernel against Gallium where Gallium ran it. Accepted by the supervisor with
+  its two gaps named: the 2 sRGB-sub rows and this.
+  Stencil's "undefined channels" were this harness's own: real Metal refuses a one-ushort fragment shader on an RGBA32Uint attachment (M1), so nothing is there to
+  match, and those two rows now digest the channel they write (metal_drv_test.m, target_digest). Their digests change once, and "undefined channels aside" can go.
+  **M5c, built, 2026-11-05, rows passed on real Metal, phone runs next:** argument buffers, a draw's stores, arrays of descriptors, function constants, on vk.
+  The design is in air_vk.c, ARGUMENT BUFFERS (at resolve_binding) and FUNCTION CONSTANTS (at rwa_compute_create), and hkmetal.m, FUNCTION CONSTANTS.
+  - **tools/air/mtlref/airdump.m**, new and worth more than this milestone: this Mac's own Metal compiler turns MSL into a real metallib, through the private
+    -serializeToURL:error: of _MTLLibrary, so a test shader can be written in MSL, its AIR read with llvm-dis-18, and it can run on real Metal and on the phone
+    from one source. tools/air/m5c.metal and tools/air/m5c_rows.h are that: `mtlref --m5c out/msl/m5c.metallib` and `metal_drv_test --m5c LIB` run the same rows;
+    real Metal gives 65 ok, 0 differ. What it says of forms is macOS 27's compiler (air64_v29), so the corpus stays the check on iOS 16's.
+  - What real Metal's AIR settled, each read off that output: the second integer after air.location_index IS the array length; an array of buffer pointers has
+    its own metadata form (`air.struct_type_info` first, the id an integer, the length in the inner node); -newFunctionWithName: returns ONE object, which is why
+    a specialized function is a proxy here; a constant left unset still makes a function; a vertex stage may run more than once per vertex (counts 1 2 2 1).
+  - Native frontend without a phone: `meson setup /tmp/hf` in the container with `-Dgallium-drivers=softpipe`, no libdrm needed, `ninja src/compiler/air/air2nir`, and
+    `air2nir --report LIB` over the MetalPerformanceShaders libraries: MPSImage 1318 of 1825 kernels, MPSCore 54 kernels and 4063 air.visible functions (stitching),
+    MPSRayIntersector 48 of 66. MPSImage's refusals: aggregate index out of its value 245, pointer at a computed offset passed to a call 71, a pointer stored 50,
+    N-bit integer 43, phi of pointers over a loop edge 36, insertelement at a run-time index 18. To do, with air.visible measured before it is started.
+  - Refused still: texturecube.read() (Vulkan has no fetch on a cube view, and the frontend says so at the coordinate); -newRenderPipelineStateWithDescriptor: with
+    no fragment function, which a depth-only pass or rasterizationEnabled NO needs (M5d).
+  **M5d, 2026-11-05, the owner's direction (relayed): every boot is the goal, `metal=2 metal_profile=1 metal_backend=vk camtl=1`, RAM only; what stops the system decides the next fix.** Gallium jobs, the non-camtl boot and the sweeps only if a fix needs them. Verified on phone, vk: the --m5c rows through fc-* in run 130504, 69 ok, 0 differ, 0 refused, inside a system boot (so M5c's rows have passed; the fetch rows are newer).
+  Found by those boots: (1) `[MTLFunctionConstantValues alloc]` is a `MTLFunctionConstantValuesInternal`, with its own setters, so hkmetal's hook on the public class recorded nothing and every constant read as not defined (runs 125308, 125405, 125612); it is on the Internal class now and `58 fragment constants` reach QuartzCore's fixed_frag_lph_cph. (2) CoreAnimation answers a refused pipeline by trying once more and then SIGABRT, so one refusal is a dead window server in a loop (11 lives in run 125405); nothing in hkmetal stands between them, and a stand-in pipeline for backboardd is undecided. (3) air.get_null_texture as a second place in a phi was a regression of M5c's; a phi or a select of a real resource and null or a module constant now resolves to the resource (air_to_nir.c, resolve_pointer_phi, load_pointer_through_choice). (4) Function constants reach a shader through scratch, so nothing folded them: fold_module_variables, 52,451 lines of NIR to 221 for fixed_frag_lph_cph on the host with no values. (5) Framebuffer fetch is real on vk: air_vk.c FRAMEBUFFER FETCH, a subpass input by dynamic rendering local read; the multisampled case is refused. Rows fetch-*, real Metal 75 ok; phone: see HANDOFF.
+  **Verified on phone, run 141516 (2026-11-05, RAM boot): the home screen is complete and right with the compositor on Metal over Vulkan** (`metal=2 metal_profile=1 metal_backend=vk camtl=1`), 30 frames a second while it moves, 0 SMMU, 0 IS, 0 DEVICE_LOST. Against the GL-compositor shot of run 122525: 0.88 % of pixels differ by more than 12, in the clock's hands and the status bar's corners and a few edges (a picture compare, not a proof). Further fixes of that day, each found by the boot: (6) a half between the stages arrived as garbage, a different colour every frame: storageInputOutput16 is off in turnip, so widen_varyings makes them 32 bits between the stages (`metal_drv_test --ca-fill`, row half-varying). (7) RenderBox's primitive_gradient_fragment has two [[function_constant]] buffers at one index, constant and device: stage_bindings takes the one the instructions touch (Weather's card). (8) MTLPixelFormatYCBCR8_420_2P: hkBiplanarTexture copies a 420f or 420v surface into RGBA8, in RGB, BT.601 (the stock wallpaper's Head.HEIC, measured against this Mac's decoder: full range); the pipeline CA draws it with has no matrix, so Apple's sampling answers colours. air_intrinsics: fmax3 family, pack.unorm.rgb565 (red in the LOW bits, measured). air_to_nir: narrow integers up to i31.
+  Apps verified on phone, same config, runs 141836-143528, opened with rwtouch: Settings, Safari, Clock, Photos (first-run sheet with an alert over it), Maps (first-run sheet). Further fixes those boots asked for: attachments of different sizes (the pass is the part they share), a surface row not a multiple of 64 copied once when read-only, a whole mipmapped view sampled while a level of it is rendered, an i1 used as a vector index (ir3's "invalid src bit size: 1" was a trap that killed chronod 27 times in a row), air.pack.*/unpack.* (rows pack-*, unpack-*; real Metal 101 ok, snorm10a2 not in this Mac's compiler, not measured), bitcast of any equal total, `inttoptr` constants as null, resources whose index is a function constant's (`air.location_index` is `@__metal_implicit_attr_int_expr_N`: air_to_nir translates twice), surface formats for what a kernel lays over a surface.
+  **Open from that, in order of the loop:** (a) [served since, M5e below; this was the state then] **VideoToolbox's Metal path is declined, a stopgap:** `hk_specialize` answers nil for VTMTSComputeFunction. Served, its pipeline is made in 3 s (2,037 lines of NIR), its one dispatch returns, no SpringBoard thread is waiting 45 s on (`hk_sample_threads`, a file /hackios/share/probes/sample in the root), and the wallpaper's HEIC layers are simply never decoded, 420f included. Why its success changes that is not known. Real iOS uses it. (b) The 420 copy is made once per surface: a video would not update. A real import needs VkSamplerYcbcrConversion or per-plane views. Format 500 measured on real Metal (M1): RGB, BT.601, 420f (42,133,128) and 420v (32,135,130) from Y 105, Cb 141, Cr 83, as hkBiplanarTexture computes; a surface tagged 709 is not measured. (c) [fixed: chronod's trap was ir3's refusal of an i1 index, above.] (d) compositeSphere (Siri's orb) reads a target at 4 samples per pixel: refused, lower_fbfetch has no SUBPASS_MS. (e) [done: corpus vk 271 of 271 identical to run 124507 in run 151633, after the fold and everything since.] (f) hkmetal's `spec`, `layout`, `draw`, `new texture` lines are bounded but still on; the per-draw pixel probe is off unless /hackios/share/probes/metal_probe exists. (g) Not tried yet: the map itself past Maps' first-run sheet, a video, HDR Photos, a third-party Metal app.
+  **M5e, HEIC and HDR (the owner, 2026-11-05: 「heic啊，你走偏了」; stopped by 「我们保存结果接下来做dms」; RAM only, nothing committed). Done, each verified on the phone unless said:**
+  (1) `hk_specialize` serves VTMTSComputeFunction again; a file /hackios/share/probes/vt_decline turns that off for a comparison, and is absent. (2) **Every texture write was typed uint:** `tex_dest_type` read the call's return type, void. The GPU converts by that type, so 0.5 and 1.0 into RGBA16Float became 0xffff and VideoToolbox's two-pass scale came out empty (read back in run 161649; fixed air_intrinsics.c, run 162255, rows kernel-write-*). (3) **The black wallpaper was compile time, not decoding:** CollectionsPoster is a Metal client, decodes a HEIC on its way up, each VTMTSComputeFunction took 1.8-3.2 s and launchd kills an extension at 5 s ("hanging on launch", XPC_EXIT_REASON_EXTENSION_CHECK_IN_TIMEOUT), 23-35 times a boot, a new process each time. Declined runs show 0. Runs with log_launchd=0 show nothing at all, which hid it (the runner's `lean` now leaves launchd's lines on). Fixed: the learning pass of `air_to_nir` skips the body, and A TRANSLATION KEPT ON DISK (air_to_nir.c; /var/tmp/hk-air; key: bitcode, entry, constants, the library's size and date; plus turnip's compute pipeline, one VkPipelineCache file per threadgroup size in air_vk.c). Host: 0.76 s to 0.40 s, 0.015 s on a hit, NIR byte-identical on three specializations. Phone: first compile 0.9-1.6 s; hits not timed on the phone; turnip's share not measured; check-in time not measured. Empty cache: killed 2 times, then stays, about 11 s after the first start. (4) Photos' fragment_main: an array of textures copied into a struct on the stack and read at a computed index, and a cursor stored 57 times and never read (POINTERS IN A LOCAL; row kernel-descriptors-in-a-local). Photos treated the refusal as an uncaught exception. (5) A sample outside a fragment function is level 0 (real Metal: row kernel-sample-level); it was not the zeros' cause, and stays because it is the rule. (6) Format 540: raw Cr, Y, Cb, alpha 1, centred chroma, for 420f and 420v, by read and by sample, measured on real Metal; served as a copy (hkBiplanarTexture raw:YES). (7) A read-only surface's copy follows it (`hkFollowSurface`); a destination whose row the GPU cannot write is refused at import rather than turned into a read-only copy.
+  **Stopgaps that stand:** 420 pictures as CPU copies, format 500's once per surface, format 540's once per texture (no VkSamplerYcbcrConversion, no per-plane views). Copied surfaces cost a full read of the surface per command buffer. The disk cache has no limit and no eviction, does not hold turnip's graphics pipelines, and does nothing on a read-only /var: on the kept volume in a RAM test the kill loop could return; not tested. Pipelines are still compiled on the phone once; nothing is shipped precompiled.
+  **Open, in the order they stop things:** (a) -12914 from CMPhoto with 540 served, cause unknown. (b) VideoToolbox's destination imports: format 123 (RGBA32Uint) over BGRA at a quarter of the width (four pixels a texel); R8Uint (13), R32Uint (53) per plane on a 420f; `rwd_texture_for_surface` wants plane 0 and equal widths. Plan: plane offset and row from IOSurfaceGetBaseAddressOfPlane and ...BytesPerRowOfPlane, the check by bytes. A 16-byte texel needs a 256-byte row, so format 123 over most rows waits for (e). (c) The dim screen: Photos' white 187 of 255, picture at most 191, nits 70-83, with and without hbm=1. The drawable is format 80, BGRA8; no RGBA16F surface appears. The same photo with the compositor on hk-gl has NOT been booted for comparison; do that before anything installs. (d) Full view 1512x1134 and 1496x1122 before and after 540; the photo's real size unread. (e) **The kernel round, not started:** MiniIOSurface's row alignment (8424 bytes a row in assetsd, 8640 for RGBA16Float against 128; freedreno's rule is 64 up to 4 bytes a texel, 128 for 8, 256 for 16); IOSurfaceSharedEventAddEventListener e00002c7, MiniIOSurface has no shared events, effect unknown. (f) vt_test's 420f colour on the phone 129 124 34 against this Mac's 128 133 42, the same by GPU and CPU: reads as VideoToolbox's own matrix on this boot; not settled. (g) Rows surface-540-*: the phone refuses the shader, "an inline sampler whose state is not a constant", from this Mac's compiler; use an API sampler or read what that global is. (h) threadsof (userland/src/threadsof.c) gets its task but task_threads is refused; not chased. The kernel's `ustacks=NAME ustacks_at=SECONDS` is the alternative, 40 bytes.
+  **Default-on, the owner's rule (「之前成功的不进内核参数但是默认enable」, 「wifi震动声音相机都能用了」, supervisor's relay), for this board only (instantnoodle_board()), arg=0 off; touch is already on (instantnoodle_touch.c) and is not to be touched. Nothing flipped yet, all in the next new kernel copy.** Gates read so far, to be confirmed against the driver this board runs: `wifi` hk_wifi.c (with wifi_bdf_native), `adsp` hk_adsp.c, `sound` hk_sound.c, `sound_amps`, `haptic` hk_haptic.c, `cam` instantnoodle_camera.c. Then drop them from the runner and stable-plan.json, boot once with none, check each one's log line, and check a second boot in one power-on (never wifi_again or adsp_again; run 160351 logged `ath11k WARNS: firmware crashed: MHI_CB_EE_RDDM` once at the return to the loader, and the next boot's radio came up). Runner now: Wi-Fi and sound on, `nowifi`, `nosound`, `nocam`, `novoldown` (25 bytes), `datadefault` (15). Bytes of 607: ramhfs, all on 656; no ramhfs 623; ramhfs with Wi-Fi only 601; Photos' log, edr=2, photos_import with nowifi, novoldown, datadefault 599 (605 with hbm). **So goal boots have run with camera and sound off, and the Photos boots with Wi-Fi off too, for bytes alone.** The return to the loader can abort backboardd if a pipeline is being built that moment (run 160351: allocations fail after `loader_return_after expired`); read as the return, 0 in the boots since.
+  **Safari, left on the owner's word (2026-11-05, 「heic啊，你走偏了」), not finished.** Verified on phone, run 154007 (root m5e1, RAM): Safari draws a page on Metal over Vulkan, fetched from `userland/src/hkhttpd.c` on the phone's loopback (page: `tools/metal/mk_testpage.py`, built only by the scratchpad's build_m5.sh, not in `userland/build.sh`); text, colour bars in order, gradients, canvas, SVG, opacity, a CSS animation at 87 frames a second, 0 SMMU, 0 IS, 0 DEVICE_LOST. **Wrong, not explained:** after scrolling, parts of the page are missing or overlap (runs 154007, 154748): bands of a picture out of step, black or white below a cut, for several seconds a white page. The page's tiles are 1125x1536 surfaces the GPU has in place (`place#N`), seed 1, and this processor reads colours in them. Not known: whether the tiles' memory or their placing is wrong. Next look: a thumbnail of a tile from this processor against the screen, and the vertices' real stride (the `at` and `t` of the frame_dump lines assume 48 bytes and are only right for some pipelines). Copied surfaces now follow changes (`hkFollowSurface`: added up once per command buffer, copied again when the sum moves); 420 copies still do not. Diagnostic left in: file `share/probes/frame_dump`. Wi-Fi: nothing joined in these boots, `fw-wifi/network` does not exist here (never read); earlier joins were by hand in Settings.
+  Host census of all 103 system metallibs with `air2nir --not-defined --report` (counts of refusals, what the next blockers may be, none yet asked for by a running process): CMImaging 15 air.imageblock, QuartzCore's 4 tile_downsample imageblocks, CoreUI's 17 "no entry point metadata" (kernels of an older form, to read), MetalTools' 7 air.command_buffer, simd_shuffle* / simd_min / simd_max / quad_shuffle in MPSImage, FRC, VideoProcessing; patch_control_point inputs in LocalAuthenticationPrivateUI (7), MTLSpline, ARKitUI, RoomPlan. RenderBox 47 of 47 now (i10, pack.rgb565 with red in the LOW five bits, measured).
+  **libhackiosair.dylib is not rebuilt in this work and stays 6ef66c30 (08:53).** So "0 stale" in every M5c notice holds with that exception: air_metal.c and the shared frontend (air_to_nir.c, air_intrinsics.c, nir_air.h) moved past it, and Gallium's --m5c rows test none of that. air_metal.c's new refusals of an array of descriptors are syntax-checked only. **Before that library goes into any system image it needs its own rebuild and full regression, because it is what the installed system runs on** (and OpenGL ES with the new shim, tools/mk-mesa.sh's warning stands).
+  **To do after M5b's runs:** [done in the M5c build, row mtl-iosurface-swizzle] -newTextureWithDescriptor:iosurface:plane: must honour a descriptor swizzle on vk. Real Metal does
+  (measured on an M1 Max: an L565 surface, B5G6R5Unorm, word 0x001F reads blue with no swizzle and red with B,G,R,A, by read
+  and by sample; a view likewise; BGRA surfaces likewise). Gallium has no views and stays unswizzled, so the metal=2 Gallium
+  boot's picture does not change; the log line keeps reporting what was asked. Reading that boot: an L565 wallpaper surface
+  with no swizzle anywhere means the bytes themselves had red low, and the question becomes who wrote them (Apple's CPU
+  code, or our GPU through a 16-bit attachment under the old table; the usage field says whether it was a render target).
+  (Aside, the owner's request of 2026-11-05 to dump hyp to the desktop: tool built, not run, shelved by the owner
+  ("這個再說吧"). userland/src/partdump.c (read-only, hyp_a/hyp_b only), out/hypdump-root.apfs, out/rc.jobs.hypdump: paced
+  base64 lines joined from run_cam_probe's kept log copies, CRC per line, sha256 at the end. hyp is about 3.65 MB, by
+  the kernel's survey identical on both slots.)
+  **M4, first cost runs, 2026-11-05 (runs 071517 + 071937; GPU fixed at 525 MHz, cpufreq_gov=0, metal_drv_test
+  3fcd97e10dc1195b; GPU time net of an idle baseline, since the kernel has no per-client GPU time).** Medians of 3:
+  - W4, 200 frames of one full-screen draw: into an owned 1080x2400 texture, GPU per frame vk 429 us against Gallium
+    753 (0.57x), wall 649 against 1014 us; into an imported IOSurface, vk 816 against 1005 us (0.81x). But CPU sys per
+    frame is vk 521 us against 80-161; into the surface vk 278 ms (seen) / 219 ms (not seen) per 200 frames against 83.
+  - W2 (271 draws) and W3 (AV1SW, PortraitFilters compute): net GPU about the same, but vk makes 7-40x more
+    submissions (2021/278; 11.8k/349; 36.1k/895) -- air_vk submits uploads and read-backs on their own -- so its sys
+    time is 4-13 s against 0.1-0.6 s. turnip's pipeline creation is about 4.3x Gallium's (1797 against 422 ms for 271).
+  - **Bug found: SMMU faults on vk (run 071937).** 4 of 5 `--time` runs on vk faulted ("THE SMMU REFUSED the 3D core
+    in a program's tables") right after 256 empty command buffers committed and dropped unwaited, then
+    VK_ERROR_DEVICE_LOST; Gallium none; W1's vk numbers from those runs are invalid. Cause (from the code and the log; a
+    pair recycled in flight was the first guess, and wrong): a second thread recording on the Vulkan device. An empty
+    command buffer got no fence from rwa_flush, so hkmetal's background waiter fell back to mesa.finish, and the old
+    rwa_finish began, recorded and submitted on the completion queue's thread with the main thread's pool and queue;
+    -getBytes: and -replaceRegion: do not take rw_pipe_lock, so they collided. Fix (air_vk.c, libvulkan_freedreno
+    9f625b63388cc528): only the thread that began a recording records or submits (device->recorder); wait_for_all
+    backs rwa_finish and destroys and waits on the newest fence; rwa_flush with nothing recorded hands out that
+    fence; pairs refcounted; vkDeviceWaitIdle at close. metal_drv_test --burst N is the test. **Verified on the phone
+    (run 080405):** --time on vk 0 of 5 faulted (4 of 5 before), --burst 256 ok on all 6, no recovery or device loss,
+    nothing in flight at any process's end, the imported-surface draws still right. W1, now valid (median of 5 vk, 1
+    Gallium): wall 2471/2523 ms, cpu sys 677/584, net GPU 276/272, submissions 418/652, pipelines 385/225.
+  - **Why vk's CPU sys is high (read from the code, 2026-11-05):** (1) every vk wait is a busy poll: turnip's and
+    hk_drm's syncobj deadlines are on CLOCK_MONOTONIC (date minus boot date on Darwin) while HKGPU compares against
+    mach_continuous_time (from SoC power-up, tens of thousands of seconds ahead), so each wait is "over before it
+    began" (log 061800:7270), returns at once and is re-asked in a loop for the whole GPU time; freedreno's patch had
+    already moved Gallium to CLOCK_MONOTONIC_RAW, so Gallium sleeps. (2) air_vk's texture writes and every destroy
+    submit and wait on their own (the test writes textures row by row: 7-40x the submissions). (3) staging buffers
+    made and closed per call. (4) turnip names every live BO in every submission; per BO the kernel's work is O(1),
+    the only O(size) part being the seen surface's clean (~37 us/MB, under gGPULock).
+  - **Must be fixed before metal_backend=vk goes into the system:** a narrow race left by M4-1: a recording stopped at
+    an event's wait can resume on another thread in the instant the first thread writes or reads a texture it named.
+    -replaceRegion: and -getBytes: need rw_pipe_lock in hkmetal.m (documented at air_vk.c record_begin). Also: a GPU
+    job over 5 s now hits the kernel's "no answer" and recovery on vk too, as it always has on Gallium.
+  - Next (M4-1): the SMMU-fault fix; the wait clock (hk_drm fence_wait on CLOCK_MONOTONIC_RAW with a back-off;
+    turnip-darwin.patch tu_knl_drm.h to CLOCK_MONOTONIC_RAW); deferred texture writes (an upload command buffer ahead
+    of the current one) and deferred destroys; a staging ring. Kernel round: patience in us, not whole ms.
+    Agreed details (the supervisor, 2026-11-05): the deadline from mach_continuous_time() itself (HKGPU.cpp:505's
+    source), in hk_drm and in the turnip patch, not from whichever clock id happens to match; the ETIMEDOUT back-off
+    kept as a last guard; gpu_irq stays 0 for M4-1 (comparable with run 071517), gpu_irq=1 a separate run; the
+    upload command buffer on the same queue, ahead of the user's, with a barrier, so a CPU write read at once by a
+    blit or draw stays in order; deferred destroys share the SMMU fix's "recycle only once the fence signalled"
+    mechanism; hk_drm.c built both ways (turnip's copy rebuilt, Gallium's compiled to check it still builds).
+      - **Design input for the kernel round (the supervisor, 2026-11-05):** cleaning every seen surface at every
+        submission does not scale -- turnip names every buffer of the process each time, so one full-screen seen
+        surface costs a 10 MB clean per submission. The kernel should clean/invalidate only surfaces the CPU has
+        touched since the last time (by the seed, dirty tracking, or the window a CPU mapping is open), and
+        invalidate after the GPU writes only what the CPU will read (IOSurfaceLock(ReadOnly), or mapped surfaces).
+      - **Also for the kernel round:** a wait's patience counted in us or rounded up (millisecondsUntil rounds down to
+        whole ms, so the last <1 ms of every wait is polled); and the seen surface's clean (10 MB, ~390 us) not done
+        whole under gGPULock -- it blocks every other process's submissions, backboardd's included -- but in pieces or
+        outside the lock.
+      - **And (2026-11-05, read during the SMMU-fault work):** every GPU address space uses ASID 0, and ring_table
+        (hk_adreno.c about line 3839) switches spaces with no wait-for-idle before it; and a GPU recovery makes every
+        pending fence read as done (hk_adreno.c about line 4280), so an application takes work that was given up for
+        success. The SMMU fault line prints only address, FSR and FSYNR0: it cannot name the task or the buffer.
+  - **M4-1, the cost part: built, NOT run on the phone (2026-11-05).** libvulkan_freedreno cba626e5552d5aa9, metal_drv_test
+    c28bc6e6687e45c4; hkmetal.m unchanged, Gallium's library not rebuilt. Jobs out/rc.jobs.m4r1 (--order, --burst, regression, W4, W3),
+    m4r2 (W2), m4r3 (W1); fixed clocks as run 071517, gpu_irq as it was.
+    - The wait clock: hk_drm.c fence_wait and the Mesa tree's tu_knl_drm.h (get_abs_timeout, turnip-darwin.patch, 372 lines) take the deadline
+      from mach_continuous_time() itself (hk_drm_gpu_now_ns, xf86drm.h); more than an hour is an hour a request (HK_DRM_LONGEST_WAIT_NS: the
+      kernel multiplies seconds by 10^9 in 64 bits signed, and "forever" wrapped negative); a back-off of 50-200 us on ETIMEDOUT with time left.
+      Checked on the host against a model of kMsmWaitFence (20 ms: one request; forever: two in 7 s; 3 ms never done: six). Gallium's copy
+      compiled with its own command: 27 functions of 31 the same, three differ in one static's offset, drmSyncobjWait changed and nothing in
+      gallium/freedreno calls it. Not fixed, not reached by air_vk (no timeline semaphores, no queries): tu_timeline_sync_wait's
+      pthread_cond_timedwait with a CLOCK_MONOTONIC abstime on Darwin's realtime condition, which would spin; vk_sync_timeline's condition.
+    - air_vk.c (8.6k lines): an upload command buffer, its own pool, under upload_lock with every vkQueueSubmit, one submission with the recording
+      and ahead of it (UPLOADS, at upload_begin): writes and read-backs from any thread never touch `current`. A write waits only with no defer_waits
+      or over an IOSurface. Destroys and an evicted pipeline: when_done, the last recording and upload that named the object (struct rwa_use), freed
+      when reap sees that fence signalled: one list of pairs on the queue for pairs, objects and the ring. THE STAGING RING: 4 MB at first use; over 1 MB
+      a buffer of its own; full: the upload is sent and the oldest holder waited for.
+    - Open by reading: one narrow race, a recording stopped at an event's wait, resumed on another thread in the instant the first writes or reads a
+      texture that recording named (record_begin's comment). rw_pipe_lock around -replaceRegion: and -getBytes: would close it. The kernel's
+      "no answer" and recovery now apply to vk waits as they do to Gallium's: a wait of a second or more, asked with the right clock, can reach them.
+  - Observed: CPU reads after GPU writes are stale on both back ends (the kernel item under T38 (17)): Gallium BGRA8
+    6384/6400 stale with a 5.1 ms gap, RGBA16F 1728/4096 at 2.5 ms; vk 1080/6400 at 0.5 ms, 616/4096 at 0.3 ms;
+    1080x2400 none (22 ms).
+  **M1 built, 2026-11-05:**
+  - turnip builds and links for iOS in a second build dir in the container: xnu-deps/build/mesa/build-turnip, same
+    tree and cross.ini, `-Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm -Dopengl=false
+    -Dgles2=disabled -Dosmesa=false -Dshared-glapi=disabled`, the rest as gallium's. It needs glslangValidator
+    (glslang-tools, installed in the container). The result is libvulkan_freedreno.dylib (73c6e36f); its only
+    unbound symbols are the entrypoint tables' weak references.
+  - tools/mesa/turnip-darwin.patch, applied after freedreno-darwin.patch:
+    - meson: the libdrm stand-in also for turnip, with HAVE_LIBDRM for the runtime's device list;
+    - turnip's three maps and unmaps through hk_drm_map/unmap;
+    - no pthread_condattr_setclock on Darwin;
+    - `-undefined dynamic_lookup`, because Mach-O does not leave weak references NULL as ELF does.
+  - tools/mesa/hackios-drm:
+    - the connection opens on the first request;
+    - drmGetDevices2/drmGetDevice2 list the one GPU, with /dev/null as its render node;
+    - binary sync objects are kept in the process: one in-order ring, so a sync object is the fence of the submission
+      that signals it, and a wait is the driver's fence wait;
+    - GEM_SUBMIT's MSM_SUBMIT_SYNCOBJ_IN/OUT are taken off before the kernel call and applied after.
+    - DRM_CAP_SYNCOBJ says 1 only in turnip's copy (HK_DRM_SYNCOBJ). gallium's copy still says 0, so its fences do
+      not change. The next gallium build (mk-mesa.sh copies hackios-drm every time) carries the new shim:
+      check OpenGL ES once before installing it.
+  - userland/src/vk_test.c: the driver opened by its ICD entry; the instance, the Adreno and its memory types; a
+    device; a 1 MB host-coherent buffer; two vkCmdFillBuffer (whole, then the middle half), each with a fence, and
+    every word read back. Test root out/vk-m1-root.apfs (rc.jobs.vk). No kernel change.
+- **(20) fps / smoothness, after HDR (the supervisor's note from the Metal assessment):** the GPU idles 75-83% of the
+  time at its lowest level (305 MHz), while each submission costs ~490 us in the kernel and glFlush 4.6 ms median
+  (docs/subsystems/gpu.md): the kernel's submit path and the GPU clock policy (`gpu_dcvs=0` in the installed args)
+  are the bigger levers for smooth frames, not the API. Also: TE averages 11375 us (87.9 Hz) against 11111 at the
+  panel's start (run 204007); frame pipelining / an extra buffer.
+  **HDR content:** the owner's two HDR HEICs (out/hdr-photos/, untracked, test roots only). A file in DCIM is not
+  imported; SpringBoard's PhotoKit import (inject_sb.c, boot-arg photos_import=1, from /hackios/import) fails with
+  PHPhotosErrorDomain 3301 on a fresh RAM /var (run 210107) and on the kept UFS /var, which ufs_write=0 makes read-only
+  (init: "creating a file gives EROFS"), so no library can be written there in a RAM run. Next: the import on ramhfs after
+  the library is ready (or assetsd's own logs), or another HDR source.
+- **(19) Settings > Safari does not open** (the owner, 2026-11-04 20:0x, run 200057: "safari設置打開失敗"). The log has only
+  Preferences' scenes going foreground/inactive, no crash line: Preferences' own os_log is not in the log. Next: a run with
+  OS_ACTIVITY_DT_MODE for Preferences (as wifi-diag-root does for SpringBoard) to see why MobileSafariSettings.bundle fails.
+  Also: SpringBoard refused `prefs:root=SAFARI&path=ADVANCED` (battery_test open). Since: run flag `prefslog`
+  (applog=1 applog_name=Preferences, kern_exec.c's aid) puts Settings' own os_log on the console (run 212043); SpringBoard
+  refuses prefs:root=SAFARI too; Settings' list flings ~4400 px on a normal swipe, slow drags (1.5 s) do not:
+  out/rc.jobs.item19b puts the Safari row near y 0.45. Run 212539's tap was overlapped by a hand on the phone: redo.
+  **Parked** (the owner, 2026-11-04 21:3x: "safari先別管，我們先管HDR").
+- **(15) the slow boot from the flash: done 2026-11-04** (the loader's log off the screen; HANDOFF, docs/INSTALL.md "Updating the installed loader").
 - **Owner, 2026-11-04 08:4x / 08:5x** (relayed by the camera supervisor session): these are to be fixed **once the camera is
   done**, not before ("這些不要立即做但是後面相機搞好了要修復"; "還有之前做的sensor也要"). "The camera done" means T07 through a
   working Camera.app (`cam=5`): the list's item 4, "no Camera app", is T07 itself. Symptoms and the supervisor's first leads
@@ -447,7 +1151,11 @@ ISP ("roadmap修相機 ->其他 -> 最后trustzone和Titan 480 IFE").**
   be set (K15 / T22: the poster switcher draws black); (5) choosing Bold Text in Settings hangs; (6) the clock about 2 s behind (the
   PMIC RTC's 1 s resolution, `xl settime`'s offset, no network time?); (7) screenshots do not work when booted from storage (VolUp +
   Power; the save to /var); (8) the display stutters after long use, more with background work (`gpu_dcvs=0`, `gpu_sleep=0`,
-  cpufreq); (9) sensors: auto-brightness (ALS), rotation, proximity (T04; the ALS agent stopped at an empty SUID list for
+  cpufreq) -- **deferred until after (12) Metal** (the owner, 2026-11-04 19:5x: "8放在metal完成后测"); the owner's hypothesis:
+  Metal work handed to the GPU contends with the compositor ("1我觉得是metal 丢给gpu"); to measure then: GPU work by client
+  (HKGPU's five-second lines are IOLog, which the loader's log does not get: switch them to loader_log_line), the compositor's
+  wait for the GPU while a Metal client is busy, and whether background daemons start Metal work after a while. Prepared:
+  out/rc.jobs.item8 (eleven rounds of gestures, 4 utility-QoS spinners in rounds 5-8), run flags touchlat and secs=N; (9) sensors: auto-brightness (ALS), rotation, proximity (T04; the ALS agent stopped at an empty SUID list for
   ambient_light -- check it is not still working on SLPI first); (10) GPS (T14); (11) the display not at 90 Hz: "我用瀏覽器測試只有
   45hz" (the owner, 2026-11-04, on the installed bundle 1793719359: `fb_hz=90 gpu_dcvs=0 gpu_pt=0 gpu_irq=0 gpu_recover=0`) --
   probably item 8's cause too. **Leads from the camera runs (2026-11-04, unverified as causes):** during Camera.app's preview

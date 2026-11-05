@@ -1,0 +1,375 @@
+--- a/meson.build
++++ b/meson.build
+@@ -1716,14 +1716,18 @@
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if host_machine.system() == 'darwin' and with_gallium_freedreno
++if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_freedreno_vk)
+   # No DRM on this system: freedreno's requests go to the kernel's driver through a stand-in
+   # for libdrm (src/hackios-drm, put there by Darwin on redwood's tools/mk-mesa.sh; its one
+-  # source file is built with freedreno's drm layer, src/freedreno/drm).
++  # source file is built with freedreno's drm layer, src/freedreno/drm, and with turnip).
+   dep_libdrm = declare_dependency(
+     include_directories : include_directories('src/hackios-drm'),
+     link_args : ['-framework', 'IOKit', '-framework', 'CoreFoundation'],
+   )
++  if with_freedreno_vk
++    # turnip and the Vulkan runtime find the GPU through drmGetDevices2 (the stand-in's)
++    pre_args += '-DHAVE_LIBDRM'
++  endif
+ elif dep_libdrm.found()
+   pre_args += '-DHAVE_LIBDRM'
+   if with_dri_platform == 'drm' and with_dri
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -101,8 +101,27 @@
+   tu_flags += '-DTU_HAS_MSM'
+   libtu_files += files('tu_knl_drm_msm.cc', 'tu_knl_drm.cc')
+   tu_deps += dep_libdrm
++  if host_machine.system() == 'darwin'
++    # the stand-in for libdrm (src/hackios-drm), with the sync objects it keeps for turnip
++    libtu_files += files('../../hackios-drm/hk_drm.c')
++    tu_flags += '-DHK_DRM_SYNCOBJ'
++  endif
+ endif
+ 
++# HackiOS's Metal driver over Vulkan (Darwin only): the contract of src/compiler/air/air_metal.h
++# implemented over turnip (src/compiler/air/air_vk.c), linked into this library so the AIR frontend,
++# NIR and turnip are one copy, and the one call into turnip it needs (tu_hackios.cc: turnip's NIR
++# options). Only the vk_icd* entry points and that contract are exported (tu_hackios_exports.txt).
++tu_hackios_link_args = []
++tu_hackios_link_depends = []
++if host_machine.system() == 'darwin'
++  libtu_files += files('tu_hackios.cc', '../../compiler/air/air_vk.c')
++  tu_deps += idep_air
++  tu_hackios_link_args += ['-Wl,-exported_symbols_list,' +
++                           join_paths(meson.current_source_dir(), 'tu_hackios_exports.txt')]
++  tu_hackios_link_depends += files('tu_hackios_exports.txt')
++endif
++
+ if freedreno_kmds.contains('virtio')
+   tu_flags += '-DTU_HAS_VIRTIO'
+   libtu_files += files('tu_knl_drm_virtio.cc', 'tu_knl_drm.cc')
+@@ -181,8 +200,12 @@
+   c_args : [no_override_init_args, tu_flags],
+   cpp_args : [tu_cpp_args, tu_flags],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
+-  link_depends : vulkan_icd_link_depends,
++  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id,
++               # (Mach-O: the entrypoint tables' weak references to entrypoints turnip does not have stay
++               # unbound until run time, where they are NULL, as an ELF linker leaves them)
++               host_machine.system() == 'darwin' ? ['-Wl,-undefined,dynamic_lookup'] : [],
++               tu_hackios_link_args],
++  link_depends : [vulkan_icd_link_depends, tu_hackios_link_depends],
+   install : true,
+ )
+ 
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2709,6 +2709,7 @@
+                                  "pthread condattr init");
+       goto fail_timeline_cond;
+    }
++#ifndef __APPLE__       /* (Darwin's condition variables keep the realtime clock: no other to set) */
+    if (pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+@@ -2716,6 +2717,7 @@
+                                  "pthread condattr clock setup");
+       goto fail_timeline_cond;
+    }
++#endif
+    if (pthread_cond_init(&device->timeline_cond, &condattr) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+@@ -3061,8 +3063,10 @@
+       result = tu_bo_init_dmabuf(device, &mem->bo,
+                                  pAllocateInfo->allocationSize, fd_info->fd);
+       if (result == VK_SUCCESS) {
++#ifndef __APPLE__       /* (an IOSurface's ID here, hk_drm.c: no file of this process's to close) */
+          /* take ownership and close the fd */
+          close(fd_info->fd);
++#endif
+       }
+    } else if (mem->vk.ahardware_buffer) {
+ #if DETECT_OS_ANDROID
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -117,6 +117,14 @@
+ 
+    TU_RMV(bo_unmap, dev, bo);
+ 
++#ifdef __APPLE__
++   /* (the driver's mapping, hk_drm.c: given back; a reserved range in its place for a placed map) */
++   hk_drm_unmap(dev->fd, bo->gem_handle, bo->map);
++   if (reserve &&
++       mmap(bo->map, bo->size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED)
++      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
++                       "Failed to replace mapping with reserved memory");
++#else
+    if (reserve) {
+       void *map = mmap(bo->map, bo->size, PROT_NONE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+@@ -126,6 +134,7 @@
+    } else {
+       munmap(bo->map, bo->size);
+    }
++#endif
+ 
+    bo->map = NULL;
+ 
+@@ -175,6 +184,13 @@
+ {
+    uintptr_t level1_dcache_size = dev->physical_device->level1_dcache_size;
+    char *start = (char *) bo->map + offset;
++
++#ifdef __APPLE__
++   /* no line size here (tu_get_l1_dcache_size), so no cached non-coherent memory to sync: and the
++    * loop below would not move */
++   if (level1_dcache_size == 0)
++      return;
++#endif
+    char *end = start + (size == VK_WHOLE_SIZE ? (bo->size - offset) : size);
+ 
+    start = (char *) ((uintptr_t) start & ~(level1_dcache_size - 1));
+@@ -194,7 +210,11 @@
+ if (!(DETECT_ARCH_AARCH64 || DETECT_ARCH_X86 || DETECT_ARCH_X86_64))
+    return 0;
+ 
+-#if DETECT_ARCH_AARCH64 &&                                                   \
++#if defined(__APPLE__)
++   /* XNU does not let a program read ctr_el0 (SIGILL, run 001544), and the driver's buffers are
++    * write-combined (iokit/Kernel/HKGPU.cpp): no cached non-coherent memory, so no line size needed */
++   return 0;
++#elif DETECT_ARCH_AARCH64 &&                                                 \
+    (!defined(_SC_LEVEL1_DCACHE_LINESIZE) || DETECT_OS_ANDROID)
+    /* Bionic does not implement _SC_LEVEL1_DCACHE_LINESIZE properly: */
+    uint64_t ctr_el0;
+--- a/src/freedreno/vulkan/tu_knl_drm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm.cc
+@@ -72,7 +72,11 @@
+ 
+    if (bo->map) {
+       TU_RMV(bo_unmap, dev, bo);
++#ifdef __APPLE__
++      hk_drm_unmap(dev->fd, bo->gem_handle, bo->map);
++#else
+       munmap(bo->map, bo->size);
++#endif
+    }
+ 
+    TU_RMV(bo_destroy, dev, bo);
+--- a/src/freedreno/vulkan/tu_knl_drm.h
++++ b/src/freedreno/vulkan/tu_knl_drm.h
+@@ -14,6 +14,10 @@
+ 
+ #include "util/timespec.h"
+ 
++#ifdef __APPLE__
++#include <xf86drm.h>    /* the stand-in's (src/hackios-drm): hk_drm_gpu_now_ns */
++#endif
++
+ VkResult tu_allocate_userspace_iova(struct tu_device *dev,
+                                     uint64_t size,
+                                     uint64_t client_iova,
+@@ -37,10 +41,25 @@
+ static inline void
+ get_abs_timeout(struct drm_msm_timespec *tv, uint64_t ns)
+ {
++#ifdef __APPLE__
++   /* The kernel's driver measures this against mach_continuous_time() (HKGPU.cpp's
++    * millisecondsUntil) and CLOCK_MONOTONIC is another clock on Darwin, far behind it: a time
++    * made of that is long past, and nothing would be waited for. So the driver's clock itself,
++    * and no clock id that may or may not be it (hk_drm_gpu_now_ns, xf86drm.h). And a time it can
++    * add up: tu_queue_wait_fence(~0) must not wrap negative there (HK_DRM_LONGEST_WAIT_NS).
++    * tu_wait_fence asks once and takes the driver's answer, so there is no loop here to back off:
++    * an answer up to 1 ms early (the driver rounds down) or after its 5 s is VK_TIMEOUT to
++    * callers that only log it, and hk_drm.c's fence_wait is the path that goes on asking.
++    */
++   int64_t until = hk_drm_gpu_now_ns() + (int64_t) MIN2(ns, HK_DRM_LONGEST_WAIT_NS);
++   tv->tv_sec = until / 1000000000;
++   tv->tv_nsec = until % 1000000000;
++#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    tv->tv_sec = t.tv_sec + ns / 1000000000;
+    tv->tv_nsec = t.tv_nsec + ns % 1000000000;
++#endif
+ }
+ 
+ static inline bool
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -680,9 +680,17 @@
+                    uint64_t size,
+                    int prime_fd)
+ {
++#ifdef __APPLE__
++   /* (what comes in here is an IOSurface, and the "file descriptor" its ID: hk_drm.c's
++    * drmPrimeFDToHandle. Its size is the kernel's answer, as freedreno's import has it;
++    * an lseek() would move whatever file of this process has that number) */
++   struct hk_drm_surface surface = { .surface = (uint32_t) prime_fd };
++   off_t real_size = hk_drm_surface(dev->fd, &surface) ? -1 : (off_t) surface.size;
++#else
+    /* lseek() to get the real size */
+    off_t real_size = lseek(prime_fd, 0, SEEK_END);
+    lseek(prime_fd, 0, SEEK_SET);
++#endif
+    if (real_size < 0 || (uint64_t) real_size < size)
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+ 
+@@ -735,6 +743,17 @@
+ static VkResult
+ msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+ {
++#ifdef __APPLE__
++   /* the buffer's memory is the driver's client memory of the type that is its handle (hk_drm.c) */
++   void *map = placed_addr == NULL ? hk_drm_map(dev->fd, bo->gem_handle, bo->size) : MAP_FAILED;
++   if (map == MAP_FAILED)
++      return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
++
++   bo->map = map;
++   TU_RMV(bo_map, dev, bo);
++
++   return VK_SUCCESS;
++#else
+    uint64_t offset = tu_gem_info(dev, bo->gem_handle, MSM_INFO_GET_OFFSET);
+    if (!offset)
+       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+@@ -750,6 +769,7 @@
+    TU_RMV(bo_map, dev, bo);
+ 
+    return VK_SUCCESS;
++#endif
+ }
+ 
+ static void
+--- a/src/freedreno/vulkan/tu_hackios.cc
++++ b/src/freedreno/vulkan/tu_hackios.cc
+@@ -0,0 +1,53 @@
++/*
++ * Copyright © 2026 Darwin on redwood contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * What the Metal back end over Vulkan (src/compiler/air/air_vk.c, HackiOS's
++ * tools/mesa/air/air_vk.c) needs from turnip and cannot get through the Vulkan API:
++ * the NIR compiler options turnip's own shaders are made with.
++ *
++ * WHY THIS IS NEEDED AT ALL. air_vk.c hands turnip NIR rather than SPIR-V -- the AIR
++ * frontend makes NIR, and VkPipelineShaderStageNirCreateInfoMESA (vk_pipeline.h) is the
++ * Vulkan runtime's own door for it, the one vk_meta.c uses. That door has one condition
++ * that is not visible in any Vulkan structure: the shader's `options` must be the very
++ * options the driver compiles with. vk_pipeline_shader_stage_to_nir clones the shader
++ * and asserts
++ *
++ *     assert(clone->options == NULL || clone->options == nir_options);
++ *
++ * and then overwrites the pointer anyway. Asserts are compiled out of this build, so a
++ * shader made with other options would not be refused -- it would be COMPILED, having
++ * been translated under different promises about what the backend lowers (which ALU
++ * ops it has, whether it wants vertex ids zero-based, what it does with fp64...). That
++ * is a wrong shader that looks right, so the options are taken from turnip itself, by
++ * the same call tu_shader.cc makes (tu_spirv_to_nir: ir3_get_compiler_options of the
++ * device's compiler).
++ *
++ * WHY A VkDevice AND NOT A VkPhysicalDevice. turnip makes its ir3 compiler in
++ * tu_CreateDevice (tu_device.cc, `device->compiler = ir3_compiler_create(...)`), with
++ * per-device options (push_ubo_with_preamble, shared_push_consts and the storage bits),
++ * so there is no compiler, and no options, before there is a device. The options are
++ * one struct for every stage: ir3_get_compiler_options takes no stage.
++ *
++ * It is C linkage and hidden like everything else of turnip's: air_vk.c is linked into
++ * this same library, so nothing outside it needs to see this.
++ */
++
++#include "tu_device.h"
++
++#include "ir3/ir3_compiler.h"
++
++extern "C" const struct nir_shader_compiler_options *
++tu_hackios_nir_options(VkDevice device);
++
++extern "C" const struct nir_shader_compiler_options *
++tu_hackios_nir_options(VkDevice device)
++{
++   VK_FROM_HANDLE(tu_device, dev, device);
++
++   if (dev == NULL || dev->compiler == NULL)
++      return NULL;
++   return ir3_get_compiler_options(dev->compiler);
++}
+--- a/src/freedreno/vulkan/tu_hackios_exports.txt
++++ b/src/freedreno/vulkan/tu_hackios_exports.txt
+@@ -0,0 +1,68 @@
++# What libvulkan_freedreno.dylib exports on Darwin, and nothing else: ld64's
++# -exported_symbols_list (meson.build). Mach-O names, so each has its leading underscore.
++#
++# The library is built -fvisibility=hidden already, which today leaves exactly the three
++# vk_icd* entry points global. This list makes that a property of the link instead of a
++# property of every header in Mesa: NIR, util, ir3 and turnip are linked in whole, and one
++# of them marking a symbol default would otherwise export it -- and a second copy of NIR
++# visible in a process that already holds libhackiosair.dylib's is the kind of collision
++# that binds a call to the wrong copy without saying so.
++#
++# The ICD entry points, as a Vulkan loader (or userland/src/vk_test.c) looks them up:
++_vk_icdGetInstanceProcAddr
++_vk_icdGetPhysicalDeviceProcAddr
++_vk_icdNegotiateLoaderICDInterfaceVersion
++#
++# The Metal driver's contract over Vulkan (src/compiler/air/air_vk.c, the calls of
++# air_metal.h), which userland/src/hkmetal.m looks up by name when metal_backend=vk:
++_rwa_argbuf_encode_buffer
++_rwa_argbuf_encode_sampler
++_rwa_argbuf_encode_texture
++_rwa_argbuf_encoded_members
++_rwa_buffer_create
++_rwa_buffer_destroy
++_rwa_buffer_map
++_rwa_buffer_size
++_rwa_clear_color
++_rwa_clear_depth_stencil
++_rwa_compute_create
++_rwa_compute_destroy
++_rwa_copy_buffer
++_rwa_copy_buffer_to_texture
++_rwa_copy_texture
++_rwa_copy_texture_to_buffer
++_rwa_depth_read
++_rwa_depth_stencil_create
++_rwa_depth_stencil_destroy
++_rwa_device_close
++_rwa_device_defer_waits
++_rwa_device_name
++_rwa_device_open
++_rwa_dispatch
++_rwa_dispatch_buffers
++_rwa_fence_release
++_rwa_fence_wait
++_rwa_fill_buffer
++_rwa_finish
++_rwa_flush
++_rwa_generate_mipmaps
++_rwa_module_argbufs
++_rwa_module_textures
++_rwa_render_create
++_rwa_render_destroy
++_rwa_render_draw
++_rwa_resolve_texture
++_rwa_sampler_create
++_rwa_sampler_destroy
++_rwa_texture_create
++_rwa_texture_destroy
++_rwa_texture_from_surface
++_rwa_texture_read
++_rwa_texture_view_create
++_rwa_compute_create_constants
++_rwa_module_function_constants
++_rwa_texture_write
++#
++# Not part of air_metal.h: air_vk.c's counts of command buffers, fences, buffers and
++# images in use, for a test to print (userland/src/metal_drv_test.m).
++_rwa_vk_counts

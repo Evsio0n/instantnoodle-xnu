@@ -4,6 +4,251 @@
 (1) the camera: the three back cameras, zero-copy, the installed bundle, the owner's own check (T07); (2) the rest: T38 (the
 owner's list, items 1-13); (3) last: TrustZone (FairPlay, the Secure Enclave: T15) and the Titan 480 IFE's full hardware ISP.
 
+**Git, 2026-11-05 about 18:50:** the work below is committed locally (kernel d63f37e, userland 596393b on branch instantnoodle) and published to github.com/Evsio0n/instantnoodle-xnu without `tools/metal/loop/`, whose scripts name local paths. "Nothing committed" in the sections below was true when they were written. Kernel default-on is done (cam-6329a3e9); the HEIC section's "no kernel flip" is older. MDP work in progress is in xnu-src only.
+
+## DSP round, stopped for MDP — 2026-11-05 (the owner: 「等隔壁看看收尾，收尾后做 DSP」, then 「跑完了跑MDP」; RAM only, nothing committed)
+- **Kernel to start from: `out/kernels/cam-6329a3e9.mach`, built from `xnu-src/xnu-8796.121.2` as it stands (BUILD_CAM's binary has the same SHA, no source newer than it).** Build: in the container, `./xnu-build.sh OBJROOT=/build/xnu-src/xnu-8796.121.2/BUILD_CAM/obj -j11 -k`; it ends with an error by design, judge by the binary's date. **Everything for it is in xnu-src and NOT in xnu/:** pexpert/arm/pe_bootargs.c, bsd/kern/kern_sysctl.c and bsd/dev/hk_sound.c are not exported (hk_sound.c was already behind since 2026-11-04). Do not recreate the tree with xnu/apply.sh, and run xnu/export.sh before any commit. Two sessions sharing this tree: say so before starting a build.
+- **The board's defaults (verified on phone, runs 180414, 180530, two boots of one power-on):** on board=instantnoodle, `wifi=1 wifi_bdf_native=1 adsp=1 sound=4 sound_amps=1 haptic=5 cam=5 cam_after=10` are added to the kernel's boot line unless that name is given (pe_bootargs.c), so arg=0 is off and user space's kern.bootargs agrees. Each came up by its own log line. No such args: 550 of the loader's 607 bytes with exctrace and ramhfs. Touch not touched. **Install dependency: `oneplus8-audit/wifi-native/stable-plan.json` keeps `wifi=1 wifi_bdf_native=1` until the installed kernel has these defaults; an older kernel without them would lose Wi-Fi.** The runner detects such a kernel by the string in its binary; flags `nowifi`, `nosound`, `nocam`, `silent` (sound_amps=0), `touchlat`, `mediastacks`, `medialog`, `sound_periods=N`, `sound_period_frames=N`.
+- **Sound, measured from logs with the amplifiers down (run 180858 baseline, 181527 with `sound_periods=4`):** see TODO T38 (18). Post of a touch to the queue's end about 108 ms with 4 x 10 ms, about 130 ms with 8 x 10 ms. Not measured at the speaker. **Camera speed not started.** The tone-and-microphone reference waits for the supervisor's word.
+- **Boots:** `tools/metal/loop/goal.sh` with `GOAL_METAL= GOAL_OFF= GOAL_TRACE= GOAL_KERNEL=out/kernels/cam-6329a3e9.mach GOAL_ROOT=dsp1 GOAL_FLAGS="silent touchlat sound_periods=4"`; job list out/rc.jobs.dsp1; `tools/metal/loop/latency.py LOG`.
+
+## HEIC and HDR on Metal over Vulkan, stopped on the owner's word — 2026-11-05 (Metal session; RAM only, nothing committed)
+**Stopped by 「我们保存结果接下来做dms」; the supervisor is confirming what comes next. To pick HEIC up again, this is the state.** Details and causes: docs/TODO.md, M5e. The target is the owner's: HEIC and HDR photos as iOS does them.
+- **Verified on the phone (RAM):**
+  - Wallpaper back with VideoToolbox's Metal path served, no decline (run 164610, `outputs/m5f5-164610-wallpaper-heic-through-vt-metal.png`). The 420f pictures were still converted on the CPU in that run; that proves the path no longer blocks the wallpaper, not that the wallpaper is converted on the GPU.
+  - VideoToolbox's BGRA scale on the GPU: worst off by 1 against the pattern, as the CPU path (run 162255). Generic HEICs decode with the right colours through ImageIO.
+  - Photos imports the two HDR photos, opens the grid and a full view, in colour and not the gain map's grey, with no crash (runs 165643, 170709). **Not HDR, soft, and dimmer than it should be: see below.**
+  - Rows: 111 ok, 0 differ on the phone, 2 refused by the test itself (surface-540-*); real Metal 113 ok. Corpus vk 271 of 271 identical at the last frontend change (run 165643). 0 SMMU, 0 IS, 0 DEVICE_LOST in the last boots.
+- **Open, in the order they stop things:**
+  1. **CMPhoto still answers -12914** ("PHFigDecoder - failed async decode", twice a run). Format 540 is served and it did not change that. Unknown why.
+  2. **VideoToolbox's next refusals are destination imports:** format 123 (RGBA32Uint) over BGRA at a quarter of the width, and R8Uint and R32Uint per plane on a 420f ("surface N has 2 planes", "is 504x378 and the descriptor asks for 126x378"). It falls back to the CPU on each. Next fix: `rwd_texture_for_surface` in userland/src/hkdrawable.m (plane offset and row from IOSurface; compare bytes and not widths). A 16-byte texel needs a row of 256, which is kernel work.
+  3. **The dim screen:** Photos' white is 187 of 255 (about half in linear light), the picture's highest pixel is 191, and brightness-nits stays at 70-83, so the screen is dimmed for HDR with no extra brightness and no highlights. It is not hbm=1 (same with and without). **The comparison with the compositor on hk-gl has not been done;** run 231531's notes say factor 0.5 with nits rising to 140 there. If Metal's route makes Photos dimmer than SDR, this must not reach an install.
+  4. **Size at full view unchanged by 540:** BGRA 1512x1134 and 420f 1496x1122 imported, gain maps up to L008 2016x1512. The photo's real size has not been read from its header.
+  5. **Wallpaper colour:** vt_test's 420f of Y 105, Cb 141, Cr 83 gives BGRA 129 124 34 on the phone by the GPU and the CPU alike, 128 133 42 on this Mac. It reads as VideoToolbox's own matrix on this boot and is not settled.
+  6. **Rows surface-540-* need a test fix:** the phone refuses them with "an inline sampler whose state is not a constant", from this Mac's compiler. Format 540 is verified on the phone only through vt_test's results.
+  7. No RGBA16F surface appears in Photos yet, so the kernel round for its rows has not been reached. IOSurfaceSharedEventAddEventListener fails with e00002c7 in SpringBoard and Photos (no shared events in MiniIOSurface); its effect is not known.
+- **Default-on (the owner's rule: what is proven takes no boot-arg):** the runner has Wi-Fi and sound on by default, with `nowifi`, `nosound`, `nocam`. **No kernel flip is done.** The line is 607 bytes: all on with ramhfs is 656, so goal boots run `nocam nosound`. Gates and bytes: TODO, M5e.
+- **To boot the goal configuration:** `tools/metal/loop/` holds this session's scripts (they name their scratchpad; set `S`): `build_m5.sh` in the container, `mk_root.sh JOB` (env `TRACE=1`, `PHOTOS=1`, `FRAMEDUMP=1`, `VTDECLINE=1`), `goal.sh TAG SECS` (env `GOAL_ROOT`, `GOAL_FLAGS`, `GOAL_OFF`, `GOAL_TRACE`, `SHOT_DELAY`, `SHOT_COUNT`, `SHOT_GAP`). Last used: `GOAL_TRACE= GOAL_ROOT=m5f7 GOAL_FLAGS="datadefault novoldown nowifi photos edr2 hbm slideshowlog"`. Job list: out/rc.jobs.m5f7.
+- **The owner's photos:** test roots out/m5f4-root.apfs, m5f5, m5f6, m5f7 and out/hdr-photos/ hold them (0600); the owner decides when they go. Copies of shots showing them were deleted. They go into a root under generic names only; a shot showing one goes to the owner only, through the supervisor, never into docs or outputs.
+
+## The whole system on Metal over Vulkan — 2026-11-05 (Metal session; RAM only, nothing committed)
+- **The owner's direction (relayed): 「我就是要和iOS 一样metal +vulcan」, 「你不用这样测，要朝着目标测」.** Every boot is `metal=2 metal_profile=1 metal_backend=vk camtl=1`; what stops the system decides the next fix.
+- **Verified on the phone:** home screen complete and right with the compositor on Metal over Vulkan (run 141516, `outputs/m5d2-141516-home-complete-compositor-on-metal-vk.png`), 30 a second while it moves. Settings, Safari, Clock, Photos and Maps' first-run sheet open and draw (runs 141836-143528). Last boot 151633: `metal_drv_test --m5c` 101 ok, 0 differ, 0 refused; corpus vk 271 of 271 identical to the baseline of run 124507; 0 SMMU, 0 IS, 0 DEVICE_LOST, no trap.
+- **Not done:** docs/TODO.md's M5d passage, "Open from that" ([since then] VideoToolbox's Metal path is served, see the section above): VideoToolbox's Metal path was declined as a stopgap, the 420 and misaligned-row copies do not follow a changing surface, video and the map itself and HDR Photos are untried, Siri's orb at 4 samples is refused, the trace lines are still on.
+- **Tools for a wrong picture:** `metal_drv_test --ca-fill` (CoreAnimation's own library and constants), `air2nir --constants I=HEX,...` (what hkmetal's `spec` line says, as NIR, on the host), hkmetal's per-draw probe and thread sample (files /hackios/share/probes/metal_probe and sample in the root), `hk-trap` lines (a SIGTRAP's stack, always on).
+- libhackiosair stays 6ef66c30 and was not touched. Before anything of this goes into a system image it needs its rebuild and regression.
+
+## HDR (item 17) closed for the display side; Photos and HDR photos — 2026-11-04 21:3x-2026-11-05 00:1x (camera/backlog session; RAM only)
+- **Verified on the phone:**
+  - The full EDR ramp: CoreAnimation's factor went 0.993 -> 0.500 in about 2 s while brightness-nits rose 70 -> 140 (edr=2,
+    run 231531). The headroom is about 2 at 70 and at 20 % brightness, so the photo's own headroom limits it. No HBM was
+    needed (nothing over 430).
+  - Photos no longer crashes on HDR photos: GL library a5074b37 put eagl.c's EAGLContext table under a lock. Two decode
+    threads had taken one place; CI::GLContext::init then called address 0 (exctrace, run 230437).
+- **Open, waits for Metal (KNOWN_ISSUES K27, TODO T38 (17)):** a full-size HDR photo shows its grey gain map. Photos'
+  PHFigDecoder gets -12914 from CMPhoto's accelerated decode (it probes the M2 scaler and links Metal and MPS).
+  VideoToolbox's rotations and scales and ImageIO's decode all work (userland/src/vt_test.c, run 234735). There is no
+  supported switch (per-request flags in Photos).
+- **Uncommitted, mine:**
+  - userland/src/eagl.c: the table lock (32 places); each move of the EDR factor logged; two-plane plane stats; a hand-written
+    glUniformMatrix3fv; CoreAnimation's YCbCr shader text logged once. GL library 17af903e.
+  - userland/src/vt_test.c (new).
+  - out/mk-current-root.sh copies vt_test.
+  - ../oneplus8-audit/camera-native/run_cam_probe.py has `slideshowlog` (applog_name=MobileSl).
+  - docs: TODO, KNOWN_ISSUES K27.
+- **The owner's photos:** the 15 test roots that held them were deleted on 2026-11-05 (the supervisor's privacy rule), along
+  with the screenshots from those runs. Only out/hdr-photos/ (untracked, 0600) remains, kept for the HDR content view after
+  Metal; delete it after that. The shared root has no photos (27dbc8a2).
+- **Scripted Photos runs on a new /var:** the first launch puts "What's New in Photos" with a notifications alert on top;
+  answer the alert (Don't Allow, about 0.32 0.59) before Continue (0.5 0.895).
+- **Next: Metal over Vulkan** (the owner, 2026-11-05, relayed: "Metal first"). Items 11/20 (fps) come after Metal.
+  - **M1 passed on the phone** (run 002111): turnip on HKGPU fills a 1 MB buffer, reads back right, no fault.
+  - Files (uncommitted): tools/mesa/turnip-darwin.patch (new), tools/mesa/hackios-drm/{hk_drm.c,xf86drm.h},
+    userland/src/vk_test.c (new); docs/BUILD.md (the turnip build). Built in the container's
+    xnu-deps/build/mesa/build-turnip (glslang-tools installed there).
+  - The next gallium build carries the new shim (DRM_CAP_SYNCOBJ still 0 there): check OpenGL ES once before installing it.
+  - **M2 passed** (run 002902, a SPIR-V triangle in sysmem, sysmem+UBWC and GMEM). **M3a passed** (run 012447):
+    Metal through turnip, AIR -> NIR. Both back ends in one boot (HK_METAL_BACKEND, metal_drv_test --backend,
+    air_metal_test_gl/_vk); fragPos matches Gallium.
+  - Files for M3a (uncommitted): tools/mesa/air/air_vk.c (new); in the Mesa tree, tu_hackios.cc and
+    tu_hackios_exports.txt (in turnip-darwin.patch, now 304 lines); userland/src/hkmetal.m (mesa_available);
+    userland/src/metal_drv_test.m (--backend, --rtfmt, --clear, the digest line, rwa_vk_counts);
+    tools/mesa/air/air_metal_test.c (--gpu).
+  - The Mesa tree's .redwood-patches no longer matches tools/mesa/*.patch, so the next tools/mk-mesa.sh run
+    re-extracts the tree and deletes both build dirs. Rebuild build-turnip after it (docs/BUILD.md).
+  - **M3b passed** (runs 020036 + 020900): buffers, textures and samplers through turnip (one push-descriptor set).
+    The whole AppleMetalGLRenderer corpus, 271 fragment shaders, on both back ends: 259 the same, 1 different only
+    in channels the shader leaves undefined, 0 real differences, 3 refused by vk alone (3D textures), 8 failed on both
+    (multisample, [[depth]]). Details in TODO T38 (12).
+  - Files for M3b (uncommitted): tools/mesa/air/air_vk.c (4104 lines; the copy in the Mesa tree is the same file);
+    userland/src/metal_drv_test.m (drawall-result/-summary lines); tools/mesa/air/air_metal_test.c (16 pixels and
+    FNV-1a); out/rc.jobs.m3b, out/rc.jobs.m3b2. libvulkan_freedreno 7fe7b0bbd4094b20.
+  - **M3c-1 passed** (run 023037): 3D textures on vk (the three M3b refusals now match Gallium), and
+    userland/src/hkmetal.m gives a command buffer's fence back at completion (vk in use during --draw-all: 0, was 208).
+    Files: air_vk.c (4284 lines), hkmetal.m (-hkWaitFence), metal_drv_test.m; out/rc.jobs.m3c1. libvulkan_freedreno
+    30c9f9e25fd55ea0, libhackiosmetal bf0c6896dd530a86, HKMetal 3b3c6d02947261c3, metal_drv_test 2ae7f9676a4a55dc.
+    The hkmetal change is on the Gallium path too: the installed system has the old library until the next install.
+  - **M3c-2 passed on vk** (runs 030433 + 030853): depth and stencil. Corpus 271/271: 262 same, 1 undefined-only,
+    0 different, 2 failed on Gallium alone (a [[depth]] store times the GPU out there: KNOWN_ISSUES K28), 6 multisample
+    on both. libvulkan_freedreno f50f681dbb6fd686, metal_drv_test f6a04ecd38f91d69; out/rc.jobs.m3c2a/b.
+  - **M3c-3 passed** (run 034547): multisample and resolve. vk draws all 271 corpus shaders (266 the same as Gallium,
+    2 undefined-only, 0 different, 3 that fail on Gallium alone: K28). K28 is the Metal path only: GLES gl_FragDepth
+    works (gl_test fragdepth, new). libvulkan_freedreno 99b1e65b4fe1eb2d, metal_drv_test 3418bb2b11972a7e, gl_test
+    025b1a917eb93e03; out/rc.jobs.m3c3. Files: air_vk.c (5813 lines), metal_drv_test.m, gl_test.c.
+  - Next: compute, then IOSurface (texture_from_surface), then argument buffers, then M4.
+  - **M3d run** (runs 043116 + 043536; TODO T38 (12)): compute on vk, 45/52 the same as Gallium, 6 3D pixel-coordinate
+    kernels refused by Vulkan's rule (M3d-2 lowers them), fbs_pcg_iter2 racy on both; sysvals to re-run (stale test build). air_vk.c (6653 lines; the Mesa tree's copy is the same),
+    metal_drv_test.m (compute-result lines, --compute-all), air_metal_test.c (compute-result, GROUPS THREADS),
+    tools/air/sysvals.ll (new; userland/obj/sysvals.bc must be at /hackios/share/probes). hkmetal.m unchanged.
+    libvulkan_freedreno fc6f028849b2093f, metal_drv_test 50c63ea159289eda, air_metal_test_gl f0235a027076be7e,
+    air_metal_test_vk 1a431295fb7c3c66. Jobs out/rc.jobs.m3d1, out/rc.jobs.m3d2.
+  - **M3d-2 passed** (run 050912): sysvals and tools/air/sample3d.ll equal the host values on both back ends; the six 3D
+    pixel-coordinate kernels get a pipeline. **Erode settled** (run 054947): offsets right on both (sample3d_off);
+    half overflow is +inf on vk, 65504 on Gallium (KNOWN_ISSUES K29).
+  - **M3e run** (run 054947): IOSurface textures on vk (dma-buf import by surface ID). Imports, clears, copies,
+    refusals and drawable_test match on both; one open item, a draw into an RGBA16Float imported surface differs on vk.
+    CPU reads after GPU writes were seen stale on both back ends (a kernel item, TODO T38 (17), with the RGBA16F row
+    alignment). libvulkan_freedreno 51efa75f271a052d, libhackiosmetal 60092d1c9c6d47c0, HKMetal ff931e59eec9277a,
+    air_metal_test_gl/_vk 77a969cb/6776441c, drawable_test 7288672b; turnip-darwin.patch 333 lines. Jobs out/rc.jobs.m3e.
+  - **M3e passed on vk** (runs 060507-062853): the RGBA16F mismatch was the CPU's stale cache, not vk. air_vk now maps
+    an imported surface once so the kernel treats it as seen (as Gallium's are): 9/9 right. iOS's sys_dcache_flush is a
+    no-op here (a barrier and a return), so the kernel must keep GPU-shared memory coherent: TODO T38 (17), kernel
+    round. libvulkan_freedreno a2b44a1c63233269 (7376-line air_vk.c), air_metal_test_gl/_vk 6aea8d8e/852e457b.
+  - **M4 first numbers** (run 071517, 525 MHz, cpufreq_gov=0): in steady drawing vk uses 0.57-0.81x Gallium's GPU time,
+    but its CPU sys is far higher: every vk wait is a busy poll (a clock mismatch) and writes and destroys submit on
+    their own. **SMMU faults on vk found and fixed** (a second thread recording via rwa_finish on empty command
+    buffers; verified run 080405; libvulkan_freedreno 9f625b63388cc528, metal_drv_test 61fcc2ab463f2c3e). TODO T38 (12).
+  - run_cam_probe.py (oneplus8-audit/camera-native) now also takes cpufreq_gov=[01] (lines 27 and 46).
+  - **M4-1 verified, M4 closed** (runs 084829-091116): vk really sleeps now, and in steady drawing it uses 0.57-0.8x
+    Gallium's GPU time, CPU no worse apart from the seen surface's kernel clean. libvulkan_freedreno cba626e5552d5aa9,
+    metal_drv_test c28bc6e6687e45c4. **The owner: Metal goes over Vulkan; no more cost comparison.** Correctness checks
+    stay. VkPipelineCache stays in TODO. The hyp dump (partdump, out/hypdump-root.apfs) is built, not run, shelved by
+    the owner.
+  - Next: M5 (complete Metal on vk, TODO T38 (12)): M5a blending, vertex input, indexed draws, geometry and pass state.
+  - **M4-1, the cost part: built, NOT run** (TODO T38 (12), its entry has the design): the wait clock (tools/mesa/hackios-drm/{hk_drm.c,xf86drm.h}, the
+    Mesa tree's tu_knl_drm.h, tools/mesa/turnip-darwin.patch), deferred writes, deferred destroys and a staging ring (tools/mesa/air/air_vk.c), --order
+    (userland/src/metal_drv_test.m). libvulkan_freedreno cba626e5552d5aa9, metal_drv_test c28bc6e6687e45c4. Jobs out/rc.jobs.m4r1, m4r2, m4r3. Uncommitted.
+    A pristine copy for the patch is in the session's scratchpad (mesa-pristine, now with tu_knl_drm.h).
+
+
+## Sound delay (item 18), screenshots (item 7), display (items 11/17) — 2026-11-04 19:3x-20:0x (camera/backlog session; RAM only)
+- **Item 18, done in RAM** (TODO T38 (18)): `xnu-src/.../bsd/dev/hk_sound.c` -- 8 x 10 ms periods (80 ms queued at the DSP),
+  amplifiers off after 30 s of silence, no silence kept while parked (the first sound clears the ring), silence over 43 ms at
+  the ring's front dropped, 60 ms of silence leading the first sound after a park (UNPARK_LEAD_PERIODS). The 0.68 s backlog
+  of a parked ring was the real delay (run 193817). Kernel `BUILD_CAM` 9b50e69b (20:0x). **Export hk_sound.c** with the rest
+  before an install. New log lines: "a sound after silence (N) written at T, with M ms of the ring ahead of it", "N underflows
+  at the DSP so far", the feeder's stop line with the ring's longest wait and what was dropped.
+- **Item 7 closed in RAM:** chord and physical VolUp+Power both save a PNG (runs 192253, 192832). rwtouch has `chord`.
+- **init splits an rc.jobs line into 63 words at most** (the rest becomes one word, which rwtouch refuses): keep job lines
+  short (run 193817 stopped at its k10).
+  - **M5c, built, rows pass on real Metal, phone runs waiting on the notice** (TODO T38 (12)): argument buffers, a draw's stores, arrays of descriptors and
+    function constants on vk. out/rc.jobs.m5c1-3, tools/air/m5c.metal, tools/air/m5c_rows.h, tools/air/mtlref/airdump.m; out/msl/m5c.metallib is made by
+    airdump on this Mac. libvulkan_freedreno dc58c35cad96014b, 51 exports. Uncommitted.
+  - **M5b, run: results in TODO T38 (12)** (runs 111109-112410, no fault; the sRGB rows wait for the curve): textures, samplers and formats of air_vk.c: levels, slices, every type, a pass into a level or slice, views
+    (`rwa_texture_view_create`, the one new export), border colours, generate_mipmaps, the packed 32-bit, ETC2/EAC and ASTC formats. Jobs out/rc.jobs.m5b1-4.
+    draw_model.h's blend model now quantizes first, as the hardware does: run 094931's 92 rgba8/bgra8/rgba16f/rgba32f blend pictures reproduced whole on the host.
+  - **M5a, built, NOT run** (TODO T38 (12) has the design): the draw path of air_vk.c (blending, vertex input, indexed draws, cull,
+    winding, viewport, scissor, primitive types, per-attachment clears). Uncommitted: tools/mesa/air/{air_vk.c,air_metal.h,air_metal_test.c,
+    draw_model.h}, tools/air/m5a_*.ll, userland/src/{hkmetal.m,metal_drv_test.m}; jobs out/rc.jobs.m5a1, m5a2, m5a3. userland/obj/m5a_*.bc
+    go to /hackios/share/probes. Exports still 48; Gallium's library not rebuilt (it reads rwa_draw's old prefix).
+- **Item 8 deferred until after Metal** (the owner); prepared out/rc.jobs.item8. **Items 11 + 17 in progress:** the panel's
+  TE is 90 Hz; the owner's browser 45 is probably Safari's PreferPageRenderingUpdatesNear60FPSEnabled (60 on 90 -> 45), being
+  measured (run 70, out/rc.jobs.item11, `touchlat`).
+- Run flags added to run_cam_probe.py: `touchlat` (touch_lat=1), `secs=N` (loader_return_after), `hbm`, `edr`, `photos`;
+  `CAM_KERNEL=out/kernels/cam-<sha>.mach`: every run now sends a kept copy of the kernel and quotes its SHA (a build
+  during a run had changed what was sent, run 203539).
+- **Item 17 (HDR), 20:0x-21:1x:** HBM verified by the owner (bsd/dev/hk_hbm.c, `hk_display_hbm()`, boot-arg hbm=1, limits
+  approved by the supervisor: 30 s, 60 s cooldown, 180 s per 10 min, battery 38 C, hottest 60 C, off on dark/sleep/
+  loader/panic -- the last unconditionally with hbm=1). The EDR step in eagl.c verified (255 -> 188). CoreBrightness's
+  new architecture behind edr=1 (MiniAppleARMBacklight.cpp): taken, but its slider is broken (TODO T38 (17)); edr stays
+  test-only. **For an install:** the shared root now carries libhackios-gl with the EDR step (inert at factor 1),
+  libhackios-sb with a PhotoKit importer that registers only with photos_import=1 (keep it off), power_test hbm, prefs_set,
+  and com.hackios.prefs (Safari's near-60 switch off at every boot: the owner's choice, item 11). Kernel files to export:
+  hk_hbm.c (+ bsd/conf/files), MiniIOMobileFramebuffer.cpp (HBM; another session's uncommitted AMB655 changes are in the
+  same file), MiniAppleARMBacklight.cpp, hk_thermal.c (hk_thermal_now), hk_sound.c.
+- Wi-Fi in test images: runs needing the network use the kept UFS /var (ufs_write=0: read-only there, EROFS); a ramhfs
+  /var has no known network. mk-current-root.sh installs fw-wifi/network (0600) when the owner has made it; never read it.
+
+## Sound (backlog item 2) and the io_map panic — 2026-11-04 18:5x (camera/backlog session; RAM only)
+**Verified by the owner in RAM with the installed combination** (run 185457: wifi=1 + cam=5 + sound, "聲音正常"; vibration OK
+in 183207); io_map with everything on: **9136 KB** of the 64 MB (over Apple's 8192 KB: the cause confirmed).
+**The eventual install (not now; the owner: no UFS writes) must carry, together with items 1/16:** kernel with hk_sta.c,
+hk_apple80211.c, lx_80211.c (items 1), hk_adsp.c (fw lookup), loader_return.c (amps before Wi-Fi), io_map.c (64 MB) -- export
+hk_adsp.c, loader_return.c, io_map.c first; root = camera-mgfix-root + fw/ with fw-audio/* (adsp.mdt, adsp.b00-b18,
+tfa98xx.cnt) and fw-haptic/aw8697_haptic_170.bin, rc.jobs the stable one; cmdline = out/camera-install-cmdline.txt minus
+`gpu_pt=1 gpu_recover=1 var_data_format=0` (defaults) plus `sb_clock=28 wifi_dwell=1 adsp=1 sound=4 sound_amps=1 sound_below=96
+haptic=5 haptic_trim=11` = 584 B of the loader's 607 (with its 187 B prefix).
+Also for that install (items 5/6, 2026-11-04 19:2x): the root's var/db/timed/com.apple.timed.plist and init with timed_prefs()
+("Set Automatically" + NTP; item 6, verified in RAM run 191643 on a new /var; the kept-/var path of timed_prefs() is
+untested until the install; Time Zone keeps spinning without Location Services, known, left); item 5 (Bold Text) needed nothing beyond gpu_pt/gpu_recover on.
+
+No sound / no vibration on the installed bundle: its cmdline has none of the profile's `adsp=1 sound=4 sound_amps=1
+sound_below=96 haptic=5 haptic_trim=11`, and its image no audio firmware. Done in RAM (runs 183207-184851): vibration works with
+the args alone; the speakers need the audio DSP's image (`fw-audio/adsp.mdt`, `adsp.b00-b18`, read only from `modem_a`'s FAT
+/image with the loader's `oem fwread`: `../oneplus8-audit/firmware-reader/read_adsp_fat.py`) and `tfa98xx.cnt` (the ODM
+capture's /firmware), both untracked; `hk_adsp_fw_file()` (hk_adsp.c) now looks in the small image's fw/ first (with the iOS
+volume as the root there is no /fw). Sound verified by the owner ("有聲音", run 184551, wifi=0 no cam). With the camera too it
+panicked: `kmem_alloc(..., 1048576, ...): failed with 3` from camera_thread -> instantnoodle_gpio_cfg -> pin_base -> io_map:
+**`osfmk/arm/io_map.c` IO_MAP_SIZE 8 MB (Apple's) was full** -- our drivers' cached ml_io_map() register maps (TLMM tiles of
+1 MB, GCC, DSPs, mics, camera, PCIe) share it, KMA_NOFAIL. Now 64 MB, and loader_return prints "io_map: N KB of the io submap's
+65536 KB mapped". **Export note:** io_map.c becomes a new entry of hackios.patch (Apple file); every session's drivers get the
+room. Longer term: map only the TLMM pages used, not 1 MB tiles. Profile args fit the installed cmdline when gpu_pt=1
+gpu_recover=1 var_data_format=0 (defaults) are dropped (584 B of 607). Test image `out/sound-test-root.apfs` (rc.jobs = the sound
+check); run flags `lean`, `sound`, `nocam` in run_cam_probe.py.
+
+## For the Wi-Fi session: a panic with wifi=1 loses the panic text — 2026-11-04 18:4x (camera/backlog session)
+
+Run 184025 (sound test, wifi=1): "psci: cpu 2 ends the system" then "wifi: UNCLEAN PCIe DMA OWNERSHIP; loader return halted,
+cold recovery required" -- `hk_wifi_quiesce()` (`pci_diag_halt()`, hk_wifi.c, uncommitted) halts on loader_return after a panic
+(the orderly Wi-Fi shutdown not run) before the panic's text is copied into the loader's log: no message, and the phone hangs
+until a cold restart. You may want to copy the panic text (or the loader log) out before halting. Meanwhile sound/other
+panic hunts run with wifi=0. Also: `osfmk/arm64/loader_return.c` (it had uncommitted changes of another session) now calls
+`hk_sound_quiesce()` before `hk_wifi_quiesce()`, so the speakers' amplifiers are held in reset even when the Wi-Fi halt
+follows (one line added, nothing else touched).
+
+## Wi-Fi list, 5 GHz delay, status-bar bars; the clock — 2026-11-04 18:2x, verified on phone in RAM (the owner: "掃描改善了", "格子黑了，時間 OK")
+
+The owner's backlog item 1 (Wi-Fi) and item 16 (the clock under the camera hole). Found (runs 155842, 175404, 181543, 182409; RAM):
+(a)/(c) wifid scans 2.4 GHz (11 channels) and 5 GHz (25) apart, and each scan's results replaced the list (lx clears its heard list
+per scan): networks a scan missed dropped out, 5 GHz came seconds late. Fix `bsd/dev/hk_sta.c`: what was heard in the last
+`wifi_scan_keep` s (120; 0: as before) stays in what is read, with its real age -- wifid reads 24-55 per scan (3-22 before).
+Scan time: ath11k's own dwell (50 ms active, 150 passive; 16 of the 25 5 GHz channels are DFS) and 50 ms rest per channel
+when joined. Fix `wifi/lx/src/lx_80211.c` station_scan: `wifi_dwell=1` (or wifi_dwell_active/passive=) makes one scan two
+driver scans, the channels it may send on at 40 ms, the DFS ones at 110 (Android's WCNSS_qcom_cfg.ini values): 5 GHz 2.96->2.26 s
+unjoined, 4.2->3.8 s joined, 2.4 GHz 0.63->0.5 s; the list keeps 12 DFS networks (ath11k itself untouched).
+(b) the bars: always 0 (grey). wifid's bars come from its RSSI cache (`__WiFiDeviceProcessRSSIEvent`: scaled = 0.5 + x/(2*sqrt(x^2+450)),
+x = rssi+77.5; SpringBoard 3 x it, 1..3), fed by event 39; NOISE/RSSI_BOUNDS do not matter (subagent, 20F66 disassembly; the
+Apple Wiki's MobileWiFi page agrees on kWiFiScaledRSSIKey). Fix `bsd/dev/hk_apple80211.c`: event 39 (0xb4 bytes: [0]=1, [4]=RSSI
+dBm, the rest 0) 1 s after a join and every 3 s while joined. Also: its request log and the station's events now go into the
+loader's log (the kernel's printf is paused once iOS runs). Clock: `sb_clock=28` (inject_sb.c; the profile had 24, the
+installed cmdline none). Exported (xnu/export.sh: only hk_sta.c, hk_apple80211.c changed). Diagnostic image (not for install):
+`out/wifi-diag-root.apfs` = camera-install-root + OS_ACTIVITY_DT_MODE for SpringBoard and wifid.
+**Install candidate** `out/instantnoodle-wifi-bars.img` gen 1793788085 cd0743a2...: kernel `out/wifi-install-kernel` 10fd7b0d...,
+root `out/camera-mgfix-root.apfs` cf335620 (+ the camera stamp init), resident flashboot.apfs 3fb7b93a, cmdline
+`out/wifi-install-cmdline.txt` = the installed one + `sb_clock=28 wifi_dwell=1`. Uncommitted: xnu/files/bsd/dev/hk_sta.c,
+hk_apple80211.c, wifi/lx/src/lx_80211.c, userland/src/init.c, run_cam_probe.py (sb_clock=, wifi_scan_keep=, wifi_dwell= pass-through).
+
+## Installed loader: a quiet, faster boot from the flash — 2026-11-04 17:4x, verified on phone (the owner: "Yes, fast and quiet", Camera and Wi-Fi "都正常")
+
+The owner's backlog item 15 ("走內部UFS啟動的話，會print 日誌…因為日誌刷新efifb很卡，導致開機很慢"). Cause: the loader drew its whole
+log (~300 lines, 20 KB before the kernel) on the firmware's text console a character a call, a 1080x2400 scroll a line (the
+UEFI itself prints nothing: its FD is Mu-Silicium's RELEASE build). Fix (`xnuloader/loader.c`, `xnuloader/flashboot.c`, uncommitted;
+loader.c also carries another session's earlier uncommitted changes, which the installed loader already had): the installed
+boot's screen has the menu and one "starting <label>" line (with a framebuffer; QEMU's serial keeps the log), the screen gets a
+line a call, `time: N ms since power-on` lines in the log, and `oem readpart boot_a|boot_b` (read only: the first 63 MB staged,
+the whole partition's SHA-256 logged). QEMU `common/flash/qemu-test.sh boot previous guard` 3/3 (LOADER_EFI= new; sgdisk from
+the build container). **The UEFI is in `boot_a`** (ABL: current-slot a; `boot_b` = OxygenOS's boot): docs and the profile fixed.
+The loader must be built with this phone's userdata GUID (`LOADER_DEFS`, out/backup/loader-build-defs.txt, not in git): a RAM
+boot without it had no HackiOS in the menu. Image `out/instantnoodle-uefi-fast.img` 8156abcc6df0e57b... (= boot_a's image with
+only the loader payload: `out/repack_uefi.py`), RAM-tested (`fastboot boot`: quiet, HackiOS, Developer mode), then
+`xl flashpart boot_a` (EXPECT 6c9c5e3a..., read back) at 17:39. boot_a now: whole SHA-256 e286be3d8e8f0e6e738b3c41050a1929a10261e73b04f019359db0a97f9a1f66.
+Backups (never delete): `out/backup/boot_a-20261104-6c9c5e3a.img` (before), `boot_b-20261104-a13126e8.img`, `boot_a-20261104-after-fast.img`,
+copies in `../../outputs/boot-backup-20261104/`. **Undo:** `./xl flashpart boot_a out/backup/boot_a-20261104-6c9c5e3a.img e286be3d8e8f0e6e738b3c41050a1929a10261e73b04f019359db0a97f9a1f66`.
+Unplugged boot (logs/lastlog-ufs-after-fast.txt): the loader at 13678 ms after power-on, the menu 13684, chosen 13788 (by
+hand), the bundle read and checked 14463, the kernel next 17876 (3.4 s of run_kernel: not looked into). Before: no time
+lines (the old loader; logs/lastlog-ufs-before-fast.txt, 447 lines on screen). Open: the stock fastboot's key combination
+from power-off is not confirmed (the menu's "Bootloader (fastboot)" works).
+
 ## OnePlus 8 cameras (T07) — 2026-11-04 ~00:45, Claude session (parallel to the ALS one)
 
 **16:4x-16:5x installed camera bundle: the Camera icon (MobileGestalt cache) and Camera opening (/var made anew) -- verified on phone in RAM runs against the phone's /var (the owner: "有相机了", "相機工作正常"), then on the
@@ -356,7 +601,7 @@ Owner entered Developer mode (USB, xl); USB serial xnuloader. GPU stages 2 and 3
 ### Earlier local chronology (superseded where it describes current state)
 
 - CURRENT MILESTONE: RAM-only UEFI (`out/instantnoodle-v2-ramonly.img`, SHA f53badf74a64b1d5ce0353de75b7dd0043d94b9d40003a6e154d4c5a458ba751) successfully reaches `product: xnuloader` after ~10s; owner confirms text/menu. USB serial is now `xnuloader`, NOT the Android serial. UFSDxe absent from extracted FV. `./xl state` reports loader. Upload `./xl ramdisk userland/system.apfs` started in exec session 1306; do NOT issue concurrent fastboot commands during upload. Next XNU trial should use RAM root and no ufs/ufs_write, software rendering (fb_push=0 fb_hz=60 gpu=0), no radio/audio, syssleep=0; loaded XNU not yet verified.
-- CURRENT 2026-11-03: exact hardware target audit passed (instantnoodle FD, payload and loader verified). Owner photo IMG_0927.HEIC proves direct `ios-instantnoodle` probe runs (`BOARD instantnoodle`, live FDT, 30s countdown); ADB returned at 36s. That probe carries no XNU payload. Header-normalized UEFI still crashed; diagnosis below supersedes speculative header/USB explanations.
+- CURRENT 2026-11-03: exact hardware target audit passed (instantnoodle FD, payload and loader verified). An owner photo proves direct `ios-instantnoodle` probe runs (`BOARD instantnoodle`, live FDT, 30s countdown); ADB returned at 36s. That probe carries no XNU payload. Header-normalized UEFI still crashed; diagnosis below supersedes speculative header/USB explanations.
 - Read-only Sahara diagnostics now work on USB 05c6:900e. HELLO mode=2; respond with memory-debug mode and read table. Drain zero-length IN packets after reads divisible by 512, otherwise next OUT times out. `../oneplus8-audit/capture-uefi-crash.py` implements a bounded capture; `read-sahara-region.py` reads another RAM region in an already-negotiated session. NO loader upload or flash commands. Sahara RESET_REQ (7,8), RESET_RSP (8,8) has twice restored Android automatically.
 - ACTUAL STOP: original UFSDxe at base b2fc0000 spins at RVA f74c (CpuDeadLoop) after `ASSERT UFS.c +1004: !EFI_ERROR (... | (7))`; stack also contains `ufs_error_log: 28b`. Saved IRQ context ESR/FAR=0 is not a synchronous-fault record. HOB, EFI system table, debug image table, stack and exact build maps establish the driver identity. Evidence `crash-normalized/ufs-assert-finding.json`, `loaded-uefi-images.json`, raw stack. UEFI reaches DXE driver dispatch; XNU has NOT run.
 - Current XBL is **00358**, identical a/b. Historical 00248 in abl_log is stale. Extracted current XBL with uefi_firmware into `../oneplus8-audit/firmware/`. Replacing only UFSDxe and its real DEPEX with this unit's native PE (SHA 78f04782a353b6c51a3fae6f458e7e89abdade1d8d5c6bc259eabd3c52918f97) was verified by extracting rebuilt FD. Incremental build first retained old FFS due copy2 timestamps; touch input EFI/DEPEX/INF and verify embedded PE bytes before any test.

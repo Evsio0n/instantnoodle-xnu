@@ -21,8 +21,8 @@ setup the upstream documentation describes (`common/setup.sh`, `common/ugit`) is
 
 ## Status
 
-Verified on **one** unit (IN2010, panel AMB655UV01) as of **2026-11-04**. "Installed" means it boots from the phone's
-own flash with no computer attached.
+Verified on **one** unit (IN2010, panel AMB655UV01) as of **2026-11-05**. "Installed" means it boots from the phone's
+own flash with no computer attached. "RAM" means it works in a test boot from RAM and is not yet in an installed build.
 
 ### Works
 
@@ -31,7 +31,7 @@ own flash with no computer attached.
 | Boot to the home screen, standalone | ✅ installed | Boot menu with a USB developer mode; falls back to the previous version after 3 failed boots |
 | Storage (UFS), user data on HFS+ | ✅ installed | Data survives reboots |
 | Display, 90 Hz panel mode, no tearing | ✅ installed | Real frame rate is often ~45 fps (see Known issues) |
-| GPU compositing (Adreno 650, Mesa freedreno) | ✅ installed | Metal is experimental |
+| GPU compositing (Adreno 650, Mesa freedreno) | ✅ installed | Through OpenGL ES; Metal is below |
 | Touch, power key, volume down | ✅ installed | |
 | Manual brightness | ✅ installed | No auto-brightness yet |
 | Wi-Fi 2.4/5 GHz (QCA6390), Safari | ✅ installed | WPA2 verified |
@@ -39,12 +39,18 @@ own flash with no computer attached.
 | Main camera (IMX586, 48 MP) as 1x, with autofocus | ✅ installed | Colour tuning from the phone's own calibration |
 | 2x (IMX586 sensor crop; digital zoom in low light) | ✅ installed | Switching 1x ↔ 2x takes ~0.3 s |
 | Ultra-wide (IMX481) as 0.5x, with autofocus | ✅ installed | The .5 / 1 / 2 buttons as on an iPhone 11 Pro; no lens-distortion correction yet |
+| Speakers, iOS sounds, main microphone, vibration | 🧪 RAM | Touch to the DSP's queue about 108 ms, computed |
+| Metal over Vulkan (Mesa turnip), whole system | 🧪 RAM | Compositor, home screen, wallpaper, Settings, Safari, Clock, Photos and Maps' first screens; not the default |
+| Display brightness, EDR and HBM | 🧪 RAM | HDR on the panel; HDR photos are not there yet, see below |
+| Wi-Fi list, signal bars, automatic time, screenshots, Bold Text | 🧪 RAM | Fixes waiting for the next install |
 
 ### Not working yet
 
 | Feature | Notes |
 |---|---|
-| Sound, vibration | Not working on this unit yet |
+| HDR photos | Photos opens them in colour through Metal, but not as HDR: CMPhoto still fails (-12914), the screen is too dim there |
+| VideoToolbox on Metal | Scaling works, and HEICs decode; 420f destinations still fall back to the CPU |
+| Own display driver (MDP/DPU) | Started: hardware planes and scaler instead of the GPU, read-only so far |
 | Bluetooth | Partial |
 | Sensors, auto-brightness, GPS | In progress / not started |
 | Cellular | Not started |
@@ -55,13 +61,10 @@ own flash with no computer attached.
 ### Known issues
 
 - Real frame rate often ~45 fps instead of 90
-- Slow boot from flash: the loader draws its log to the screen character by character
 - Camera: switching lenses takes 0.5–1 s; Portrait is listed but has no depth effect
 - Setting a wallpaper does not work
-- Bold Text in Settings freezes
-- Clock about 2 s behind
-- Screenshots do not work when booted from flash
-- Wi-Fi list incomplete on refresh, no signal bars in the status bar
+- On Metal: Safari's sticky headers are missing and scrolled content can go missing; video does not update
+- In installed builds, until the next install: no sound or vibration, clock about 2 s behind, Bold Text freezes, no screenshots, Wi-Fi list incomplete on refresh, no signal bars
 
 ---
 
@@ -77,5 +80,8 @@ phone's `userdata` and removes Android.
 
 ## Roadmap
 
-1. The known issues above, sound, vibration, sensors, GPS, Metal, installing third-party apps
-2. TrustZone-dependent services, the Titan 480 hardware ISP, camera start-up speed
+1. HEIC and HDR photos through Metal, as on an iPhone
+2. Our own MDP/DPU display driver, then the frame rate
+3. Sound delay through the audio DSP's low-latency path, camera start-up speed
+4. Sensors, GPS, installing third-party apps, an installed build with all of the above
+5. TrustZone-dependent services, the Titan 480 hardware ISP

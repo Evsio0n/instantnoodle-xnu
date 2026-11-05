@@ -3,6 +3,7 @@
  *
  * usage: rwtouch STEP...
  *   wait SECONDS                 pause
+ *   alive NAME                   stop here, with the rest of the line undone, if no process has that name
  *   tap X Y                      a short touch
  *   swipe X0 Y0 X1 Y1 [MS]       drag from one point to the other in MS milliseconds (default 300)
  *   drag X0 Y0 X1 Y1 MS HOLD [GRAB]
@@ -18,6 +19,7 @@
  *                                swipe and drag give them):
  *                                for measuring how far behind the finger the screen is (tools/latency.py)
  *   button NAME [MS]             press a button: home, lock, volup, voldown
+ *   chord NAME NAME [MS]         two buttons held together (volup lock: a screenshot), the second pressed after the first
  *   slider down|middle|up        the alert slider there, as the kernel tells it (HK_SLIDER)
  *   read                         print the samples that arrive, forever (to watch the queue)
  *   notify NAME                  post a Darwin notification (com.hackios.unlock: see inject_sb.c)
@@ -289,6 +291,31 @@ wait_uptime(double seconds)
 	}
 }
 
+static int
+process_named(const char *name)
+{
+	int query[] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+	size_t size = 0;
+	int found = 0;
+
+	if (sysctl(query, 3, NULL, &size, NULL, 0) != 0) {
+		return 1;   /* (not known: as before there was this question) */
+	}
+	size += 16 * sizeof(struct kinfo_proc);
+
+	struct kinfo_proc *all = malloc(size);
+
+	if (all == NULL || sysctl(query, 3, all, &size, NULL, 0) != 0) {
+		free(all);
+		return 1;
+	}
+	for (size_t i = 0; i < size / sizeof(*all) && !found; i++) {
+		found = strcmp(all[i].kp_proc.p_comm, name) == 0;
+	}
+	free(all);
+	return found;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -342,6 +369,34 @@ main(int argc, char **argv)
 			}
 			button(which, ms ? ms : 80);
 			i += ms ? 2 : 1;
+		} else if (strcmp(step, "chord") == 0 && left >= 2) {
+			uint32_t which[2];
+			int ms = left >= 3 && argv[i + 3][0] >= '0' && argv[i + 3][0] <= '9' ? atoi(argv[i + 3]) : 0;
+
+			for (int k = 0; k < 2; k++) {
+				const char *name = argv[i + 1 + k];
+
+				which[k] = strcmp(name, "home") == 0 ? HK_BUTTON_HOME : strcmp(name, "lock") == 0 ? HK_BUTTON_LOCK :
+				    strcmp(name, "volup") == 0 ? HK_BUTTON_VOLUME_UP : strcmp(name, "voldown") == 0 ? HK_BUTTON_VOLUME_DOWN : 0;
+				if (which[k] == 0) {
+					fprintf(stderr, "rwtouch: buttons are home, lock, volup and voldown\n");
+					return 2;
+				}
+			}
+			{
+				struct hk_touch t = { .type = HK_BUTTON_DOWN, .finger = which[0] };
+
+				write(device, &t, sizeof(t));
+				usleep(30 * 1000);
+				t.finger = which[1];
+				write(device, &t, sizeof(t));
+				usleep((useconds_t)(ms ? ms : 150) * 1000);
+				t.type = HK_BUTTON_UP;
+				write(device, &t, sizeof(t));
+				t.finger = which[0];
+				write(device, &t, sizeof(t));
+			}
+			i += ms ? 3 : 2;
 		} else if (strcmp(step, "slider") == 0 && left >= 1) {
 			const char *name = argv[++i];
 			struct hk_touch t = { .type = HK_SLIDER, .finger = strcmp(name, "down") == 0 ? HK_SLIDER_DOWN :
@@ -378,6 +433,15 @@ main(int argc, char **argv)
 		} else if (strcmp(step, "mark") == 0 && left >= 1) {
 			printf("t-mark: %s at %llu\n", argv[i + 1], (unsigned long long)((mach_absolute_time() * timebase.numer / timebase.denom) / 1000));
 			fflush(stdout);
+			i += 1;
+		} else if (strcmp(step, "alive") == 0 && left >= 1) {
+			/* the program these touches are for has to be there: a crash must not turn the rest into taps on whatever
+			 * is under them (Photos ended in run 164610 and the next taps opened Weather). */
+			if (!process_named(argv[i + 1])) {
+				printf("rwtouch: %s is not running: the rest of this line is not done\n", argv[i + 1]);
+				fflush(stdout);
+				return 0;
+			}
 			i += 1;
 		} else if (strcmp(step, "notify") == 0 && left >= 1) {
 			uint32_t status = notify_post(argv[i + 1]);

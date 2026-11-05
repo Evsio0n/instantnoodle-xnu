@@ -31,8 +31,10 @@
  * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
  */
+#include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <sys/errno.h>
 #include <sys/kern_event.h>
@@ -43,6 +45,12 @@
 #include <sys/hk_sta.h>
 #include <sys/sockio.h>
 #include <sys/systm.h>
+
+/*
+ * (the kernel's printf no longer reaches the log once iOS runs -- the console is paused: what is said here
+ * goes into the loader's log itself, as the run's summary does)
+ */
+static void apple80211_summary_log(const char *format, ...) __printflike(1, 2);
 
 #define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
 #define SIOCGA80211             0xc02869c9u     /* _IOWR('i', 201, struct apple80211req) */
@@ -196,7 +204,7 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct 
 
 /* Apple80211's events (APPLE80211_M_...) */
 enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
-       EVENT_SCAN_DONE = 10 };
+       EVENT_SCAN_DONE = 10, EVENT_RSSI_CHANGED = 39 };
 
 static const char interface_name[16] = "en0";   /* (bsd/dev/hk_net.c makes one interface, and that is its name) */
 
@@ -409,6 +417,14 @@ get(struct apple80211req *request)
 		lck_mtx_unlock(&apple80211_lock);
 		there = hk_sta_heard(index, bss);
 		error = there ? give_network(request, bss) : EIO;
+		if (!there) {
+			static unsigned said;
+
+			if (said < 30) {
+				said++;
+				apple80211_summary_log("apple80211: SCAN_RESULT: %u read, then the end\n", index);
+			}
+		}
 		kfree_data(bss, sizeof(*bss));
 		return error;
 	}
@@ -651,6 +667,70 @@ post(uint32_t code, const void *data, uint32_t length)
 	kev_post_msg(&message);
 }
 
+/*
+ * The link's quality while a network is joined: event 39, the one wifid's __WiFiDeviceProcessRSSIEvent takes
+ * (IO80211's __dispatchlqmChangedEvent: at least 0xb4 bytes after the name; byte 0 "the RSSI is there", the
+ * RSSI at 4; the rest -- SNR, noise, CCA, the counters, the flags at 0x5c -- left zero, as not there). Its
+ * scaled value is what the status bar's bars are made of (SpringBoard: 3 x it, 1 to 3); posted every
+ * three seconds from the join on. Without it the bars stayed grey (2026-11-04), the RSSI of the
+ * link-up event alone reaching wifid's own records only.
+ */
+static thread_call_t rssi_call;
+static bool rssi_running;
+
+static void
+rssi_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static unsigned said;
+	struct hk_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+	uint8_t lqm[0xb4];
+	uint64_t deadline;
+	bool joined = false;
+
+	if (state != NULL) {
+		hk_sta_state(state);
+		joined = state->phase == HK_STA_JOINED;
+		if (joined) {
+			int32_t rssi = state->bss.rssi;
+
+			bzero(lqm, sizeof(lqm));
+			lqm[0] = 1;
+			memcpy(lqm + 4, &rssi, sizeof(rssi));
+			post(EVENT_RSSI_CHANGED, lqm, sizeof(lqm));
+			if (said < 10) {
+				said++;
+				apple80211_summary_log("apple80211: the link's quality told (event 39): %d dBm\n", rssi);
+			}
+		}
+		kfree_data(state, sizeof(*state));
+	}
+	lck_mtx_lock(&apple80211_lock);
+	if (joined) {
+		clock_interval_to_deadline(3, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(rssi_call, deadline);
+	} else {
+		rssi_running = false;
+	}
+	lck_mtx_unlock(&apple80211_lock);
+}
+
+static void
+rssi_start(void)
+{
+	uint64_t deadline;
+
+	lck_mtx_lock(&apple80211_lock);
+	if (rssi_call == NULL) {
+		rssi_call = thread_call_allocate(rssi_tick, NULL);
+	}
+	if (rssi_call != NULL && !rssi_running) {
+		rssi_running = true;
+		clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(rssi_call, deadline);
+	}
+	lck_mtx_unlock(&apple80211_lock);
+}
+
 /* What the station side says has happened (bsd/dev/hk_sta.c calls this, on its thread or the station's). */
 void
 hk_apple80211_event(enum hk_sta_event event, int status)
@@ -659,7 +739,7 @@ hk_apple80211_event(enum hk_sta_event event, int status)
 
 	if (said < 200) {
 		said++;
-		printf("apple80211: the station says: %s, %d\n", event == HK_STA_POWER ? "power" : event == HK_STA_SCAN_DONE ?
+		apple80211_summary_log("apple80211: the station says: %s, %d\n", event == HK_STA_POWER ? "power" : event == HK_STA_SCAN_DONE ?
 		    "a scan is over" : event == HK_STA_JOIN_DONE ? "a join is over" : "the link", status);
 	}
 	switch (event) {
@@ -691,6 +771,9 @@ hk_apple80211_event(enum hk_sta_event event, int status)
 		post(EVENT_SSID_CHANGED, NULL, 0);
 		post(EVENT_BSSID_CHANGED, NULL, 0);
 		post(EVENT_LINK_CHANGED, &link, sizeof(link));
+		if (status == 1) {
+			rssi_start();
+		}
 		break;
 	}
 	}
@@ -811,11 +894,11 @@ hk_apple80211_ioctl(u_long command, void *data)
 	times = note(request, is_set, error);
 	/* (a kind of request that is repeated for ever -- a scan's results, the network joined -- is said 40 times) */
 	if (times <= 40) {
-		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+		apple80211_summary_log("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
 		    EOPNOTSUPP ? "REFUSED\n" : "");
 		if (error != 0 && error != EOPNOTSUPP) {
-			printf("error %d\n", error);
+			apple80211_summary_log("error %d\n", error);
 		}
 	}
 	return error;

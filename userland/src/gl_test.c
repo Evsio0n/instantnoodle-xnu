@@ -9,6 +9,9 @@
  *   gl_test fill [WIDTH HEIGHT]        no picture: how long the GPU takes over a frame of that size
  *                                      (default 1125 x 2436, what the window server draws), by what
  *                                      is in it -- see fill()
+ *   gl_test fragdepth [z16|z32f]       no picture: whether a fragment shader's gl_FragDepth reaches
+ *                                      the depth buffer, and whether the GPU finishes it -- see
+ *                                      fragdepth() (KNOWN_ISSUES K28)
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -60,6 +63,15 @@ extern int glGetUniformLocation(unsigned program, const char *name);
 extern void glUniform1i(int location, int value);
 extern void glUniform4f(int location, float x, float y, float z, float w);
 extern void glReadPixels(int x, int y, int width, int height, unsigned format, unsigned type, void *pixels);
+extern void glGenRenderbuffers(int n, unsigned *names);
+extern void glBindRenderbuffer(unsigned target, unsigned renderbuffer);
+extern void glRenderbufferStorage(unsigned target, unsigned internal, int width, int height);
+extern void glFramebufferRenderbuffer(unsigned target, unsigned attachment, unsigned rbtarget, unsigned renderbuffer);
+extern void glDepthFunc(unsigned func);
+extern void glDepthMask(unsigned char flag);
+extern void glClearDepthf(float depth);
+extern int glGetAttribLocation(unsigned program, const char *name);
+extern void glUniform1f(int location, float value);
 
 #define OSMESA_RGBA                     0x1908
 #define OSMESA_FORMAT                   0x22
@@ -90,6 +102,14 @@ extern void glReadPixels(int x, int y, int width, int height, unsigned format, u
 #define GL_FRAMEBUFFER_COMPLETE         0x8cd5
 #define GL_COLOR_ATTACHMENT0            0x8ce0
 #define GL_FRAMEBUFFER                  0x8d40
+#define GL_RENDERBUFFER                 0x8d41
+#define GL_DEPTH_ATTACHMENT             0x8d00
+#define GL_DEPTH_COMPONENT16            0x81a5
+#define GL_DEPTH_COMPONENT32F           0x8cac
+#define GL_DEPTH_BUFFER_BIT             0x0100
+#define GL_DEPTH_TEST                   0x0b71
+#define GL_LESS                         0x0201
+#define GL_ALWAYS                       0x0207
 
 /* the kernel's GPU service takes pixels for the panel (iokit/Kernel/HKGPU.cpp: kHKShow) */
 struct show {
@@ -132,6 +152,105 @@ shader(unsigned type, const char *text)
 		printf("gl_test: a shader does not compile\n");
 	}
 	return name;
+}
+
+/*
+ * Whether a fragment shader's gl_FragDepth reaches the depth buffer, and whether the GPU finishes
+ * the draw at all. Metal on the Gallium back end (libhackiosair) times the GPU out on a fragment
+ * shader that stores [[depth]] (docs/KNOWN_ISSUES.md K28, run 030433), while the Vulkan back end
+ * draws it; this asks the same of the OpenGL ES library, which is the same freedreno Gallium driver
+ * and what the window server and every GLES application draw with. If this hangs too, the fault is
+ * the driver's; if not, it is in what the AIR frontend hands it.
+ *
+ * Two draws over the whole of a 64 x 64 target with a depth buffer cleared to 1, the colour to blue:
+ *   1. red, depth test ALWAYS with writes on, the quad at window depth 0.5, the shader storing
+ *      gl_FragDepth = 0.25;
+ *   2. green, depth test LESS, the quad at window depth 0.3 and the shader storing nothing.
+ * The second passes only where the depth buffer holds more than 0.3: red means 0.25 was stored,
+ * green means the store went nowhere (the quad's own 0.5, or the clear's 1, was left), blue means
+ * nothing drew. Each draw is waited for (glFinish) and timed: a GPU that does not finish shows as
+ * the kernel's recovery and a time of seconds.
+ */
+static int
+fragdepth(const char *depth_format)
+{
+	static const float quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+	static const char *vertex =
+	    "#version 300 es\n"
+	    "in vec2 where; uniform float z;\n"
+	    "void main() { gl_Position = vec4(where, z, 1.0); }\n";
+	static const char *storing =
+	    "#version 300 es\n"
+	    "precision highp float; out vec4 o;\n"
+	    "void main() { o = vec4(1.0, 0.0, 0.0, 1.0); gl_FragDepth = 0.25; }\n";
+	static const char *plain =
+	    "#version 300 es\n"
+	    "precision highp float; out vec4 o;\n"
+	    "void main() { o = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+	unsigned z32f = depth_format != NULL && strcmp(depth_format, "z32f") == 0;
+	unsigned texture, framebuffer, renderbuffer, programs[2];
+	unsigned char pixel[4] = { 0x55, 0x55, 0x55, 0x55 };
+	uint64_t t0, t1, t2;
+	int good = 0;
+
+	glGenTextures(1, &texture);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 64, 64, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glGenRenderbuffers(1, &renderbuffer);
+	glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+	glRenderbufferStorage(GL_RENDERBUFFER, z32f ? GL_DEPTH_COMPONENT32F : GL_DEPTH_COMPONENT16, 64, 64);
+	glGenFramebuffers(1, &framebuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, renderbuffer);
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		printf("gl_test: fragdepth: the framebuffer with a %s depth buffer is not complete\n", z32f ? "z32f" : "z16");
+		return 1;
+	}
+	for (int i = 0; i < 2; i++) {
+		programs[i] = glCreateProgram();
+		glAttachShader(programs[i], shader(GL_VERTEX_SHADER, vertex));
+		glAttachShader(programs[i], shader(GL_FRAGMENT_SHADER, i == 0 ? storing : plain));
+		glBindAttribLocation(programs[i], 0, "where");
+		glLinkProgram(programs[i]);
+		glGetProgramiv(programs[i], GL_LINK_STATUS, &good);
+		if (!good) {
+			printf("gl_test: fragdepth: program %d does not link\n", i + 1);
+			return 1;
+		}
+	}
+	glViewport(0, 0, 64, 64);
+	glClearColor(0, 0, 1, 1);
+	glClearDepthf(1);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	glEnable(GL_DEPTH_TEST);
+	glDepthMask(1);
+	glVertexAttribPointer(0, 2, GL_FLOAT, 0, 2 * sizeof(float), quad);
+	glEnableVertexAttribArray(0);
+
+	t0 = now_us();
+	glUseProgram(programs[0]);
+	glUniform1f(glGetUniformLocation(programs[0], "z"), 0.0f);      /* window depth 0.5 */
+	glDepthFunc(GL_ALWAYS);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glFinish();
+	t1 = now_us();
+	glUseProgram(programs[1]);
+	glUniform1f(glGetUniformLocation(programs[1], "z"), -0.4f);     /* window depth 0.3 */
+	glDepthFunc(GL_LESS);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glFinish();
+	t2 = now_us();
+	glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+	printf("gl_test: fragdepth %s: the storing draw took %llu us, the test draw %llu us; error %#x; the middle reads "
+	    "%u %u %u %u: %s\n", z32f ? "z32f" : "z16", (unsigned long long)(t1 - t0), (unsigned long long)(t2 - t1),
+	    glGetError(), pixel[0], pixel[1], pixel[2], pixel[3],
+	    pixel[0] > 200 && pixel[1] < 50 ? "RED -- gl_FragDepth 0.25 reached the depth buffer" :
+	    pixel[1] > 200 && pixel[0] < 50 ? "GREEN -- the store went nowhere" :
+	    pixel[2] > 200 && pixel[0] < 50 ? "BLUE -- nothing drew" : "something else");
+	return 0;
 }
 
 /*
@@ -267,6 +386,20 @@ main(int argc, char **argv)
 	OSMesaContext context;
 	int good = 0;
 
+	if (argc > 1 && strcmp(argv[1], "fragdepth") == 0) {
+		/* gl_FragDepth is GLSL ES 3.00's; the rest of this program asks for an ES 2 context */
+		static const int es3[] = { OSMESA_FORMAT, OSMESA_RGBA, OSMESA_PROFILE, OSMESA_ES_PROFILE,
+			                   OSMESA_CONTEXT_MAJOR_VERSION, 3, 0 };
+
+		context = OSMesaCreateContextAttribs(es3, NULL);
+		if (context == NULL || !OSMesaMakeCurrent(context, window, GL_UNSIGNED_BYTE, 16, 16)) {
+			printf("gl_test: no OpenGL ES 3 context\n");
+			return 1;
+		}
+		printf("gl_test: %s; %s; %s\n", (const char *)glGetString(GL_VENDOR),
+		    (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
+		return fragdepth(argc > 2 ? argv[2] : NULL);
+	}
 	context = OSMesaCreateContextAttribs(attributes, NULL);
 	if (context == NULL || !OSMesaMakeCurrent(context, window, GL_UNSIGNED_BYTE, 16, 16)) {
 		printf("gl_test: no OpenGL ES context\n");

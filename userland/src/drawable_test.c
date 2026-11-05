@@ -4,6 +4,16 @@
  *
  *   drawable_test [WIDTH HEIGHT]      the whole of it; 1080x2400 by default, the panel's size
  *   drawable_test --refusals          only the cases the bridge must decline, by name
+ *   drawable_test --backend gallium|vk [WIDTH HEIGHT]
+ *                                     the same, through the compiler library of that back
+ *                                     end: libhackiosair.dylib (Gallium) or
+ *                                     libvulkan_freedreno.dylib (Metal over Vulkan, M3e),
+ *                                     handed to src/hkdrawable.m with rwd_use_library the
+ *                                     way src/hkmetal.m hands it its own. It ends in one line
+ *                                     to join the two runs on: "drawable_test: result
+ *                                     BACKEND WxH stride S: F of N checks failed, surface
+ *                                     fnv1a64 HEX" (the digest is of every texel of the
+ *                                     surface as the processor reads it at the end).
  *
  * WHY IT IS A PROGRAM AND NOT A UNIT TEST. The drawable path of the Metal driver
  * (src/hkdrawable.m, docs/metal.md 10.46) ends in a texture laid over memory the
@@ -29,7 +39,8 @@
  *
  * WHAT IT NEEDS: a kernel booted with gpu=1 (without it the library has no GPU to import
  * into and says so by name, which this program prints and reports as not-measured rather
- * than as a failure), and /hackios/lib/libhackiosair.dylib in the image (GL=1).
+ * than as a failure), and /hackios/lib/libhackiosair.dylib in the image (GL=1) -- or, with
+ * --backend vk, /hackios/lib/libvulkan_freedreno.dylib.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -66,10 +77,14 @@ static struct {
 	void (*texture_destroy)(struct rwa_texture *);
 } mesa;
 
+/* the back end --backend named, and the library it is; Gallium's by default, as before */
+static const char *backend = "gallium";
+static const char *library = "/hackios/lib/libhackiosair.dylib";
+
 static int
 open_library(void)
 {
-	mesa.handle = dlopen("/hackios/lib/libhackiosair.dylib", RTLD_NOW);
+	mesa.handle = dlopen(library, RTLD_NOW);
 	if (mesa.handle == NULL) {
 		printf("drawable_test: NOT MEASURED: no compiler library: %s\n", dlerror());
 		return -1;
@@ -237,6 +252,27 @@ main(int argc, char **argv)
 	IOSurfaceRef surface;
 	uint32_t id;
 
+	/*
+	 * --backend first, and only then the rest as before. With it, the library of that back
+	 * end is told to src/hkdrawable.m (rwd_use_library) the way src/hkmetal.m tells it its
+	 * own; without it nothing is told, and the bridge finds libhackiosair.dylib by itself,
+	 * which is what this program always tested.
+	 */
+	int told = 0;
+
+	if (argc > 2 && strcmp(argv[1], "--backend") == 0) {
+		if (strcmp(argv[2], "vk") == 0) {
+			backend = "vk";
+			library = "/hackios/lib/libvulkan_freedreno.dylib";
+		} else if (strcmp(argv[2], "gallium") != 0) {
+			printf("drawable_test: --backend %s is neither gallium nor vk\n", argv[2]);
+			return 2;
+		}
+		told = 1;
+		argv[2] = argv[0];
+		argv += 2;
+		argc -= 2;
+	}
 	if (argc > 1 && strcmp(argv[1], "--refusals") == 0) {
 		refusals();
 		printf("drawable_test: %d of %d checks failed\n", failed, checks);
@@ -298,6 +334,10 @@ main(int argc, char **argv)
 		CFRelease(surface);
 		return 1;
 	}
+	if (told) {
+		rwd_use_library(mesa.handle);
+	}
+	printf("drawable_test: back end %s, %s\n", backend, library);
 	device = mesa.device_open(why, sizeof(why));
 	if (device == NULL) {
 		printf("drawable_test: NOT MEASURED: %s\n", why);
@@ -328,8 +368,10 @@ main(int argc, char **argv)
 	if (texture == NULL) {
 		printf("drawable_test: NOT MEASURED: no texture over the surface: %s\n", why);
 		mesa.device_close(device);
-		CFRelease(surface);
 		printf("drawable_test: %d of %d checks failed\n", failed, checks);
+		printf("drawable_test: result %s %ux%u stride %zu: no texture\n", backend, width,
+		    height, IOSurfaceGetBytesPerRow(surface));
+		CFRelease(surface);
 		return 1;
 	}
 	printf("drawable_test: a texture over surface %u exists\n", id);
@@ -374,9 +416,31 @@ main(int argc, char **argv)
 		    x, y, got, want);
 	}
 
+	/*
+	 * The line the two back ends are joined on: every texel of the surface as the processor
+	 * reads it now, row by row and without the padding at the end of each row, through one
+	 * FNV-1a. Both runs make the same surface, write the same corners and leave the rest as
+	 * the kernel made it (zeroes), so the two digests are equal exactly when the two
+	 * imports wrote the same bytes to the same places.
+	 */
+	uint64_t digest = 0xcbf29ce484222325ull;
+	const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(surface);
+	size_t stride = IOSurfaceGetBytesPerRow(surface);
+
+	IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+	for (unsigned y = 0; y < height; y++) {
+		for (size_t i = 0; i < (size_t)width * 4; i++) {
+			digest = (digest ^ base[(size_t)y * stride + i]) * 0x100000001b3ull;
+		}
+	}
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+
 	mesa.texture_destroy(texture);
 	mesa.device_close(device);
 	CFRelease(surface);
 	printf("drawable_test: %d of %d checks failed\n", failed, checks);
+	printf("drawable_test: result %s %ux%u stride %zu: %d of %d checks failed, surface "
+	       "fnv1a64 %016llx\n", backend, width, height, stride, failed, checks,
+	    (unsigned long long)digest);
 	return failed ? 1 : 0;
 }

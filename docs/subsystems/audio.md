@@ -58,7 +58,7 @@ from `0x10000000`, the stream's low 4 bits in bits 32..35 of every address hande
 | 1 | the port: pins, bit clock, group, port started; the clock and frame sync looked at; held `sound_secs` then undone |
 | 2 | + a stream, device path and a 1 kHz -20 dBFS tone for at most 3 s; the DSP's "written" events say whether it takes 48 kHz. Amplifiers off (silent) |
 | 3 | + the amplifiers, faded in to `sound_below` eighths of a dB under Android's level. **Audible** |
-| 4 | what iOS plays (`/dev/hk-audio`) until the run ends: path kept running, amplifiers started when a write is not silence, stopped after 3 s of silence |
+| 4 | what iOS plays (`/dev/hk-audio`) until the run ends: path kept running, amplifiers started when a write is not silence, stopped after 30 s of silence (3 s before 2026-11-04) |
 
 Redwood's amplifiers are on the primary TDM interface (`PRI_TDM_RX_0`, AFE port `0x9000` in group `0x9100`, GPIO 97/100/99
 bit clock/frame sync/data). The OnePlus 8's are on the **tertiary MI2S** (`TERT_MI2S_RX` `0x1004`, clock `0x104`, GPIO
@@ -82,8 +82,8 @@ of iOS's sixteen steps.
   the container, has the receiver profile) and `tfa98xx_left` `0x35` (reset GPIO 99, slot 1, "Q", the bottom speaker),
   both resets active high. Set up as NXP's driver v6.5.3 does for a cold TFA9874 from the container
   `/vendor/firmware/tfa98xx.cnt` (profile "speaker"). The chip has no DSP of its own and no volume/mute the driver
-  uses, so **the level is applied to the samples** by `hk_guard_digital()`, and amplifiers are powered down after 3 s of
-  silence. Amplifier health: alarm/state 8 -> reset, other non-9 states tolerated 1 s; the status register 0x10 idle
+  uses, so **the level is applied to the samples** by `hk_guard_digital()`, and amplifiers are powered down after 30 s of
+  silence (3 s until 2026-11-04: a keyboard's clicks waited for their start). Amplifier health: alarm/state 8 -> reset, other non-9 states tolerated 1 s; the status register 0x10 idle
   values 0x0016/0x0017 are OK bits. **The kernel default is `sound_amps=0`** (amps set up but never started); the
   device profile passes `sound_amps=1 sound_below=96` (12 dB under Android's maximum).
   - Stock evidence for the level: no attenuation at Android's maximum (speaker media/ring/notification curves end at
@@ -91,6 +91,16 @@ of iOS's sixteen steps.
     makeup undecoded, COPP PBE off, gain 0x10C35 = unity). So `sound_below` is "dB under stock maximum".
   - A bug found and fixed: the first 150 ms of the lock sound were lost because of a silent-start plus fade. The
     amplifiers start in 26-39 ms, within the DSP's 160 ms queue, and the level is kept (kernel `44ba0e0`).
+  - The delay (backlog item 18, 2026-11-04, in RAM test): the DSP's queue is 8 periods of 10 ms now (80 ms; it was
+    8 x 20 ms, 160 ms), the periods' pages unchanged. Run 193817 (observed): from rwtouch's mark just before a key's
+    touch-down to iOS's write of the click, 96-128 ms (the 128 ms the first, with the path parked); the amplifiers up
+    54-67 ms after the write, inside the 80 ms. So iOS's own part (touch to the HAL's write) is now the larger one.
+    The larger delay was the ring (run 193817): iOS's IO runs from the moment a keyboard opens, it wrote silence into the
+    parked ring until that was full (682 ms), and the backlog stayed ahead of every click. Now silence is not kept while
+    parked, the first sound clears the ring, silence over 43 ms at its front is dropped, and after a park 60 ms of silence
+    lead the sound so that the amplifiers (up 54-69 ms after the write) hear its start. Runs 194854/195427: 0-10 ms in
+    the ring, 0 underflows. The full fix (the ADSP's low-latency path) is for later.
+    **Correction, run 181527 (2026-11-05, observed):** the mark's 96-128 ms holds 55 ms of rwtouch printing its mark before it posts. From the kernel's post: under 1 ms to the window server's hand-over, 39-60 ms (median 45) to iOS's write. `sound_periods=N` and `sound_period_frames=N` set the queue; 4 x 10 ms ran with 0 underflows, amplifiers down, not listened to. docs/TODO.md T38 (18).
 
 ### The guard (`hk_guard.c`)
 

@@ -42,7 +42,8 @@
  * path, not the hardware. RWA_SOFTWARE=0 asks for the GPU and so prints what a driver
  * on a phone booted without gpu=1 is told.
  *
- *   air_metal_test FILE.metallib [FUNCTION [MTLPixelFormat[,...] [FILL]]]
+ *   air_metal_test FILE.metallib [FUNCTION [MTLPixelFormat[,...] [FILL [GROUPS [THREADS
+ *                  [TEXELS]]]]]]
  *   air_metal_test --textures FILE.metallib [FUNCTION]
  *   air_metal_test --draw FILE.metallib FUNCTION
  *                  [MTLPixelFormat[,...] [MTLPixelFormat[:MTLTextureType][,...]]]
@@ -56,10 +57,28 @@
  *   air_metal_test --draw-attrib VERTEXLIB VERTEXFUNCTION FRAGMENTLIB FRAGMENTFUNCTION
  *                  [GATEDVERTEXFUNCTION]
  *   air_metal_test --attrib-sweep VERTEXLIB FRAGMENTLIB FRAGMENTFUNCTION
+ *   air_metal_test --draw-blend|--draw-attrib|--attrib-sweep|--draw-index|--draw-vertex
+ *                  --pixels DIR              (M5a: every pixel against a model, run_pixels_*)
  *   air_metal_test --argbufs FILE[.metallib|.bc] [FUNCTION]
  *   air_metal_test --draw-argbuf SETMODULE DIRECTMODULE
+ *   air_metal_test --surface ID [WIDTH HEIGHT ROWBYTES]
+ *   air_metal_test --surface self WIDTH HEIGHT ROWBYTES [MTLPixelFormat [FILE FUNCTION]]
+ *
+ * Any of them may be preceded by --gpu (the GPU, not softpipe) and then by
+ * --tu-debug FLAGS (turnip's TU_DEBUG for this run: sysmem, gmem, noubwc, ...), and
+ * --surface self by the switches of its draw (run_surface_self): --fence-delay-us N,
+ * --predraw-flush, --read-noclean, --read-civac, --read-sysflush, --vk-noseen.
+ *
+ * [2026-11-05, M4: every "flushed" read of --surface self now cleans and invalidates the
+ * surface with an inline DC CIVAC a line at a time and DSB SY (civac_range) BY DEFAULT --
+ * what --read-civac asked for -- because iOS 16.5's sys_dcache_flush is "dsb ish; ret" here
+ * and cleans nothing (libsystem_platform of 20F66). --read-sysflush brings the old read back
+ * (sys_dcache_flush, which is then a plain read), and --read-civac is still taken and changes
+ * nothing. The surface-result line names the read it made: read-civac or read-sysflush.]
  */
 
+/* for the compute-result line's back-end word (M3d, backend_word below) */
+#include <dlfcn.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -73,8 +92,22 @@
  */
 #include <sys/wait.h>
 #include <unistd.h>
+/* --surface self makes an IOSurface of its own (run_surface_self), which needs the
+ * framework, and reads it back past the processor's cache (sys_dcache_flush): on the phone
+ * only, linked with -framework IOSurface -framework CoreFoundation. [M4: past the cache by
+ * an inline DC CIVAC by default (civac_range); sys_dcache_flush only with --read-sysflush,
+ * and it is a barrier and a return on this system.] */
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOSurface/IOSurfaceRef.h>
+#include <libkern/OSCacheControl.h>
+#include <time.h>
+#endif
 
 #include "air_metal.h"
+/* what every --pixels case must have drawn (M5a) */
+#include "draw_model.h"
+#include "adreno_srgb.h"
 
 #define WHY 512
 #define COUNT_OF(a) (sizeof(a) / sizeof((a)[0]))
@@ -136,6 +169,27 @@ texel_value(unsigned slot, unsigned x, unsigned y, unsigned z, float out[4])
    out[1] = 200.0f + (float)y;
    out[2] = 300.0f + (float)x + (float)y + (float)z;
    out[3] = 400.0f;
+}
+
+/* The kernel mode's other seed, asked for with TEXELS "index" (M3d-2): (x + 4y + 16z + 64n,
+ * 1, 0, 1) for slot n, R being the texel's own index. For a kernel that FILTERS, which
+ * air_run's texels cannot be checked through: 100 and up, the six 3D pixel-coordinate
+ * kernels of the corpus saturate or overflow half on them and come back the same whatever
+ * they read. tools/air/sample3d.ll is the kernel it is for. Every texel differs from every
+ * other in R, R is small, and in slot 0 every blend of them at a texel centre or halfway
+ * between centres -- where sample3d.ll samples -- is a multiple of an eighth below 64,
+ * exact in binary32 and in half: so nearest and linear have exact expectations even on a
+ * texture unit that filters at reduced precision. G = 1
+ * says the weights summed to one, and A = 1 inside against 0 at a transparent-black border
+ * says clamp_to_zero apart from clamp_to_edge and from an opaque-black border.
+ */
+static void
+index_texel_value(unsigned slot, unsigned x, unsigned y, unsigned z, float out[4])
+{
+   out[0] = (float)(x + TEX * y + TEX * TEX * z + TEX * TEX * TEX * slot);
+   out[1] = 1.0f;
+   out[2] = 0.0f;
+   out[3] = 1.0f;
 }
 
 /* where texel (x, y, z) sits in a tightly packed level of TEX x TEX x TEX */
@@ -1041,6 +1095,45 @@ run_draw(const char *path, const char *vfunc, const char *func, const char *colo
          printf("air_metal_test: ... which as a packed 16-bit word is 0x%04x\n",
                 last_word);
       }
+   }
+
+   /* And every pixel of the attachment, raw, which the two corners above are a sample
+    * of: the supervisor's comparison between the two back ends is over the whole 4x4, and
+    * a picture that agrees at two corners can disagree everywhere between them. The words
+    * are printed as the bits -getBytes: would return (hex, so a float and a uint read the
+    * same way), then one FNV-1a digest over all of them -- the digest metal_drv_test
+    * prints, so the two programs' numbers can be put side by side.
+    */
+   {
+      unsigned texel = format[read_rt] >= 40 && format[read_rt] <= 43 ? 2 : 16;
+      uint8_t grid[TEX * TEX * 16];
+      memset(grid, 0, sizeof(grid));
+      if (rwa_texture_read(color[read_rt], 0, 0, NULL, NULL, grid, 0, why, sizeof(why)) != 0) {
+         printf("air_metal_test: rwa_texture_read (attachment %u, all of it): %s\n", read_rt,
+                why);
+         return 1;
+      }
+      unsigned long long digest = 0xcbf29ce484222325ull;
+      for (unsigned i = 0; i < TEX * TEX * texel; i++)
+         digest = (digest ^ grid[i]) * 0x100000001b3ull;
+      for (unsigned y = 0; y < TEX; y++) {
+         for (unsigned x = 0; x < TEX; x++) {
+            const uint8_t *t = grid + (y * TEX + x) * texel;
+            printf("air_metal_test: attachment %u at (%u, %u) =", read_rt, x, y);
+            if (texel == 2) {
+               printf(" 0x%04x", (unsigned)(t[0] | t[1] << 8));
+            } else {
+               for (unsigned c = 0; c < 4; c++) {
+                  uint32_t w;
+                  memcpy(&w, t + 4 * c, sizeof(w));
+                  printf(" 0x%08x", w);
+               }
+            }
+            printf("\n");
+         }
+      }
+      printf("air_metal_test: digest of attachment %u (4x4, pixel format %u, %u bytes): "
+             "fnv1a64 %016llx\n", read_rt, format[read_rt], TEX * TEX * texel, digest);
    }
 
    rwa_render_destroy(render);
@@ -4297,7 +4390,8 @@ run_attrib_sweep(const char *vpath, const char *fpath, const char *ffunc)
  * checked too, which is why the sweep is run twice when no ID is given.
  */
 static int
-run_surface(int surface_id, unsigned width, unsigned height, unsigned row_bytes)
+run_surface(int surface_id, unsigned width, unsigned height, unsigned row_bytes,
+            unsigned pixel_format)
 {
    char why[WHY] = "";
    struct rwa_device *device = rwa_device_open(why, sizeof(why));
@@ -4308,8 +4402,11 @@ run_surface(int surface_id, unsigned width, unsigned height, unsigned row_bytes)
    printf("air_metal_test: surface sweep on %s: IOSurface %d, %ux%u, %u bytes a row\n",
           rwa_device_name(device), surface_id, width, height, row_bytes);
 
+   /* (the format is BGRA8Unorm, 80, unless --surface self made the surface of another
+    * one: then it is that surface's own, so the one shape that may be MADE is laid over
+    * the memory as what it is) */
    const struct rwa_texture_shape base = {
-      .pixel_format = 80 /* MTLPixelFormatBGRA8Unorm */, .type = 2 /* MTLTextureType2D */,
+      .pixel_format = pixel_format, .type = 2 /* MTLTextureType2D */,
       .width = width, .height = height, .depth = 1, .array_length = 1, .mip_levels = 1,
       .sample_count = 1, .usage = MTL_USAGE_RENDER_TARGET,
    };
@@ -4378,6 +4475,679 @@ run_surface(int surface_id, unsigned width, unsigned height, unsigned row_bytes)
           wrong == 1 ? "" : "s");
    return wrong ? 1 : 0;
 }
+
+/*
+ * --surface self WIDTH HEIGHT ROWBYTES [MTLPixelFormat [FILE FUNCTION]]: an IOSurface this
+ * program makes for itself, laid under a texture by rwa_texture_from_surface, written by
+ * the GPU and read back by the processor through the surface's own mapping -- the drawable
+ * path end to end, on whichever library this binary is linked against (Metal over Gallium,
+ * air_metal.c, or over Vulkan, air_vk.c, M3e), ending in ONE line to join the two runs on:
+ *
+ *   air_metal_test: surface-result BACKEND FORMAT WxH stride S: ...
+ *
+ * The surface is the program's own and nobody else's, which is the point of "self": an
+ * import by ID can name any ordinary surface of the kernel's table, the window server's
+ * included, and only a surface made here may be written. ROWBYTES 0 is the kernel's own row
+ * length (64-byte aligned, MINISURF_ROW_ALIGN); any other is asked for as
+ * kIOSurfaceBytesPerRow and is what the kernel then reports. The formats are the ones
+ * src/hkdrawable.m sends: BGRA8Unorm (80, the default), RGBA8Unorm (70), R8Unorm (10) and
+ * RGBA16Float (115, for HDR).
+ *
+ * The refusal sweep above runs first, against this surface's ID. Then, in this order, and
+ * the order is the measurement:
+ *
+ *   1  the padding of every row (the bytes past WIDTH texels) gets 0xa5, and the surface is
+ *      locked for writing and unlocked, which moves its seed;
+ *   2  the GPU clears the texture to colour A (rwa_clear_color, rwa_finish). The kernel
+ *      cleans and invalidates the processor's cache over the surface at that submission,
+ *      because the seed moved (iokit/Kernel/HKGPU.cpp, submit);
+ *   3  the processor reads every texel (locked read-only, which moves no seed): A is
+ *      expected, and those lines are now in its cache;
+ *   4  the GPU clears it to colour B and is waited for. Nothing moved the seed, so the
+ *      kernel cleans the surface out of the cache again only if 4 ms have passed since 2
+ *      (GPU_PUSH_AGAIN_MS) or the program has mapped the buffer;
+ *   5  the processor reads every texel again. B is the GPU's; A there is a STALE read --
+ *      the cache line of step 3, which nobody invalidated after the GPU wrote. The line
+ *      says how many, and how long 2 to 4 took (the 4 ms window);
+ *   6  the processor writes pattern P into every texel (each texel names its own place)
+ *      and moves the seed; rwa_texture_read reads the texture: P is expected, which says
+ *      the import found the surface's pages at the surface's pitch;
+ *   7  rwa_texture_write puts pattern Q into an 8x4 block at (1, 1), rwa_finish;
+ *   8  the processor cleans and invalidates its own cache over the surface
+ *      (sys_dcache_flush: DC CIVAC, which XNU lets a program do, SCTLR_EL1.UCI) and reads
+ *      [run 061800: NOT so -- sys_dcache_flush is "dsb ish; ret" in iOS 16.5 on arm64 and
+ *      cleans nothing, so this is a plain read unless --read-civac does the DC CIVAC by hand]
+ *      [M4: the DC CIVAC by hand is now the default, civac_range; --read-sysflush gives the
+ *      sys_dcache_flush read back, which is a plain one]
+ *      every texel, row by row without the padding, into one FNV-1a -- against the same
+ *      digest computed here from P and Q -- and checks the padding is still 0xa5;
+ *   9  with FILE FUNCTION, a fragment shader that binds nothing (fragpos.bc's fragPos) is
+ *      drawn over the whole texture with the generated vertex stage, as a render pass
+ *      loading the attachment: the drawable's real write, the GPU's 16-texel stores at the
+ *      surface's pitch. Its digest is the same kind; for RGBA16Float and fragPos the
+ *      expected one is computed (texel (x, y) is (x + 0.5, y + 0.5, 0, 1)), for the others
+ *      the two back ends are compared with each other. A draw that DIFFERS from its model
+ *      dumps pixels (dump_draw). Then THE CONTROL, its own line ("surface-control"): the
+ *      same draw into a texture the library allocates itself, read with rwa_texture_read,
+ *      against the same model -- which tells an imported linear render target from a
+ *      render target of this format as such (run 054947: fragPos into an imported
+ *      RGBA16Float surface matched on Gallium and differed on Vulkan).
+ *
+ * The colours are exact in every format: 0.2, 0.4, 0.6 and 1.0 are 51, 102, 153 and 255 in
+ * eight bits however the converter rounds, and 0.25, 0.5, 0.75, 1, 2, -1 and 0.125 are
+ * halves. Step 8's cache operation is a test's tool and not a fix: it only makes the digest
+ * say what is in memory whatever step 5 found, and steps 3-5 are what say whether anything
+ * else would have.
+ */
+#ifdef __APPLE__
+static const char *backend_word(void);
+static uint64_t fnv1a64(const void *bytes, size_t size);
+
+/*
+ * The switches of step 9's draw (asked for after run 060507, where texels the vk draw had
+ * written read back, at random and in whole 64-byte lines, as what was there before it),
+ * all off unless given before --surface, each to tell one explanation from another:
+ *
+ *   --fence-delay-us N   sleep N us after the fence and before the read: a GPU write that
+ *                        reaches memory after its fence is in memory by then
+ *   --predraw-flush      just before the draw is submitted, clean and invalidate the
+ *                        processor's cache over the surface and move its seed (so the
+ *                        kernel cleans it at the submission too): no line of the processor's
+ *                        can then be dirty, or stale, while the GPU writes
+ *   --read-noclean       after the fence, read the surface plainly (a second digest, of what
+ *                        the cache holds), then push the surface out of the cache by reading
+ *                        SURFACE_EVICT_BYTES of memory of our own, and read it plainly again,
+ *                        with no clean-and-invalidate at all. The verdict is the second.
+ *                        NOTE: eviction writes a DIRTY line back exactly as a clean does, so
+ *                        this tells "clean but stale lines that the flush did not drop" from
+ *                        the rest, not a dirty line from a late GPU write
+ *   --read-civac         every "flushed" read (steps 8 and 9) cleans and invalidates the
+ *                        surface with DC CIVAC by hand, a 64-byte line at a time, then
+ *                        DSB SY, instead of calling sys_dcache_flush -- which in iOS 16.5 on
+ *                        arm64 is "dsb ish; ret" and cleans nothing (libsystem_platform of
+ *                        20F66, read in its dyld cache after run 061800)
+ *                        [M4: THE DEFAULT now; the switch is still taken and changes nothing]
+ *   --read-sysflush      the old flushed read: sys_dcache_flush and then the texels, which on
+ *                        this system is a plain read -- kept so runs before M4 can be repeated
+ *                        as they were. --predraw-flush calls sys_dcache_flush either way: what
+ *                        it does is the seed move, as run 061800 measured it
+ *   --vk-noseen          AIR_VK_NOSEEN=1 for this process: air_vk.c does not map an imported
+ *                        surface at import (texture_of_shape, THE SURFACE MARKED "SEEN"), its
+ *                        behaviour before run 061800, to show what that mapping fixes
+ *
+ * [--vk-hostflush wfi was here too, for air_vk.c's AIR_VK_HOSTFLUSH=wfi (a full barrier
+ * with a wait before the host barrier); it changed nothing in run 061800, and both are gone.]
+ */
+static unsigned surface_fence_delay_us;
+static bool surface_predraw_flush, surface_read_noclean;
+/* [M4: true unless --read-sysflush] */
+static bool surface_read_civac = true;
+
+/* DC CIVAC over a range, by hand, and DSB SY after it: what sys_dcache_flush is not on this
+ * system. EL0 may do it (XNU sets SCTLR_EL1.UCI, osfmk/arm64/proc_reg.h). */
+static void
+civac_range(void *start, size_t size)
+{
+   uintptr_t p = (uintptr_t)start & ~(uintptr_t)63, end = (uintptr_t)start + size;
+   for (; p < end; p += 64)
+      __asm__ volatile("dc civac, %0" : : "r"(p) : "memory");
+   __asm__ volatile("dsb sy" : : : "memory");
+}
+#define SURFACE_EVICT_BYTES (16u << 20)   /* past the L3 (4 MB) and the system cache (3 MB) */
+
+struct surface_format {
+   unsigned mtl;
+   const char *name;
+   uint32_t fourcc;
+   unsigned bytes;
+   bool half;                 /* four halves; otherwise unorm bytes */
+   unsigned channels;
+   unsigned order[4];         /* the byte (or half) of each channel R, G, B, A in memory */
+};
+
+static const struct surface_format surface_formats[] = {
+   {  80, "BGRA8Unorm",  0x42475241 /* 'BGRA' */, 4, false, 4, { 2, 1, 0, 3 } },
+   {  70, "RGBA8Unorm",  0x52474241 /* 'RGBA' */, 4, false, 4, { 0, 1, 2, 3 } },
+   {  10, "R8Unorm",     0x41303038 /* 'A008' */, 1, false, 1, { 0, 0, 0, 0 } },
+   { 115, "RGBA16Float", 0x52476841 /* 'RGhA' */, 8, true,  4, { 0, 1, 2, 3 } },
+};
+
+static uint16_t
+half_bits(float v)
+{
+   _Float16 h = (_Float16)v;
+   uint16_t b;
+   memcpy(&b, &h, 2);
+   return b;
+}
+
+/* One texel of an RGBA colour in a format, as the bytes in memory. */
+static void
+pack_colour(const struct surface_format *f, const double rgba[4], uint8_t *out)
+{
+   memset(out, 0, f->bytes);
+   for (unsigned c = 0; c < f->channels; c++) {
+      if (f->half) {
+         uint16_t b = half_bits((float)rgba[c]);
+         memcpy(out + 2 * f->order[c], &b, 2);
+      } else {
+         double v = rgba[c] < 0 ? 0 : rgba[c] > 1 ? 1 : rgba[c];
+         out[f->order[c]] = (uint8_t)(v * 255.0 + 0.5);
+      }
+   }
+}
+
+/* Texel (x, y) of pattern P (salt 0) or Q (salt 1): every byte depends on both coordinates,
+ * so a texel read at the wrong place reads as the wrong place. A half is a finite normal
+ * (1 to 2 for P, 2 to 4 for Q), so no copy of it can be a conversion that moves NaN bits. */
+static void
+pattern_texel(const struct surface_format *f, unsigned x, unsigned y, unsigned salt,
+              uint8_t *out)
+{
+   if (f->half) {
+      for (unsigned c = 0; c < 4; c++) {
+         uint16_t b = salt ? (uint16_t)(0x4000 | ((x * 11 + y * 3 + c * 7) & 0x3ff))
+                           : (uint16_t)(0x3c00 | ((x * 7 + y * 13 + c * 5) & 0x3ff));
+         memcpy(out + 2 * c, &b, 2);
+      }
+      return;
+   }
+   for (unsigned i = 0; i < f->bytes; i++)
+      out[i] = salt ? (uint8_t)((x * 11 + y * 3 + i * 17 + 0x5a) & 0xff)
+                    : (uint8_t)((x * 7 + y * 13 + i * 29 + 1) & 0xff);
+}
+
+static double
+now_us(void)
+{
+   struct timespec t;
+   clock_gettime(CLOCK_MONOTONIC, &t);
+   return t.tv_sec * 1e6 + t.tv_nsec / 1e3;
+}
+
+/* How many texels of the surface hold `want` (and, with `also`, how many hold that). */
+static unsigned
+count_texels(IOSurfaceRef s, const struct surface_format *f, unsigned w, unsigned h,
+             const uint8_t *want, const uint8_t *also, unsigned *also_count)
+{
+   const uint8_t *base = IOSurfaceGetBaseAddress(s);
+   size_t stride = IOSurfaceGetBytesPerRow(s);
+   unsigned n = 0, a = 0;
+   IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+   for (unsigned y = 0; y < h; y++)
+      for (unsigned x = 0; x < w; x++) {
+         const volatile uint8_t *t = base + (size_t)y * stride + (size_t)x * f->bytes;
+         uint8_t got[16];
+         for (unsigned i = 0; i < f->bytes; i++)
+            got[i] = t[i];
+         if (!memcmp(got, want, f->bytes))
+            n++;
+         else if (also && !memcmp(got, also, f->bytes))
+            a++;
+      }
+   IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+   if (also_count)
+      *also_count = a;
+   return n;
+}
+
+/* Step 8's read: out of the cache first, then every texel row by row into one digest, and
+ * the padding counted. */
+static uint64_t
+flushed_digest(IOSurfaceRef s, const struct surface_format *f, unsigned w, unsigned h,
+               unsigned *padding_changed, uint8_t *texels)
+{
+   uint8_t *base = IOSurfaceGetBaseAddress(s);
+   size_t stride = IOSurfaceGetBytesPerRow(s);
+   uint64_t d = 0xcbf29ce484222325ull;
+   unsigned changed = 0;
+   IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+   /* [run 061800: sys_dcache_flush is "dsb ish; ret" in iOS 16.5 on arm64, so without
+    * --read-civac this read is a plain one] [M4: civac by default; sys_dcache_flush, and so a
+    * plain read, only with --read-sysflush] */
+   if (surface_read_civac)
+      civac_range(base, IOSurfaceGetAllocSize(s));
+   else
+      sys_dcache_flush(base, IOSurfaceGetAllocSize(s));
+   for (unsigned y = 0; y < h; y++) {
+      const uint8_t *row = base + (size_t)y * stride;
+      /* (and, when asked, the texels themselves, tightly packed, for a pixel dump) */
+      if (texels)
+         memcpy(texels + (size_t)y * w * f->bytes, row, (size_t)w * f->bytes);
+      for (size_t i = 0; i < (size_t)w * f->bytes; i++)
+         d = (d ^ row[i]) * 0x100000001b3ull;
+      for (size_t i = (size_t)w * f->bytes; i < stride; i++)
+         changed += row[i] != 0xa5;
+   }
+   IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+   *padding_changed = changed;
+   return d;
+}
+
+/* What the processor's cache holds of a surface, read plainly: no lock, no clean. */
+static uint64_t
+plain_digest(IOSurfaceRef s, const struct surface_format *f, unsigned w, unsigned h,
+             uint8_t *texels)
+{
+   const volatile uint8_t *base = IOSurfaceGetBaseAddress(s);
+   size_t stride = IOSurfaceGetBytesPerRow(s);
+   uint64_t d = 0xcbf29ce484222325ull;
+   for (unsigned y = 0; y < h; y++)
+      for (size_t i = 0; i < (size_t)w * f->bytes; i++) {
+         uint8_t b = base[(size_t)y * stride + i];
+         if (texels)
+            texels[(size_t)y * w * f->bytes + i] = b;
+         d = (d ^ b) * 0x100000001b3ull;
+      }
+   return d;
+}
+
+/* Every line of the processor's caches given to memory of our own, twice over, so that a
+ * surface read afterwards comes from memory: read SURFACE_EVICT_BYTES twice. */
+static void
+evict_caches(void)
+{
+   static volatile uint8_t *junk;
+   if (!junk) {
+      junk = malloc(SURFACE_EVICT_BYTES);
+      if (!junk)
+         return;
+      memset((void *)junk, 1, SURFACE_EVICT_BYTES);
+   }
+   unsigned sum = 0;
+   for (unsigned pass = 0; pass < 2; pass++)
+      for (size_t i = 0; i < SURFACE_EVICT_BYTES; i += 64)
+         sum += junk[i];
+   if (sum == 1)
+      printf(" ");   /* (never: only so the reads are not taken away) */
+}
+
+/* One texel as the line prints it: four halves, or the bytes, in hex, as they are in
+ * memory. */
+static void
+texel_words(const struct surface_format *f, const uint8_t *t, char *out, size_t size)
+{
+   size_t at = 0;
+   out[0] = 0;
+   for (unsigned i = 0; i < (f->half ? 4u : f->bytes); i++) {
+      int n;
+      if (f->half) {
+         uint16_t b;
+         memcpy(&b, t + 2 * i, 2);
+         n = snprintf(out + at, size - at, "%s%04x", i ? " " : "", b);
+      } else {
+         n = snprintf(out + at, size - at, "%s%02x", i ? " " : "", t[i]);
+      }
+      if (n > 0 && (size_t)n < size - at)
+         at += (size_t)n;
+   }
+}
+
+/*
+ * The pixel dump of a draw that DIFFERS from its model (asked for after run 054947, where the
+ * fragPos draw into an imported RGBA16Float surface differed on Vulkan alone): how many
+ * texels differ and how many of them still hold what was there before the draw (`before`,
+ * when known: the draw did not reach them), the first that differs with what it should be,
+ * and six fixed ones raw -- the corners and the two neighbours of the origin, which tell a
+ * flip, a shift and a pitch apart.
+ */
+static void
+dump_draw(const char *what, const struct surface_format *f, unsigned w, unsigned h,
+          const uint8_t *got, const uint8_t *want, const uint8_t *before)
+{
+   unsigned differ = 0, untouched = 0, first = UINT32_MAX;
+   for (unsigned i = 0; i < w * h; i++) {
+      if (!memcmp(got + (size_t)i * f->bytes, want + (size_t)i * f->bytes, f->bytes))
+         continue;
+      differ++;
+      if (first == UINT32_MAX)
+         first = i;
+      if (before && !memcmp(got + (size_t)i * f->bytes, before + (size_t)i * f->bytes,
+                            f->bytes))
+         untouched++;
+   }
+   char g[64], e[64];
+   if (first != UINT32_MAX) {
+      texel_words(f, got + (size_t)first * f->bytes, g, sizeof(g));
+      texel_words(f, want + (size_t)first * f->bytes, e, sizeof(e));
+      printf("air_metal_test: %s: %u of %u texels differ", what, differ, w * h);
+      if (before)
+         printf(" (%u of them still what was there before the draw)", untouched);
+      printf("; the first is (%u, %u): got %s, expected %s\n", first % w, first / w, g, e);
+   }
+   const unsigned at[6][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { w - 1, 0 }, { 0, h - 1 },
+                               { w - 1, h - 1 } };
+   for (unsigned k = 0; k < 6; k++) {
+      unsigned x = at[k][0] < w ? at[k][0] : w - 1, y = at[k][1] < h ? at[k][1] : h - 1;
+      size_t i = (size_t)y * w + x;
+      texel_words(f, got + i * f->bytes, g, sizeof(g));
+      texel_words(f, want + i * f->bytes, e, sizeof(e));
+      printf("air_metal_test: %s: pixel (%u, %u) got %s expected %s\n", what, x, y, g, e);
+   }
+}
+
+static int
+run_surface_self(unsigned w, unsigned h, unsigned ask_stride, unsigned mtl, const char *lib,
+                 const char *func)
+{
+   const struct surface_format *f = NULL;
+   for (unsigned i = 0; i < COUNT_OF(surface_formats); i++)
+      if (surface_formats[i].mtl == mtl)
+         f = &surface_formats[i];
+   if (!f) {
+      fprintf(stderr, "air_metal_test: --surface self takes MTLPixelFormat 80 (BGRA8Unorm), "
+                      "70 (RGBA8Unorm), 10 (R8Unorm) or 115 (RGBA16Float), the formats "
+                      "src/hkdrawable.m sends, not %u\n", mtl);
+      return 2;
+   }
+   if (!w || !h || w > 4096 || h > 4096) {
+      fprintf(stderr, "air_metal_test: --surface self: %ux%u is not a size this test makes\n",
+              w, h);
+      return 2;
+   }
+
+   /* The surface, as CoreAnimation makes a drawable's: width, height, format and the size
+    * of an element, and a row length only when one was asked for. */
+   CFMutableDictionaryRef props = CFDictionaryCreateMutable(NULL, 0,
+      &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+   int v[5] = { (int)w, (int)h, (int)f->fourcc, (int)f->bytes, (int)ask_stride };
+   CFStringRef k[5] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfacePixelFormat,
+                        kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow };
+   for (unsigned i = 0; i < (ask_stride ? 5u : 4u); i++) {
+      CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &v[i]);
+      CFDictionarySetValue(props, k[i], n);
+      CFRelease(n);
+   }
+   IOSurfaceRef s = IOSurfaceCreate(props);
+   CFRelease(props);
+   /* the back end, and turnip's TU_DEBUG with it when --tu-debug set one, so the lines of
+    * one boot's variants of the same draw can be told apart */
+   char be_buf[96];
+   const char *tud = getenv("TU_DEBUG");
+   snprintf(be_buf, sizeof(be_buf), "%s%s%s%s", backend_word(),
+            tud && *tud ? "(TU_DEBUG=" : "", tud && *tud ? tud : "", tud && *tud ? ")" : "");
+   const char *be = be_buf;
+   if (!s) {
+      printf("air_metal_test: surface-result %s %s %ux%u stride %u: no surface: "
+             "IOSurfaceCreate made none\n", be, f->name, w, h, ask_stride);
+      return 1;
+   }
+   uint32_t id = IOSurfaceGetID(s);
+   size_t stride = IOSurfaceGetBytesPerRow(s);
+   printf("air_metal_test: surface self: IOSurface %u, %ux%u %s, %zu bytes a row (asked %u), "
+          "%zu bytes, base %p\n", id, w, h, f->name, stride, ask_stride,
+          IOSurfaceGetAllocSize(s), IOSurfaceGetBaseAddress(s));
+
+   int rc = run_surface((int)id, w, h, (unsigned)stride, mtl);
+
+   char why[WHY] = "";
+   struct rwa_device *device = rwa_device_open(why, sizeof(why));
+   if (!device) {
+      printf("air_metal_test: surface-result %s %s %ux%u stride %zu: no device: %s\n", be,
+             f->name, w, h, stride, why);
+      CFRelease(s);
+      return 1;
+   }
+
+   /* step 1 */
+   uint8_t *base = IOSurfaceGetBaseAddress(s);
+   IOSurfaceLock(s, 0, NULL);
+   for (unsigned y = 0; y < h; y++)
+      memset(base + (size_t)y * stride + (size_t)w * f->bytes, 0xa5,
+             stride - (size_t)w * f->bytes);
+   IOSurfaceUnlock(s, 0, NULL);
+
+   const struct rwa_texture_shape shape = {
+      .pixel_format = mtl, .type = 2 /* MTLTextureType2D */, .width = w, .height = h,
+      .depth = 1, .array_length = 1, .mip_levels = 1, .sample_count = 1,
+      .usage = MTL_USAGE_SHADER_READ | MTL_USAGE_RENDER_TARGET,
+   };
+   why[0] = 0;
+   struct rwa_texture *t = rwa_texture_from_surface(device, &shape, (int)id, 0,
+                                                    (unsigned)stride, why, sizeof(why));
+   if (!t) {
+      printf("air_metal_test: surface-result %s %s %ux%u stride %zu: refused: %s\n", be,
+             f->name, w, h, stride, why);
+      rwa_device_close(device);
+      CFRelease(s);
+      return rc ? rc : 1;
+   }
+
+   const double a8[4] = { 0.2, 0.4, 0.6, 1.0 }, b8[4] = { 0.6, 1.0, 0.2, 1.0 };
+   const double a16[4] = { 0.25, 0.5, 0.75, 1.0 }, b16[4] = { 2.0, -1.0, 0.125, 1.0 };
+   const double *ca = f->half ? a16 : a8, *cb = f->half ? b16 : b8;
+   uint8_t pa[16], pb[16];
+   pack_colour(f, ca, pa);
+   pack_colour(f, cb, pb);
+   unsigned total = w * h, pre = 0, post = 0, stale = 0, read_ok = 0;
+   double gap = 0;
+   bool failed_step = false;
+
+   /* steps 2 to 5 */
+   double t2 = now_us();
+   if (rwa_clear_color(t, ca, why, sizeof(why)) || rwa_finish(device, why, sizeof(why))) {
+      printf("air_metal_test: surface self: the first clear: %s\n", why);
+      failed_step = true;
+   }
+   pre = count_texels(s, f, w, h, pa, NULL, NULL);
+   double t4 = now_us();
+   if (!failed_step &&
+       (rwa_clear_color(t, cb, why, sizeof(why)) || rwa_finish(device, why, sizeof(why)))) {
+      printf("air_metal_test: surface self: the second clear: %s\n", why);
+      failed_step = true;
+   }
+   gap = t4 - t2;
+   post = count_texels(s, f, w, h, pb, pa, &stale);
+
+   /* step 6 */
+   uint8_t *model = calloc((size_t)w * h, f->bytes);
+   uint8_t *readback = calloc((size_t)w * h, f->bytes);
+   IOSurfaceLock(s, 0, NULL);
+   for (unsigned y = 0; y < h; y++)
+      for (unsigned x = 0; x < w; x++) {
+         uint8_t *m = model + ((size_t)y * w + x) * f->bytes;
+         pattern_texel(f, x, y, 0, m);
+         memcpy(base + (size_t)y * stride + (size_t)x * f->bytes, m, f->bytes);
+      }
+   IOSurfaceUnlock(s, 0, NULL);
+   if (!failed_step) {
+      if (rwa_texture_read(t, 0, 0, NULL, NULL, readback, 0, why, sizeof(why))) {
+         printf("air_metal_test: surface self: rwa_texture_read: %s\n", why);
+         failed_step = true;
+      } else {
+         for (size_t i = 0; i < total; i++)
+            read_ok += !memcmp(readback + i * f->bytes, model + i * f->bytes, f->bytes);
+      }
+   }
+
+   /* step 7 */
+   unsigned qo[3] = { w > 1 ? 1 : 0, h > 1 ? 1 : 0, 0 };
+   unsigned qs[3] = { w - qo[0] < 8 ? w - qo[0] : 8, h - qo[1] < 4 ? h - qo[1] : 4, 1 };
+   uint8_t q[8 * 4 * 16];
+   for (unsigned y = 0; y < qs[1]; y++)
+      for (unsigned x = 0; x < qs[0]; x++) {
+         uint8_t *qt = q + ((size_t)y * qs[0] + x) * f->bytes;
+         pattern_texel(f, qo[0] + x, qo[1] + y, 1, qt);
+         memcpy(model + ((size_t)(qo[1] + y) * w + qo[0] + x) * f->bytes, qt, f->bytes);
+      }
+   if (!failed_step &&
+       (rwa_texture_write(t, 0, 0, qo, qs, q, 0, why, sizeof(why)) ||
+        rwa_finish(device, why, sizeof(why)))) {
+      printf("air_metal_test: surface self: rwa_texture_write: %s\n", why);
+      failed_step = true;
+   }
+
+   /* step 8 */
+   unsigned padding = 0;
+   uint64_t digest = flushed_digest(s, f, w, h, &padding, NULL);
+   uint64_t expected = fnv1a64(model, (size_t)w * h * f->bytes);
+
+   char drawn[256] = "";
+   /* step 9 */
+   if (!failed_step && lib && func) {
+      struct metallib ml = { 0 };
+      char name[256];
+      const uint8_t *bitcode = NULL;
+      size_t bitcode_size = 0;
+      struct rwa_render *render = NULL;
+      struct rwa_render_shape rs = { .color_count = 1, .sample_count = 1 };
+      struct rwa_render_info info = { 0 };
+      rs.color_format[0] = mtl;
+      /* What fragPos draws, where it can be said exactly: texel (x, y) is (x + 0.5,
+       * y + 0.5, 0, 1), which halves hold exactly up to 1024. NULL for the others, whose
+       * draws are compared between the two back ends instead. */
+      uint8_t *draw_model = NULL;
+      if (f->half && !strcmp(func, "fragPos")) {
+         draw_model = calloc((size_t)w * h, 8);
+         for (unsigned y = 0; draw_model && y < h; y++)
+            for (unsigned x = 0; x < w; x++) {
+               uint16_t px[4] = { half_bits(x + 0.5f), half_bits(y + 0.5f),
+                                  half_bits(0.0f), half_bits(1.0f) };
+               memcpy(draw_model + ((size_t)y * w + x) * 8, px, 8);
+            }
+      }
+      uint8_t *got = calloc((size_t)w * h, f->bytes);
+      if (!load_metallib(lib, &ml) ||
+          !find_function(&ml, func, name, sizeof(name), &bitcode, &bitcode_size)) {
+         snprintf(drawn, sizeof(drawn), ", draw: no %s in %s", func, lib);
+      } else if (!(render = rwa_render_create(device, NULL, 0, NULL, bitcode, bitcode_size,
+                                              func, &rs, &info, why, sizeof(why)))) {
+         printf("air_metal_test: surface self: rwa_render_create: %s\n", why);
+         snprintf(drawn, sizeof(drawn), ", draw: no pipeline");
+      } else if (info.fragment_buffers || info.fragment_textures || info.fragment_samplers) {
+         snprintf(drawn, sizeof(drawn), ", draw: %s binds resources, and this draw binds "
+                  "none", func);
+      } else {
+         struct rwa_texture *color[1] = { t };
+         const struct rwa_draw draw = {
+            .color = color, .color_count = 1,
+            .primitive = 4,                       /* MTLPrimitiveTypeTriangleStrip */
+            .vertex_start = 0, .vertex_count = 4,
+         };
+         if (surface_predraw_flush) {
+            /* --predraw-flush: nothing of the surface left in the processor's cache, dirty
+             * or clean, and a seed the kernel sees moved at the draw's submission */
+            IOSurfaceLock(s, 0, NULL);
+            sys_dcache_flush(base, IOSurfaceGetAllocSize(s));
+            IOSurfaceUnlock(s, 0, NULL);
+         }
+         if (rwa_render_draw(render, &draw, why, sizeof(why)) ||
+             rwa_finish(device, why, sizeof(why))) {
+            printf("air_metal_test: surface self: rwa_render_draw: %s\n", why);
+            snprintf(drawn, sizeof(drawn), ", draw: failed");
+         } else {
+            if (surface_fence_delay_us)
+               usleep(surface_fence_delay_us);
+            unsigned dpad = 0;
+            uint64_t dd;
+            char plain[48] = "";
+            if (surface_read_noclean) {
+               uint64_t pd = plain_digest(s, f, w, h, NULL);
+               evict_caches();
+               dd = plain_digest(s, f, w, h, got);
+               snprintf(plain, sizeof(plain), " (plain read %016llx)",
+                        (unsigned long long)pd);
+            } else {
+               dd = flushed_digest(s, f, w, h, &dpad, got);
+            }
+            char exp[64] = "none";
+            const char *verdict = "";
+            if (draw_model) {
+               uint64_t de = fnv1a64(draw_model, (size_t)w * h * 8);
+               snprintf(exp, sizeof(exp), "%016llx", (unsigned long long)de);
+               verdict = de == dd ? " match" : " DIFFERS";
+               /* `model` is still what step 8 found there: P with Q */
+               if (de != dd && got)
+                  dump_draw("surface draw", f, w, h, got, draw_model, model);
+            }
+            snprintf(drawn, sizeof(drawn), ", draw %s fnv1a64 %016llx%s expected %s%s, "
+                     "draw padding %s%u", func, (unsigned long long)dd, plain, exp, verdict,
+                     surface_read_noclean ? "unread " : dpad ? "changed " : "kept ", dpad);
+         }
+
+         /*
+          * THE CONTROL (asked for after run 054947): the same pipeline and the same draw
+          * into a texture this library allocates itself (rwa_texture_create: on Vulkan an
+          * optimal, possibly UBWC, image; on Gallium a resource of its own), read back with
+          * rwa_texture_read, against the same model. It tells "an imported linear image as
+          * a render target" from "a render target of this format as such": a DIFFERS here
+          * as well is the format, a match here is the import.
+          */
+         const struct rwa_texture_shape os = {
+            .pixel_format = mtl, .type = 2 /* MTLTextureType2D */, .width = w, .height = h,
+            .depth = 1, .array_length = 1, .mip_levels = 1, .sample_count = 1,
+            .usage = MTL_USAGE_SHADER_READ | MTL_USAGE_RENDER_TARGET,
+         };
+         struct rwa_texture *owned = rwa_texture_create(device, &os, why, sizeof(why));
+         struct rwa_texture *ocolor[1] = { owned };
+         const struct rwa_draw odraw = {
+            .color = ocolor, .color_count = 1,
+            .primitive = 4, .vertex_start = 0, .vertex_count = 4,
+         };
+         if (!owned) {
+            printf("air_metal_test: surface-control %s %s %ux%u: no owned texture: %s\n", be,
+                   f->name, w, h, why);
+         } else if (rwa_render_draw(render, &odraw, why, sizeof(why)) ||
+                    rwa_finish(device, why, sizeof(why)) ||
+                    rwa_texture_read(owned, 0, 0, NULL, NULL, got, 0, why, sizeof(why))) {
+            printf("air_metal_test: surface-control %s %s %ux%u: the draw into an owned "
+                   "texture failed: %s\n", be, f->name, w, h, why);
+         } else {
+            uint64_t od = fnv1a64(got, (size_t)w * h * f->bytes);
+            if (draw_model) {
+               uint64_t de = fnv1a64(draw_model, (size_t)w * h * 8);
+               printf("air_metal_test: surface-control %s %s %ux%u: draw into an owned "
+                      "texture fnv1a64 %016llx expected %016llx %s\n", be, f->name, w, h,
+                      (unsigned long long)od, (unsigned long long)de,
+                      od == de ? "match" : "DIFFERS");
+               if (od != de)
+                  dump_draw("owned draw", f, w, h, got, draw_model, NULL);
+            } else {
+               printf("air_metal_test: surface-control %s %s %ux%u: draw into an owned "
+                      "texture fnv1a64 %016llx expected none\n", be, f->name, w, h,
+                      (unsigned long long)od);
+            }
+         }
+         if (owned)
+            rwa_texture_destroy(owned);
+      }
+      if (render)
+         rwa_render_destroy(render);
+      free(draw_model);
+      free(got);
+   }
+
+   /* the switches in force, so that each line says which case it is */
+   char sw[160], delay[40] = "";
+   const char *ns = getenv("AIR_VK_NOSEEN");
+   bool noseen = ns && !strcmp(ns, "1");
+   if (surface_fence_delay_us)
+      snprintf(delay, sizeof(delay), " fence-delay-us=%u", surface_fence_delay_us);
+   /* [M4: the flushed read is always named -- read-civac, the default now, or read-sysflush
+    * -- so a line says which read made its digest whatever the binary's default was] */
+   snprintf(sw, sizeof(sw), " [switches:%s%s%s%s%s]", delay,
+            surface_predraw_flush ? " predraw-flush" : "",
+            surface_read_noclean ? " read-noclean" : "",
+            surface_read_civac ? " read-civac" : " read-sysflush", noseen ? " vk-noseen" : "");
+   printf("air_metal_test: surface-result %s%s %s %ux%u stride %zu: pre-read A %u/%u, "
+          "post-fence B %u/%u stale %u gap %.0f us, gpu-read P %u/%u, flushed fnv1a64 "
+          "%016llx expected %016llx %s, padding %s%u%s%s\n", be, sw, f->name, w, h, stride,
+          pre, total, post, total, stale, gap, read_ok, total, (unsigned long long)digest,
+          (unsigned long long)expected, digest == expected ? "match" : "DIFFERS",
+          padding ? "changed " : "kept ", padding, drawn,
+          failed_step ? ", a step FAILED (above)" : "");
+   fflush(stdout);
+   rwa_texture_destroy(t);
+   rwa_device_close(device);
+   free(model);
+   free(readback);
+   CFRelease(s);
+   bool good = !failed_step && pre == total && post == total && read_ok == total &&
+               digest == expected;
+   return rc ? rc : good ? 0 : 1;
+}
+#endif
+
 
 /*
  * --argbufs: what argument buffers a module declares, and the two numbers an
@@ -5225,6 +5995,10 @@ run_draw_argbuf(const char *setpath, const char *directpath)
  * Metal.framework's binary carries the names and the values and no layout. So a clean
  * run here means "the reading is implemented exactly", and the reading itself is
  * settled by a boot: red and blue exchanged in the window server's own surfaces is a
+ * [M5b: "settled" says too much. Real Metal measured on an M1 Max has the mirror of this table, and
+ * the boot does not show who did the exchange: air_metal.c, at rwa_pixel_formats. The table here
+ * is the Gallium library's, `shift_real` the Vulkan library's. And --pixel-formats --pixels judges
+ * both by tex_model.h.]
  * blue clock on an orange ground, not a subtle shift.
  *
  * Every texel of the probe texture holds the same word, so no coordinate, no filter and
@@ -5233,6 +6007,8 @@ run_draw_argbuf(const char *setpath, const char *directpath)
  *
  *   air_metal_test --pixel-formats FILE.metallib FUNCTION
  */
+static const char *backend_word(void);
+
 static int
 run_pixel_formats(const char *path, const char *func)
 {
@@ -5242,17 +6018,18 @@ run_pixel_formats(const char *path, const char *func)
       const char *taken;      /* the pipe_format this library chose */
       const char *other;      /* ... and the one the other reading would have chosen */
       unsigned shift[4];      /* r, g, b, a: where the field starts */
+      unsigned shift_real[4]; /* M5b: ... on real Metal (tex_model.h), the Vulkan library's */
       unsigned width[4];      /* ... and how wide it is; 0 means the format has none */
    };
    static const struct packed16 formats[] = {
       { 40, "MTLPixelFormatB5G6R5Unorm", "PIPE_FORMAT_R5G6B5_UNORM",
-        "PIPE_FORMAT_B5G6R5_UNORM", { 0, 5, 11, 0 }, { 5, 6, 5, 0 } },
+        "PIPE_FORMAT_B5G6R5_UNORM", { 0, 5, 11, 0 }, { 11, 5, 0, 0 }, { 5, 6, 5, 0 } },
       { 41, "MTLPixelFormatA1BGR5Unorm", "PIPE_FORMAT_A1R5G5B5_UNORM",
-        "PIPE_FORMAT_A1B5G5R5_UNORM", { 1, 6, 11, 0 }, { 5, 5, 5, 1 } },
+        "PIPE_FORMAT_A1B5G5R5_UNORM", { 1, 6, 11, 0 }, { 11, 6, 1, 0 }, { 5, 5, 5, 1 } },
       { 42, "MTLPixelFormatABGR4Unorm", "PIPE_FORMAT_A4R4G4B4_UNORM",
-        "PIPE_FORMAT_A4B4G4R4_UNORM", { 4, 8, 12, 0 }, { 4, 4, 4, 4 } },
+        "PIPE_FORMAT_A4B4G4R4_UNORM", { 4, 8, 12, 0 }, { 12, 8, 4, 0 }, { 4, 4, 4, 4 } },
       { 43, "MTLPixelFormatBGR5A1Unorm", "PIPE_FORMAT_R5G5B5A1_UNORM",
-        "PIPE_FORMAT_B5G5R5A1_UNORM", { 0, 5, 10, 15 }, { 5, 5, 5, 1 } },
+        "PIPE_FORMAT_B5G5R5A1_UNORM", { 0, 5, 10, 15 }, { 10, 5, 0, 15 }, { 5, 5, 5, 1 } },
    };
    static const char *const channel[4] = { "red", "green", "blue", "alpha" };
 
@@ -5268,7 +6045,8 @@ run_pixel_formats(const char *path, const char *func)
       for (unsigned c = 0; c < 4; c++) {
          if (!p->width[c])
             continue;
-         unsigned word = ((1u << p->width[c]) - 1u) << p->shift[c];
+         const unsigned *shifts = !strcmp(backend_word(), "vk") ? p->shift_real : p->shift;
+         unsigned word = ((1u << p->width[c]) - 1u) << shifts[c];
          /* what the reading says that word must sample as: the one channel whose field
           * is set comes back 1, every other channel the format HAS comes back 0, and a
           * channel the format does not have is 1 for alpha and 0 otherwise -- which is
@@ -5285,7 +6063,7 @@ run_pixel_formats(const char *path, const char *func)
          probe_fill16_given = true;
          memset(last_pixel, 0, sizeof(last_pixel));
          printf("air_metal_test: --pixel-formats %s, the %u-bit %s field at bit %u, "
-                "word 0x%04x\n", p->name, p->width[c], channel[c], p->shift[c], word);
+                "word 0x%04x\n", p->name, p->width[c], channel[c], shifts[c], word);
          int rc = run_draw(path, NULL, func, "125", NULL, texspec);
          cases++;
          if (rc != 0) {
@@ -5686,6 +6464,8 @@ struct blend_case {
      .destination_rgb_blend_factor = (dr), .source_alpha_blend_factor = (sa),           \
      .destination_alpha_blend_factor = (da), .write_mask = (mask) }
 
+static const char *backend_word(void);
+
 static int
 run_blend(const char *path, const char *func)
 {
@@ -5915,6 +6695,15 @@ run_blend(const char *path, const char *func)
       struct rwa_render *render =
          rwa_render_create(device, NULL, 0, NULL, bitcode, bitcode_size, func, &shape,
                            &info, why, sizeof(why));
+      /* [M5a: the Vulkan back end serves the blend colour (rwa_draw.blend_color): this row is
+       * refused on Gallium alone, and what vk does with it is --draw-blend --pixels's.] */
+      if (c->must_refuse && c->b.source_rgb_blend_factor == BF_BLEND_COLOR &&
+          !strcmp(backend_word(), "vk")) {
+         printf("blend: served on vk (M5a), and measured by --draw-blend --pixels: %s\n",
+                c->what);
+         rwa_render_destroy(render);
+         continue;
+      }
       if (c->must_refuse) {
          if (render) {
             printf("blend: NOT REFUSED  %s: the pipeline was made, so this would have "
@@ -6362,9 +7151,3839 @@ no_multisample:;
 #undef BLIT_CHECK
 }
 
+/*
+ * THE RESULT LINE of the kernel mode (M3d), one per run in one shape whatever happened, so
+ * this program built against each library (air_metal_test_gl, air_metal_test_vk) can be run
+ * twice in one boot and the two lines joined on the kernel's name, as metal_drv_test's
+ * compute-result lines are:
+ *
+ *     air_metal_test: compute-result BACKEND NAME ran bN HEX ... tN HEX ...
+ *     air_metal_test: compute-result BACKEND NAME ran unchanged
+ *     air_metal_test: compute-result BACKEND NAME no-pipeline REASON
+ *     air_metal_test: compute-result BACKEND NAME refused-dispatch REASON
+ *
+ * `ran` lists every buffer that no longer holds the fill (bN: FNV-1a over its 4096 bytes)
+ * and every texture that no longer holds air_run's texels -- or TEXELS index's, when that
+ * seeded it (M3d-2) -- (tN: FNV-1a over the whole level
+ * as rwa_texture_read returns it, 16 bytes a texel), in index order. BACKEND is which
+ * library this binary was linked against, asked of the process and not assumed: only the
+ * Vulkan one exports rwa_vk_counts (tu_hackios_exports.txt).
+ */
+static const char *
+backend_word(void)
+{
+#ifdef RTLD_DEFAULT
+   return dlsym(RTLD_DEFAULT, "rwa_vk_counts") != NULL ? "vk" : "gallium";
+#else
+   return "gallium";
+#endif
+}
+
+static uint64_t
+fnv1a64(const void *bytes, size_t size)
+{
+   const uint8_t *b = bytes;
+   uint64_t h = 0xcbf29ce484222325ull;
+   for (size_t i = 0; i < size; i++)
+      h = (h ^ b[i]) * 0x100000001b3ull;
+   return h;
+}
+
+/*
+ * --pixels: M5a's half of each of --draw-blend, --draw-attrib, --attrib-sweep, --draw-index and
+ * --draw-vertex, which until now were built out of Apple's shaders and each had a CONSTANT or
+ * a four-texel answer (--draw-blend a uniform source over a uniform destination, --draw-index
+ * two corners and a covered count, --draw-attrib a 4x4 grid of one gradient, --attrib-sweep no
+ * draw at all, --draw-vertex one texel). These keep all that and add a second form of the same
+ * mode:
+ *
+ *   air_metal_test [--gpu] --draw-blend  --pixels DIR     blends, every pixel its own src and dst
+ *   air_metal_test [--gpu] --draw-attrib --pixels DIR     [[stage_in]]: gradient, offsets, steps
+ *   air_metal_test [--gpu] --attrib-sweep --pixels DIR    every vertex format, one triangle each
+ *   air_metal_test [--gpu] --draw-index  --pixels DIR     a scrambled grid, bases, ids, restart
+ *   air_metal_test [--gpu] --draw-vertex --pixels DIR     orientation, primitives, stencil, passes
+ *
+ * DIR holds the hand-written modules, tools/air/m5a_*.ll assembled (on the phone
+ * /hackios/share/probes). Every case is one result line per back end (draw_model.h), against a
+ * picture computed there. Apple's shaders are not used, because what these measure is the
+ * fixed function around a shader and the modules below make every pixel's answer a function of
+ * its own position. Gallium's library reads none of rwa_draw's M5a fields and refuses the blend
+ * colour by name, so on it those cases say "gallium-lacks" or "refused": what the picture was
+ * is still in the digest.
+ */
+struct pix {
+   struct rwa_device *device;
+   const char *backend, *dir, *mode;
+   bool gallium;
+   unsigned right, wrong, lacks, refused;
+   /* M5b: rows that are what the Gallium library's mirrored 16-bit table says and not real Metal's */
+   unsigned mirror;
+   char why[WHY];
+};
+
+
+static bool
+pix_open(struct pix *r, const char *dir, const char *mode)
+{
+   memset(r, 0, sizeof(*r));
+   r->dir = dir;
+   r->mode = mode;
+   r->backend = backend_word();
+   r->gallium = strcmp(r->backend, "vk") != 0;
+   setenv("RWA_SOFTWARE", "1", 0);
+   r->device = rwa_device_open(r->why, sizeof(r->why));
+   if (!r->device) {
+      printf("air_metal_test: rwa_device_open: %s\n", r->why);
+      return false;
+   }
+   printf("air_metal_test: --%s --pixels on \"%s\", %ux%u attachments, modules in %s\n", mode,
+          rwa_device_name(r->device), DM_W, DM_H, dir);
+   return true;
+}
+
+static int
+pix_close(struct pix *r)
+{
+   printf("drvtest: draw-summary %s %s %u ok, %u differ, %u gallium-lacks, %u refused\n",
+          r->backend, r->mode, r->right, r->wrong, r->lacks, r->refused);
+   rwa_device_close(r->device);
+   fflush(stdout);
+   return r->wrong ? 1 : 0;
+}
+
+/* One module of DIR, kept for the process: the same few are used by every case. */
+static bool
+pix_module(struct pix *r, const char *name, const uint8_t **bytes, size_t *size)
+{
+   static struct { char name[32]; struct metallib lib; } kept[16];
+   for (unsigned i = 0; i < COUNT_OF(kept); i++) {
+      if (!strcmp(kept[i].name, name)) {
+         *bytes = kept[i].lib.bytes;
+         *size = kept[i].lib.size;
+         return true;
+      }
+      if (!kept[i].name[0]) {
+         char path[512];
+         snprintf(path, sizeof(path), "%s/%s.bc", r->dir, name);
+         if (!load_metallib(path, &kept[i].lib))
+            return false;
+         snprintf(kept[i].name, sizeof(kept[i].name), "%s", name);
+         *bytes = kept[i].lib.bytes;
+         *size = kept[i].lib.size;
+         return true;
+      }
+   }
+   return false;
+}
+
+/* A pipeline, or the case's one line saying why not. `vs` NULL is the generated stage. */
+static struct rwa_render *
+pix_render(struct pix *r, const char *vs, const char *fs, const struct rwa_render_shape *shape,
+           const char *name)
+{
+   const uint8_t *vb = NULL, *fb = NULL;
+   size_t vn = 0, fn = 0;
+   if ((vs && !pix_module(r, vs, &vb, &vn)) || !pix_module(r, fs, &fb, &fn)) {
+      dm_refused(r->backend, name, "a module is not in the directory");
+      r->wrong++;
+      return NULL;
+   }
+   r->why[0] = '\0';
+   struct rwa_render *render = rwa_render_create(r->device, vb, vn, vs, fb, fn, fs, shape, NULL,
+                                                 r->why, sizeof(r->why));
+   if (!render) {
+      dm_refused(r->backend, name, r->why);
+      r->refused++;
+   }
+   return render;
+}
+
+static struct rwa_texture *
+pix_target(struct pix *r, unsigned fmt)
+{
+   const struct rwa_texture_shape ts = {
+      .pixel_format = fmt, .type = MTL_TEXTURE_TYPE_2D, .width = DM_W, .height = DM_H,
+      .depth = 1, .array_length = 1, .mip_levels = 1, .sample_count = 1,
+      .usage = MTL_USAGE_SHADER_READ | MTL_USAGE_RENDER_TARGET,
+   };
+   struct rwa_texture *t = rwa_texture_create(r->device, &ts, r->why, sizeof(r->why));
+   if (!t)
+      printf("air_metal_test: a %s attachment: %s\n", dm_format_name(fmt), r->why);
+   return t;
+}
+
+/* A buffer holding these bytes; the library keeps what a draw names until it is done. */
+static struct rwa_buffer *
+pix_buffer(struct pix *r, const void *bytes, size_t size)
+{
+   struct rwa_buffer *b = rwa_buffer_create(r->device, size, r->why, sizeof(r->why));
+   if (!b) {
+      printf("air_metal_test: a buffer of %zu bytes: %s\n", size, r->why);
+      return NULL;
+   }
+   memcpy(rwa_buffer_map(b), bytes, size);
+   return b;
+}
+
+/* M5c: how far a row judged against the measured sRGB curve is from the book, and the most the curve
+ * is from it anywhere: the row's word says which it matched, and this says how much that was. */
+static float
+dm_adreno_srgb_bound(void)
+{
+   float worst = 0.0f;
+   for (unsigned c = 0; c < 256; c++) {
+      float e = dm_adreno_srgb_decode[c] - dm_srgb_decode((float)c / 255.0f);
+      e = e < 0.0f ? -e : e;
+      worst = e > worst ? e : worst;
+   }
+   return worst;
+}
+
+/* The attachment read back and judged, one line, and the counts. */
+static bool
+pix_judge(struct pix *r, struct rwa_texture *t, unsigned fmt, const char *name,
+          const struct dm_picture *want, float extra, bool lacks)
+{
+   static uint8_t got[DM_W * DM_H * 16];
+   const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { DM_W, DM_H, 1 };
+   if (rwa_texture_read(t, 0, 0, origin, extent, got, 0, r->why, sizeof(r->why)) != 0) {
+      dm_refused(r->backend, name, r->why);
+      r->wrong++;
+      return false;
+   }
+   bool ok = dm_verdict(r->backend, name, fmt, got, want, extra, lacks);
+   if (ok)
+      r->right++;
+   else if (lacks)
+      r->lacks++;
+   else
+      r->wrong++;
+   return ok;
+}
+
+/* [M5b: the map of an attachment whichever way the verdict went (draw_model.h, dm_map).] */
+static void
+pix_map(struct pix *r, struct rwa_texture *t, unsigned fmt, const char *name,
+        const struct dm_picture *want)
+{
+   static uint8_t got[DM_W * DM_H * 16];
+   const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { DM_W, DM_H, 1 };
+   if (rwa_texture_read(t, 0, 0, origin, extent, got, 0, r->why, sizeof(r->why)) == 0)
+      dm_map(r->backend, name, fmt, got, want);
+}
+
+/* What a draw failed for, as the case's line. */
+static void
+pix_draw_failed(struct pix *r, const char *name)
+{
+   dm_refused(r->backend, name, r->why);
+   r->refused++;
+}
+
+/* ---- --draw-blend --pixels ---- */
+
+/* Fill an attachment with the per-pixel destination, as the attachment's own bytes. */
+static bool
+pix_fill_dst(struct pix *r, struct rwa_texture *t, unsigned fmt)
+{
+   static uint8_t mem[DM_W * DM_H * 16];
+   const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { DM_W, DM_H, 1 };
+   unsigned texel = dm_texel_bytes(fmt);
+   for (unsigned y = 0; y < DM_H; y++)
+      for (unsigned x = 0; x < DM_W; x++) {
+         float d[4];
+         dm_dst(x, y, d);
+         dm_encode(fmt, d, mem + ((size_t)y * DM_W + x) * texel);
+      }
+   if (rwa_texture_write(t, 0, 0, origin, extent, mem, 0, r->why, sizeof(r->why)) != 0) {
+      printf("air_metal_test: writing the destination: %s\n", r->why);
+      return false;
+   }
+   return true;
+}
+
+static void
+pix_shape_blend(struct rwa_color_blend *to, const struct dm_blend *b)
+{
+   *to = (struct rwa_color_blend){
+      .blending_enabled = b->on, .rgb_blend_operation = b->rgb_op,
+      .alpha_blend_operation = b->alpha_op, .source_rgb_blend_factor = b->src_rgb,
+      .destination_rgb_blend_factor = b->dst_rgb, .source_alpha_blend_factor = b->src_alpha,
+      .destination_alpha_blend_factor = b->dst_alpha, .write_mask = b->mask,
+   };
+}
+
+#define DM_ON(sr, dr, opr, sa, da, opa, m) { 1, opr, opa, sr, dr, sa, da, m }
+
+static int
+run_pixels_blend(const char *dir)
+{
+   static const struct { const char *name; struct dm_blend b; } cases[] = {
+      { "srcover", DM_ON(DM_SA, DM_ISA, DM_ADD, DM_SA, DM_ISA, DM_ADD, DM_ALL) },
+      { "premult", DM_ON(DM_ONE, DM_ISA, DM_ADD, DM_ONE, DM_ISA, DM_ADD, DM_ALL) },
+      { "oneone", DM_ON(DM_ONE, DM_ONE, DM_ADD, DM_ONE, DM_ONE, DM_ADD, DM_ALL) },
+      { "min", DM_ON(DM_ONE, DM_ONE, DM_MIN, DM_ONE, DM_ONE, DM_MIN, DM_ALL) },
+      { "max", DM_ON(DM_ONE, DM_ONE, DM_MAX, DM_ONE, DM_ONE, DM_MAX, DM_ALL) },
+      { "revsub", DM_ON(DM_ONE, DM_ONE, DM_RSUB, DM_ONE, DM_ONE, DM_RSUB, DM_ALL) },
+      { "sub", DM_ON(DM_ONE, DM_ONE, DM_SUB, DM_ONE, DM_ONE, DM_SUB, DM_ALL) },
+      { "modulate", DM_ON(DM_DC, DM_ZERO, DM_ADD, DM_DC, DM_ZERO, DM_ADD, DM_ALL) },
+      { "invdst", DM_ON(DM_IDC, DM_SC, DM_ADD, DM_IDA, DM_SA, DM_ADD, DM_ALL) },
+      { "invsrc", DM_ON(DM_ISC, DM_DC, DM_ADD, DM_ISC, DM_DC, DM_ADD, DM_ALL) },
+      { "dstalpha", DM_ON(DM_DA, DM_IDA, DM_ADD, DM_DA, DM_IDA, DM_ADD, DM_ALL) },
+      { "saturated", DM_ON(DM_SAS, DM_ZERO, DM_ADD, DM_ONE, DM_ZERO, DM_ADD, DM_ALL) },
+      { "halves", DM_ON(DM_SA, DM_ISA, DM_ADD, DM_ONE, DM_ONE, DM_MAX, DM_ALL) },
+      { "constant", DM_ON(DM_BC, DM_IBC, DM_ADD, DM_BA, DM_IBA, DM_ADD, DM_ALL) },
+      { "constalpha", DM_ON(DM_BA, DM_IBA, DM_ADD, DM_IBC, DM_BC, DM_ADD, DM_ALL) },
+      { "mask-r", DM_ON(DM_ONE, DM_ISA, DM_ADD, DM_ONE, DM_ISA, DM_ADD, DM_R) },
+      { "mask-a", DM_ON(DM_ONE, DM_ISA, DM_ADD, DM_ONE, DM_ISA, DM_ADD, DM_A) },
+      { "mask-rgb", DM_ON(DM_ONE, DM_ISA, DM_ADD, DM_ONE, DM_ISA, DM_ADD, DM_R | DM_G | DM_B) },
+      { "mask-gba", DM_ON(DM_ONE, DM_ISA, DM_ADD, DM_ONE, DM_ISA, DM_ADD, DM_G | DM_B | DM_A) },
+      { "mask-gb", DM_ON(DM_ONE, DM_ISA, DM_ADD, DM_ONE, DM_ISA, DM_ADD, DM_G | DM_B) },
+      { "mask-none", DM_ON(DM_ONE, DM_ISA, DM_ADD, DM_ONE, DM_ISA, DM_ADD, 0) },
+      { "off-mask-rb", { 0, 0, 0, 1, 0, 1, 0, DM_R | DM_B } },
+      { "off", { 0, 0, 0, 1, 0, 1, 0, DM_ALL } },
+   };
+   static const unsigned formats[] = {
+      DM_RGBA32F, DM_RGBA16F, DM_RGBA8, DM_BGRA8, DM_RGBA8_SRGB, DM_BGRA8_SRGB,
+   };
+   /* dyadic, and each channel different, so which one was read is in the picture */
+   static const float constant[4] = { 0.25f, 0.5f, 0.75f, 0.125f };
+   struct pix r;
+   if (!pix_open(&r, dir, "draw-blend"))
+      return 1;
+   static struct dm_picture want;
+
+   for (unsigned fi = 0; fi < COUNT_OF(formats); fi++) {
+      unsigned fmt = formats[fi];
+      struct rwa_texture *t = pix_target(&r, fmt);
+      /* rgba32f exactly; rgba16f to its own rounding: products have more bits than a half */
+      /* [M5b: and the model now rounds them as the hardware does (dm_blend_model), so nothing
+       * extra: 1/512 stood here, about two steps of a half] */
+      const float extra = 0.0f;
+      if (!t) {
+         r.wrong++;
+         continue;
+      }
+      for (unsigned ci = 0; ci < COUNT_OF(cases); ci++) {
+         char name[64];
+         snprintf(name, sizeof(name), "blend-%s-%s", dm_format_name(fmt), cases[ci].name);
+         struct rwa_render_shape shape = {
+            .color_format = { fmt }, .color_count = 1, .sample_count = 1,
+            .color_blend_count = 1,
+         };
+         pix_shape_blend(&shape.color_blend[0], &cases[ci].b);
+         struct rwa_render *render = pix_render(&r, NULL, "m5a_fsrc", &shape, name);
+         if (!render)
+            continue;
+         if (!pix_fill_dst(&r, t, fmt)) {
+            r.wrong++;
+            rwa_render_destroy(render);
+            continue;
+         }
+         struct rwa_texture *color[1] = { t };
+         const struct rwa_draw draw = {
+            .color = color, .color_count = 1, .primitive = 4, .vertex_count = 4,
+            .blend_color = constant,
+         };
+         if (rwa_render_draw(render, &draw, r.why, sizeof(r.why)) != 0) {
+            pix_draw_failed(&r, name);
+         } else {
+            /* [M5c: an sRGB attachment's destination read as this GPU reads it (adreno_srgb.h), which
+             * is what blend-*srgb-sub were off by. The rest of the arithmetic is the model's.] */
+            dm_srgb_curve = dm_is_srgb(fmt) ? dm_adreno_srgb_decode : NULL;
+            dm_right_word = dm_is_srgb(fmt) ? "adreno-srgb" : "ok";
+            dm_blend_model(&want, fmt, &cases[ci].b, constant, dm_src);
+            pix_judge(&r, t, fmt, name, &want, extra, false);
+            dm_right_word = "ok";
+            dm_srgb_curve = NULL;
+         }
+         rwa_render_destroy(render);
+      }
+      rwa_texture_destroy(t);
+   }
+
+   /*
+    * Two attachments that blend and mask differently, of two formats, from two outputs that
+    * differ: rgba32f premultiplied with everything written, and rgba8 One/One writing only
+    * red and alpha. The rows of air_metal_test --draw-blend that had two attachments read the
+    * first one back and could say nothing of the second; each is judged here.
+    */
+   {
+      static const struct dm_blend b0 =
+         DM_ON(DM_ONE, DM_ISA, DM_ADD, DM_ONE, DM_ISA, DM_ADD, DM_ALL);
+      static const struct dm_blend b1 =
+         DM_ON(DM_ONE, DM_ONE, DM_ADD, DM_ONE, DM_ONE, DM_ADD, DM_R | DM_A);
+      struct rwa_render_shape shape = {
+         .color_format = { DM_RGBA32F, DM_RGBA8 }, .color_count = 2, .sample_count = 1,
+         .color_blend_count = 2,
+      };
+      pix_shape_blend(&shape.color_blend[0], &b0);
+      pix_shape_blend(&shape.color_blend[1], &b1);
+      struct rwa_texture *t0 = pix_target(&r, DM_RGBA32F), *t1 = pix_target(&r, DM_RGBA8);
+      struct rwa_render *render = pix_render(&r, NULL, "m5a_fmrt", &shape, "blend-mrt");
+      if (render && t0 && t1 && pix_fill_dst(&r, t0, DM_RGBA32F) && pix_fill_dst(&r, t1, DM_RGBA8)) {
+         struct rwa_texture *color[2] = { t0, t1 };
+         const struct rwa_draw draw = {
+            .color = color, .color_count = 2, .primitive = 4, .vertex_count = 4,
+         };
+         if (rwa_render_draw(render, &draw, r.why, sizeof(r.why)) != 0) {
+            pix_draw_failed(&r, "blend-mrt");
+         } else {
+            dm_blend_model(&want, DM_RGBA32F, &b0, constant, dm_src);
+            pix_judge(&r, t0, DM_RGBA32F, "blend-mrt-0", &want, 0.0f, false);
+            dm_blend_model(&want, DM_RGBA8, &b1, constant, dm_src2);
+            pix_judge(&r, t1, DM_RGBA8, "blend-mrt-1", &want, 0.0f, false);
+         }
+      }
+      rwa_render_destroy(render);
+      rwa_texture_destroy(t0);
+      rwa_texture_destroy(t1);
+   }
+   return pix_close(&r);
+}
+
+/* ---- geometry, for the rest ---- */
+
+/* One vertex of m5a_vattr: a window coordinate is what the cases think in, so it is written
+ * here, and turned into clip coordinates over the whole attachment. */
+struct pix_vertex {
+   float pos[4];
+   float col[4];
+};
+
+static struct pix_vertex
+pix_v(float wx, float wy, float r0, float g0, float b0, float a0)
+{
+   struct pix_vertex v = {
+      { wx * 2.0f / DM_W - 1.0f, 1.0f - wy * 2.0f / DM_H, 0.0f, 1.0f }, { r0, g0, b0, a0 },
+   };
+   return v;
+}
+
+/* The asymmetric triangle: nowhere near the attachment's middle, no two sides alike, and its
+ * corners on 1/16 of a pixel. Counter-clockwise as seen (top left, then down, then right). */
+static const float pix_tri_win[3][2] = { { 2.0625f, 1.0625f }, { 4.0625f, 12.0625f },
+                                         { 13.0625f, 3.0625f } };
+static const float pix_tri_col[3][4] = { { 1, 0, 0, 1 }, { 0, 1, 0, 1 }, { 0, 0, 1, 1 } };
+
+/* What three of a mesh's vertices put in a picture, through a viewport, a scissor and a face. */
+static void
+pix_model_tri(struct dm_picture *p, const struct pix_vertex *a, const struct pix_vertex *b,
+              const struct pix_vertex *c, const struct dm_viewport *vp, struct dm_rect rect,
+              unsigned cull, unsigned winding, bool shared)
+{
+   float w[3][2], col[3][4];
+   const struct pix_vertex *v[3] = { a, b, c };
+   for (unsigned i = 0; i < 3; i++) {
+      dm_window(v[i]->pos, vp, w[i]);
+      memcpy(col[i], v[i]->col, sizeof(col[i]));
+   }
+   if (dm_culled(w, cull, winding))
+      return;
+   dm_triangle(p, w, col, rect, shared);
+}
+
+static void
+pix_shape_vattr(struct rwa_render_shape *shape, unsigned fmt)
+{
+   memset(shape, 0, sizeof(*shape));
+   shape->color_format[0] = fmt;
+   shape->color_count = 1;
+   shape->sample_count = 1;
+   shape->vertex_attribute[0] = (struct rwa_vertex_attribute){ MTL_VF_FLOAT4, 0, 0 };
+   shape->vertex_attribute[1] = (struct rwa_vertex_attribute){ MTL_VF_FLOAT4, 16, 0 };
+   shape->vertex_layout[0] = (struct rwa_vertex_layout){ sizeof(struct pix_vertex),
+                                                          MTL_STEP_PER_VERTEX, 1 };
+}
+
+/* A draw of a pipeline over a mesh of pix_vertex at stream 0, into one cleared attachment. */
+static bool
+pix_draw_mesh(struct pix *r, struct rwa_render *render, struct rwa_texture *t,
+              const struct pix_vertex *mesh, unsigned n, struct rwa_draw d, const char *name)
+{
+   static const float black[4] = { 0, 0, 0, 0 };
+   struct rwa_buffer *vb = pix_buffer(r, mesh, n * sizeof(*mesh));
+   if (!vb)
+      return false;
+   struct rwa_texture *color[1] = { t };
+   struct rwa_vertex_stream streams[1] = { { vb, 0 } };
+   d.color = color;
+   d.color_count = 1;
+   if (!d.clear_color && !d.color_clears)
+      d.clear_color = black;
+   d.vertex_streams = streams;
+   d.vertex_stream_count = 1;
+   if (!d.vertex_count)
+      d.vertex_count = n;
+   bool ok = rwa_render_draw(render, &d, r->why, sizeof(r->why)) == 0;
+   if (!ok)
+      pix_draw_failed(r, name);
+   rwa_buffer_destroy(vb);
+   return ok;
+}
+
+/* ---- --draw-attrib --pixels ---- */
+
+static int
+run_pixels_attrib(const char *dir)
+{
+   struct pix r;
+   if (!pix_open(&r, dir, "draw-attrib"))
+      return 1;
+   static struct dm_picture want;
+   static const float black[4] = { 0, 0, 0, 0 };
+   const struct dm_viewport whole = { 0, 0, DM_W, DM_H };
+   struct rwa_texture *t = pix_target(&r, DM_RGBA32F);
+   if (!t)
+      return 1;
+   /* the interpolated colours are not exact: a thousandth is far under any wrong answer */
+   const float grad = 1.0f / 512.0f;
+
+   /* 1: the gradient, one interleaved stream, three corners with three primaries. */
+   struct pix_vertex tri[3];
+   for (unsigned i = 0; i < 3; i++)
+      tri[i] = pix_v(pix_tri_win[i][0], pix_tri_win[i][1], pix_tri_col[i][0], pix_tri_col[i][1],
+                     pix_tri_col[i][2], pix_tri_col[i][3]);
+   {
+      struct rwa_render_shape shape;
+      pix_shape_vattr(&shape, DM_RGBA32F);
+      struct rwa_render *render = pix_render(&r, "m5a_vattr", "m5a_fcolor", &shape, "attrib-gradient");
+      if (render) {
+         if (pix_draw_mesh(&r, render, t, tri, 3, (struct rwa_draw){ .primitive = 3 },
+                           "attrib-gradient")) {
+            dm_clear(&want, black);
+            pix_model_tri(&want, &tri[0], &tri[1], &tri[2], &whole, dm_whole(), 0, 0, false);
+            pix_judge(&r, t, DM_RGBA32F, "attrib-gradient", &want, grad, false);
+         }
+         rwa_render_destroy(render);
+      }
+   }
+
+   /*
+    * 2: the same triangle, interleaved differently, and every number wrong unless honoured.
+    * The element is 40 bytes: 7 bytes of decoy, the colour as UChar4Normalized at 7, more decoy,
+    * the position as Float2 at 20. The stream is at Metal's buffer index 7, bound at offset
+    * 80, so the first two elements of the buffer are a decoy triangle too. A Float2 position
+    * must read (x, y, 0, 1), which is the attribute's default for the two it does not have.
+    */
+   {
+      uint8_t mem[40 * 5];
+      memset(mem, 0xa5, sizeof(mem));
+      static const uint8_t col8[3][4] = { { 255, 0, 51, 255 }, { 0, 255, 102, 204 },
+                                          { 153, 0, 255, 51 } };
+      struct pix_vertex model[3];
+      for (unsigned i = 0; i < 3; i++) {
+         uint8_t *e = mem + 80 + 40 * i;
+         memcpy(e + 7, col8[i], 4);
+         memcpy(e + 20, tri[i].pos, 8);
+         model[i] = tri[i];
+         for (unsigned c = 0; c < 4; c++)
+            model[i].col[c] = col8[i][c] / 255.0f;
+      }
+      struct rwa_render_shape shape = {
+         .color_format = { DM_RGBA32F }, .color_count = 1, .sample_count = 1,
+      };
+      shape.vertex_attribute[0] = (struct rwa_vertex_attribute){ MTL_VF_FLOAT2, 20, 7 };
+      shape.vertex_attribute[1] = (struct rwa_vertex_attribute){ MTL_VF_UCHAR4_NORMALIZED, 7, 7 };
+      shape.vertex_layout[7] = (struct rwa_vertex_layout){ 40, MTL_STEP_PER_VERTEX, 1 };
+      struct rwa_render *render = pix_render(&r, "m5a_vattr", "m5a_fcolor", &shape, "attrib-interleaved");
+      struct rwa_buffer *vb = pix_buffer(&r, mem, sizeof(mem));
+      if (render && vb) {
+         struct rwa_texture *color[1] = { t };
+         struct rwa_vertex_stream streams[8] = { { 0 } };
+         streams[7] = (struct rwa_vertex_stream){ vb, 80 };
+         const struct rwa_draw d = {
+            .color = color, .color_count = 1, .clear_color = black, .primitive = 3,
+            .vertex_count = 3, .vertex_streams = streams, .vertex_stream_count = 8,
+         };
+         if (rwa_render_draw(render, &d, r.why, sizeof(r.why)) != 0) {
+            pix_draw_failed(&r, "attrib-interleaved");
+         } else {
+            dm_clear(&want, black);
+            pix_model_tri(&want, &model[0], &model[1], &model[2], &whole, dm_whole(), 0, 0, false);
+            pix_judge(&r, t, DM_RGBA32F, "attrib-interleaved", &want, grad, false);
+         }
+      }
+      rwa_buffer_destroy(vb);
+      rwa_render_destroy(render);
+   }
+
+   /*
+    * 3-7: the instance step, over m5a_vinst: a 3x3-pixel quad's corners per vertex, and an offset
+    * and a colour per instance, each its own stream at its own index. Four instances along a
+    * row. Rate 2 on the colour: two and two. Constant: every instance the first element.
+    * Base instance 2: the elements from the third (rate 1) and, at rate 2, base + i / 2 --
+    * which is Vulkan's formula and a6xx's on both back ends, and the model says so.
+    */
+   {
+      struct pix_vertex corners[4];
+      for (unsigned i = 0; i < 4; i++)
+         corners[i] = pix_v((i & 1) ? 3.0f : 0.0f, (i & 2) ? 3.0f : 0.0f, 0, 0, 0, 0);
+      static const float offs[6][2] = {
+         { 0.0f, -0.25f }, { 0.5f, 0.0f }, { 1.0f, 0.25f }, { 1.5f, 0.5f }, { 0.0f, 1.0f },
+         { 1.0f, 1.0f },
+      };
+      static const float cols[6][4] = {
+         { 1, 0, 0, 1 }, { 0, 1, 0, 1 }, { 0, 0, 1, 1 }, { 1, 1, 0, 1 }, { 0, 1, 1, 1 },
+         { 1, 0, 1, 1 },
+      };
+      static const struct {
+         const char *name;
+         unsigned off_step, off_rate, col_step, col_rate, instances, base;
+      } steps[] = {
+         { "attrib-instance", MTL_STEP_PER_INSTANCE, 1, MTL_STEP_PER_INSTANCE, 1, 4, 0 },
+         { "attrib-rate2", MTL_STEP_PER_INSTANCE, 1, MTL_STEP_PER_INSTANCE, 2, 4, 0 },
+         /* rate 0: real Metal aborts on a constant step at any other rate ("stepRate(1) must be
+          * zero if stepFunction is MTLVertexStepFunctionConstant", tools/air/mtlref) */
+         { "attrib-constant", MTL_STEP_PER_INSTANCE, 1, MTL_STEP_CONSTANT, 0, 4, 0 },
+         { "attrib-baseinstance", MTL_STEP_PER_INSTANCE, 1, MTL_STEP_PER_INSTANCE, 1, 3, 2 },
+         { "attrib-rate2-base", MTL_STEP_PER_INSTANCE, 1, MTL_STEP_PER_INSTANCE, 2, 4, 1 },
+      };
+      struct rwa_buffer *vb = pix_buffer(&r, corners, sizeof(corners));
+      struct rwa_buffer *ob = pix_buffer(&r, offs, sizeof(offs));
+      struct rwa_buffer *cb = pix_buffer(&r, cols, sizeof(cols));
+      for (unsigned s = 0; s < COUNT_OF(steps) && vb && ob && cb; s++) {
+         struct rwa_render_shape shape = {
+            .color_format = { DM_RGBA32F }, .color_count = 1, .sample_count = 1,
+         };
+         shape.vertex_attribute[0] = (struct rwa_vertex_attribute){ MTL_VF_FLOAT4, 0, 2 };
+         shape.vertex_attribute[1] = (struct rwa_vertex_attribute){ MTL_VF_FLOAT4, 0, 4 };
+         shape.vertex_attribute[2] = (struct rwa_vertex_attribute){ MTL_VF_FLOAT2, 0, 5 };
+         shape.vertex_layout[2] = (struct rwa_vertex_layout){ sizeof(struct pix_vertex),
+                                                               MTL_STEP_PER_VERTEX, 1 };
+         shape.vertex_layout[4] = (struct rwa_vertex_layout){ 16, steps[s].col_step, steps[s].col_rate };
+         shape.vertex_layout[5] = (struct rwa_vertex_layout){ 8, steps[s].off_step, steps[s].off_rate };
+         struct rwa_render *render = pix_render(&r, "m5a_vinst", "m5a_fcolor", &shape, steps[s].name);
+         if (!render)
+            continue;
+         struct rwa_texture *color[1] = { t };
+         struct rwa_vertex_stream streams[6] = { { 0 } };
+         streams[2] = (struct rwa_vertex_stream){ vb, 0 };
+         streams[4] = (struct rwa_vertex_stream){ cb, 0 };
+         streams[5] = (struct rwa_vertex_stream){ ob, 0 };
+         const struct rwa_draw d = {
+            .color = color, .color_count = 1, .clear_color = black, .primitive = 4,
+            .vertex_count = 4, .instance_count = steps[s].instances,
+            .base_instance = steps[s].base, .vertex_streams = streams,
+            .vertex_stream_count = 6,
+         };
+         if (rwa_render_draw(render, &d, r.why, sizeof(r.why)) != 0) {
+            pix_draw_failed(&r, steps[s].name);
+         } else {
+            dm_clear(&want, black);
+            for (unsigned i = 0; i < steps[s].instances; i++) {
+               unsigned oe = steps[s].base + i;
+               unsigned ce = steps[s].col_step == MTL_STEP_CONSTANT ? 0
+                           : steps[s].base + i / steps[s].col_rate;
+               /* window pixels: an offset of 0.5 in clip x is 4 pixels, of 0.25 in y 2 up */
+               int x0 = (int)(offs[oe][0] * DM_W / 2.0f), y0 = (int)(-offs[oe][1] * DM_H / 2.0f);
+               for (int y = y0; y < y0 + 3; y++)
+                  for (int x = x0; x < x0 + 3; x++)
+                     if (x >= 0 && y >= 0 && x < DM_W && y < DM_H)
+                        memcpy(want.px[y][x], cols[ce], sizeof(cols[ce]));
+            }
+            pix_judge(&r, t, DM_RGBA32F, steps[s].name, &want, 0.0f, false);
+         }
+         rwa_render_destroy(render);
+      }
+      rwa_buffer_destroy(vb);
+      rwa_buffer_destroy(ob);
+      rwa_buffer_destroy(cb);
+   }
+
+   /* 8: refused by name on both back ends, one line each: a packed format and a type mismatch */
+   {
+      struct rwa_render_shape shape;
+      pix_shape_vattr(&shape, DM_RGBA32F);
+      shape.vertex_attribute[1].format = MTL_VF_UINT1010102_NORMALIZED;
+      struct rwa_render *render = pix_render(&r, "m5a_vattr", "m5a_fcolor", &shape, "attrib-packed-refused");
+      rwa_render_destroy(render);
+      pix_shape_vattr(&shape, DM_RGBA32F);
+      shape.vertex_attribute[1].format = MTL_VF_INT4;
+      render = pix_render(&r, "m5a_vattr", "m5a_fcolor", &shape, "attrib-type-refused");
+      rwa_render_destroy(render);
+   }
+   rwa_texture_destroy(t);
+   return pix_close(&r);
+}
+
+/* ---- --attrib-sweep --pixels ---- */
+
+/*
+ * Every vertex format, by Apple's number: its element type, how many components, how the
+ * values read. A triangle whose colour attribute is in that format, three vertices of values
+ * the format holds exactly, and the expected colour the barycentrics of those decoded values
+ * on the processor, with what the format has not got read as (0, 0, 0, 1) and the BGRA one
+ * swapped. An integer format goes through m5a_vint or m5a_vuint, so the fetched integer comes
+ * back as a float.
+ */
+enum { SW_U8, SW_S8, SW_UN8, SW_SN8, SW_U16, SW_S16, SW_UN16, SW_SN16, SW_F16, SW_F32, SW_S32, SW_U32 };
+
+static const struct {
+   unsigned mtl;
+   const char *name;
+   unsigned kind, comps;
+} sweep_formats[] = {
+   {  1, "UChar2", SW_U8, 2 }, {  2, "UChar3", SW_U8, 3 }, {  3, "UChar4", SW_U8, 4 },
+   {  4, "Char2", SW_S8, 2 }, {  5, "Char3", SW_S8, 3 }, {  6, "Char4", SW_S8, 4 },
+   {  7, "UChar2Norm", SW_UN8, 2 }, {  8, "UChar3Norm", SW_UN8, 3 }, {  9, "UChar4Norm", SW_UN8, 4 },
+   { 10, "Char2Norm", SW_SN8, 2 }, { 11, "Char3Norm", SW_SN8, 3 }, { 12, "Char4Norm", SW_SN8, 4 },
+   { 13, "UShort2", SW_U16, 2 }, { 14, "UShort3", SW_U16, 3 }, { 15, "UShort4", SW_U16, 4 },
+   { 16, "Short2", SW_S16, 2 }, { 17, "Short3", SW_S16, 3 }, { 18, "Short4", SW_S16, 4 },
+   { 19, "UShort2Norm", SW_UN16, 2 }, { 20, "UShort3Norm", SW_UN16, 3 }, { 21, "UShort4Norm", SW_UN16, 4 },
+   { 22, "Short2Norm", SW_SN16, 2 }, { 23, "Short3Norm", SW_SN16, 3 }, { 24, "Short4Norm", SW_SN16, 4 },
+   { 25, "Half2", SW_F16, 2 }, { 26, "Half3", SW_F16, 3 }, { 27, "Half4", SW_F16, 4 },
+   { 28, "Float", SW_F32, 1 }, { 29, "Float2", SW_F32, 2 }, { 30, "Float3", SW_F32, 3 }, { 31, "Float4", SW_F32, 4 },
+   { 32, "Int", SW_S32, 1 }, { 33, "Int2", SW_S32, 2 }, { 34, "Int3", SW_S32, 3 }, { 35, "Int4", SW_S32, 4 },
+   { 36, "UInt", SW_U32, 1 }, { 37, "UInt2", SW_U32, 2 }, { 38, "UInt3", SW_U32, 3 }, { 39, "UInt4", SW_U32, 4 },
+   { 42, "UChar4Norm_BGRA", SW_UN8, 4 },
+   { 45, "UChar", SW_U8, 1 }, { 46, "Char", SW_S8, 1 }, { 47, "UCharNorm", SW_UN8, 1 }, { 48, "CharNorm", SW_SN8, 1 },
+   { 49, "UShort", SW_U16, 1 }, { 50, "Short", SW_S16, 1 }, { 51, "UShortNorm", SW_UN16, 1 }, { 52, "ShortNorm", SW_SN16, 1 },
+   { 53, "Half", SW_F16, 1 },
+};
+
+/* Values for a format: the bytes of one vertex's attribute, and what they decode to. */
+static unsigned
+sweep_values(unsigned kind, unsigned comps, unsigned vertex, uint8_t *mem, float out[4])
+{
+   static const int32_t i8s[3][4] = { { -100, -50, -10, 10 }, { 0, 20, 40, 60 }, { 100, 90, 80, 70 } };
+   static const int32_t u8s[3][4] = { { 10, 20, 30, 40 }, { 100, 110, 120, 130 }, { 200, 210, 220, 230 } };
+   static const int32_t i16s[3][4] = { { -30000, -20000, -1000, 1000 }, { 0, 2000, 4000, 6000 }, { 32767, 20000, 10000, 5000 } };
+   static const int32_t u16s[3][4] = { { 1000, 2000, 3000, 4000 }, { 10000, 20000, 30000, 40000 }, { 50000, 60000, 65000, 65535 } };
+   static const int32_t i32s[3][4] = { { -100000, -5, 100, 7 }, { 0, 2000, -40, 60 }, { 100000, 3, 8, 9 } };
+   static const int32_t u32s[3][4] = { { 0, 5, 100, 7 }, { 70000, 2000, 40, 60 }, { 100000, 3, 8, 9 } };
+   static const float fs[3][4] = { { -1.0f, 0.5f, 0.25f, 2.0f }, { 4.0f, -0.5f, 0.125f, 1.0f }, { 0.0f, 1.0f, 2.0f, 3.0f } };
+   float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+   unsigned bytes = 0;
+   for (unsigned c = 0; c < comps; c++) {
+      switch (kind) {
+      case SW_U8: case SW_UN8: {
+         uint8_t b = (uint8_t)u8s[vertex][c];
+         mem[bytes++] = b;
+         v[c] = kind == SW_UN8 ? b / 255.0f : (float)b;
+         break;
+      }
+      case SW_S8: case SW_SN8: {
+         int8_t b = (int8_t)i8s[vertex][c];
+         mem[bytes++] = (uint8_t)b;
+         v[c] = kind == SW_SN8 ? b / 127.0f : (float)b;
+         break;
+      }
+      case SW_U16: case SW_UN16: {
+         uint16_t h = (uint16_t)u16s[vertex][c];
+         memcpy(mem + bytes, &h, 2);
+         bytes += 2;
+         v[c] = kind == SW_UN16 ? h / 65535.0f : (float)h;
+         break;
+      }
+      case SW_S16: case SW_SN16: {
+         int16_t h = (int16_t)i16s[vertex][c];
+         memcpy(mem + bytes, &h, 2);
+         bytes += 2;
+         v[c] = kind == SW_SN16 ? h / 32767.0f : (float)h;
+         break;
+      }
+      case SW_F16: {
+         uint16_t h = dm_half(fs[vertex][c]);
+         memcpy(mem + bytes, &h, 2);
+         bytes += 2;
+         v[c] = fs[vertex][c];
+         break;
+      }
+      case SW_F32:
+         memcpy(mem + bytes, &fs[vertex][c], 4);
+         bytes += 4;
+         v[c] = fs[vertex][c];
+         break;
+      case SW_S32:
+         memcpy(mem + bytes, &i32s[vertex][c], 4);
+         bytes += 4;
+         v[c] = (float)i32s[vertex][c];
+         break;
+      case SW_U32:
+         memcpy(mem + bytes, &u32s[vertex][c], 4);
+         bytes += 4;
+         v[c] = (float)u32s[vertex][c];
+         break;
+      }
+   }
+   memcpy(out, v, sizeof(v));
+   return bytes;
+}
+
+static int
+run_pixels_sweep(const char *dir)
+{
+   struct pix r;
+   if (!pix_open(&r, dir, "attrib-sweep"))
+      return 1;
+   static struct dm_picture want;
+   static const float black[4] = { 0, 0, 0, 0 };
+   const struct dm_viewport whole = { 0, 0, DM_W, DM_H };
+   struct rwa_texture *t = pix_target(&r, DM_RGBA32F);
+   if (!t)
+      return 1;
+
+   for (unsigned f = 0; f < COUNT_OF(sweep_formats); f++) {
+      char name[64];
+      snprintf(name, sizeof(name), "attrib-format-%s", sweep_formats[f].name);
+      unsigned kind = sweep_formats[f].kind, comps = sweep_formats[f].comps;
+      uint8_t mem[3 * 32];
+      struct pix_vertex model[3];
+      float largest = 0.0f;
+      memset(mem, 0, sizeof(mem));
+      for (unsigned i = 0; i < 3; i++) {
+         struct pix_vertex p = pix_v(pix_tri_win[i][0], pix_tri_win[i][1], 0, 0, 0, 0);
+         float v[4];
+         uint8_t bytes[16];
+         unsigned n = sweep_values(kind, comps, i, bytes, v);
+         memcpy(mem + 32 * i, p.pos, 16);
+         memcpy(mem + 32 * i + 16, bytes, n);
+         if (sweep_formats[f].mtl == 42) {   /* the swap: byte 0 is what the shader's z reads */
+            uint8_t b0 = bytes[0], b2 = bytes[2];
+            mem[32 * i + 16] = b2;
+            mem[32 * i + 18] = b0;
+         }
+         model[i] = p;
+         memcpy(model[i].col, v, sizeof(v));
+         for (unsigned c = 0; c < 4; c++)
+            largest = v[c] > largest ? v[c] : (-v[c] > largest ? -v[c] : largest);
+      }
+      struct rwa_render_shape shape;
+      pix_shape_vattr(&shape, DM_RGBA32F);
+      shape.vertex_attribute[1].format = sweep_formats[f].mtl;
+      const char *vs = kind == SW_U8 || kind == SW_U16 || kind == SW_U32 ? "m5a_vuint"
+                     : kind == SW_S8 || kind == SW_S16 || kind == SW_S32 ? "m5a_vint"
+                                                                         : "m5a_vattr";
+      struct rwa_render *render = pix_render(&r, vs, "m5a_fcolor", &shape, name);
+      if (!render)
+         continue;
+      struct rwa_buffer *vb = pix_buffer(&r, mem, sizeof(mem));
+      if (vb) {
+         struct rwa_texture *color[1] = { t };
+         struct rwa_vertex_stream streams[1] = { { vb, 0 } };
+         const struct rwa_draw d = {
+            .color = color, .color_count = 1, .clear_color = black, .primitive = 3,
+            .vertex_count = 3, .vertex_streams = streams, .vertex_stream_count = 1,
+         };
+         if (rwa_render_draw(render, &d, r.why, sizeof(r.why)) != 0) {
+            pix_draw_failed(&r, name);
+         } else {
+            dm_clear(&want, black);
+            pix_model_tri(&want, &model[0], &model[1], &model[2], &whole, dm_whole(), 0, 0, false);
+            /* a thousandth of the largest value: interpolation of six digits is not exact */
+            pix_judge(&r, t, DM_RGBA32F, name, &want, (largest > 1.0f ? largest : 1.0f) / 512.0f,
+                      false);
+         }
+         rwa_buffer_destroy(vb);
+      }
+      rwa_render_destroy(render);
+   }
+   rwa_texture_destroy(t);
+   return pix_close(&r);
+}
+
+/* ---- --draw-index --pixels ---- */
+
+/* The grid: 5x5 vertices at 4 pixels apart, each its own colour, and 16 quads of 2 triangles. */
+static void
+pix_grid(struct pix_vertex v[25], uint32_t tris[96])
+{
+   for (unsigned j = 0; j < 5; j++)
+      for (unsigned i = 0; i < 5; i++)
+         v[j * 5 + i] = pix_v(i * 4.0f, j * 4.0f, i / 4.0f, j / 4.0f, (i + j) / 8.0f, 1.0f);
+   unsigned n = 0;
+   for (unsigned j = 0; j < 4; j++)
+      for (unsigned i = 0; i < 4; i++) {
+         uint32_t a = j * 5 + i, b = a + 1, c = a + 5, d = c + 1;
+         tris[n++] = a; tris[n++] = c; tris[n++] = b;
+         tris[n++] = b; tris[n++] = c; tris[n++] = d;
+      }
+   /* scrambled by triangles, not by vertices, with a fixed walk (32 is even, 13 is coprime) */
+   uint32_t out[96];
+   for (unsigned k = 0; k < 32; k++) {
+      unsigned from = (k * 13 + 7) % 32;
+      for (unsigned c = 0; c < 3; c++)
+         out[k * 3 + c] = tris[from * 3 + c];
+   }
+   memcpy(tris, out, sizeof(out));
+}
+
+static int
+run_pixels_index(const char *dir)
+{
+   struct pix r;
+   if (!pix_open(&r, dir, "draw-index"))
+      return 1;
+   static struct dm_picture want;
+   static const float black[4] = { 0, 0, 0, 0 };
+   const struct dm_viewport whole = { 0, 0, DM_W, DM_H };
+   struct rwa_texture *t = pix_target(&r, DM_RGBA32F);
+   if (!t)
+      return 1;
+   const float grad = 1.0f / 512.0f;
+
+   struct pix_vertex grid[25];
+   uint32_t tris[96];
+   pix_grid(grid, tris);
+   dm_clear(&want, black);
+   for (unsigned k = 0; k < 32; k++)
+      pix_model_tri(&want, &grid[tris[k * 3]], &grid[tris[k * 3 + 1]], &grid[tris[k * 3 + 2]],
+                    &whole, dm_whole(), 0, 0, true);
+   static struct dm_picture grid_want;
+   grid_want = want;
+
+   struct rwa_render_shape shape;
+   pix_shape_vattr(&shape, DM_RGBA32F);
+   struct rwa_render *render = pix_render(&r, "m5a_vattr", "m5a_fcolor", &shape, "index-pipeline");
+   /* the strip pipeline's sibling for lines is made at the first draw, as for the others */
+   if (render) {
+      /* 1: the same triangles with no index buffer at all, which is the comparison itself */
+      struct pix_vertex flat[96];
+      for (unsigned i = 0; i < 96; i++)
+         flat[i] = grid[tris[i]];
+      if (pix_draw_mesh(&r, render, t, flat, 96, (struct rwa_draw){ .primitive = 3 }, "index-flat"))
+         pix_judge(&r, t, DM_RGBA32F, "index-flat", &grid_want, grad, false);
+
+      /* 2-3: indexed, 16 and 32 bits, from a non-zero offset in the index buffer */
+      uint16_t i16[100];
+      uint32_t i32[100];
+      for (unsigned i = 0; i < 4; i++) {
+         i16[i] = 0x5a5a;
+         i32[i] = 0x5a5a5a5a;
+      }
+      for (unsigned i = 0; i < 96; i++) {
+         i16[4 + i] = (uint16_t)tris[i];
+         i32[4 + i] = tris[i];
+      }
+      struct rwa_buffer *b16 = pix_buffer(&r, i16, sizeof(i16));
+      struct rwa_buffer *b32 = pix_buffer(&r, i32, sizeof(i32));
+      if (b16 && b32 && pix_draw_mesh(&r, render, t, grid, 25,
+                                      (struct rwa_draw){ .primitive = 3, .vertex_count = 96,
+                                                         .index_buffer = b16, .index_type = 0,
+                                                         .index_buffer_offset = 8 }, "index-16"))
+         pix_judge(&r, t, DM_RGBA32F, "index-16", &grid_want, grad, false);
+      if (b16 && b32 && pix_draw_mesh(&r, render, t, grid, 25,
+                                      (struct rwa_draw){ .primitive = 3, .vertex_count = 96,
+                                                         .index_buffer = b32, .index_type = 1,
+                                                         .index_buffer_offset = 16 }, "index-32"))
+         pix_judge(&r, t, DM_RGBA32F, "index-32", &grid_want, grad, false);
+
+      /* 4-5: the base vertex, both signs: the mesh moved in its buffer behind decoys, and the
+       * indices moved the other way. The picture must not move. */
+      {
+         struct pix_vertex shifted[32];
+         for (unsigned i = 0; i < 32; i++)
+            shifted[i] = pix_v(8.0f, 8.0f, 1, 1, 1, 1);
+         memcpy(shifted + 7, grid, sizeof(grid));
+         uint16_t less[96];
+         for (unsigned i = 0; i < 96; i++)
+            less[i] = (uint16_t)tris[i];
+         struct rwa_buffer *bl = pix_buffer(&r, less, sizeof(less));
+         if (bl && pix_draw_mesh(&r, render, t, shifted, 32,
+                                 (struct rwa_draw){ .primitive = 3, .vertex_count = 96,
+                                                    .index_buffer = bl, .base_vertex = 7 },
+                                 "index-basevertex"))
+            pix_judge(&r, t, DM_RGBA32F, "index-basevertex", &grid_want, grad, false);
+         for (unsigned i = 0; i < 96; i++)
+            less[i] = (uint16_t)(tris[i] + 12);
+         struct rwa_buffer *bm = pix_buffer(&r, less, sizeof(less));
+         if (bm && pix_draw_mesh(&r, render, t, shifted + 2, 30,
+                                 (struct rwa_draw){ .primitive = 3, .vertex_count = 96,
+                                                    .index_buffer = bm, .base_vertex = -7 },
+                                 "index-basevertex-neg"))
+            pix_judge(&r, t, DM_RGBA32F, "index-basevertex-neg", &grid_want, grad, false);
+         rwa_buffer_destroy(bl);
+         rwa_buffer_destroy(bm);
+      }
+
+      /*
+       * 6-9: a strip with a restart index, both widths, and a line strip: Metal restarts on
+       * the type's largest value on the strip types. Two separate quads of a strip each; a
+       * back end that read the restart as a vertex draws a third and fourth triangle joining
+       * them, or (on Gallium, whose bound check sees vertex 65535) is refused at the draw.
+       */
+      {
+         struct pix_vertex strip[8];
+         static const float corner[8][2] = {
+            { 1, 1 }, { 6, 1 }, { 1, 6 }, { 6, 6 }, { 9, 9 }, { 15, 9 }, { 9, 14 }, { 15, 14 },
+         };
+         for (unsigned i = 0; i < 8; i++)
+            strip[i] = pix_v(corner[i][0], corner[i][1], i < 4 ? 1 : 0, i < 4 ? 0 : 1,
+                             (i & 1) ? 1.0f : 0.0f, 1);
+         const uint16_t r16[9] = { 0, 1, 2, 3, 0xffff, 4, 5, 6, 7 };
+         const uint32_t r32[9] = { 0, 1, 2, 3, 0xffffffffu, 4, 5, 6, 7 };
+         struct rwa_buffer *br16 = pix_buffer(&r, r16, sizeof(r16));
+         struct rwa_buffer *br32 = pix_buffer(&r, r32, sizeof(r32));
+         dm_clear(&want, black);
+         for (unsigned q = 0; q < 2; q++) {
+            pix_model_tri(&want, &strip[q * 4], &strip[q * 4 + 1], &strip[q * 4 + 2], &whole,
+                          dm_whole(), 0, 0, true);
+            pix_model_tri(&want, &strip[q * 4 + 2], &strip[q * 4 + 1], &strip[q * 4 + 3], &whole,
+                          dm_whole(), 0, 0, true);
+         }
+         if (br16 && pix_draw_mesh(&r, render, t, strip, 8,
+                                   (struct rwa_draw){ .primitive = 4, .vertex_count = 9,
+                                                      .index_buffer = br16 }, "index-restart-16"))
+            pix_judge(&r, t, DM_RGBA32F, "index-restart-16", &want, grad, false);
+         if (br32 && pix_draw_mesh(&r, render, t, strip, 8,
+                                   (struct rwa_draw){ .primitive = 4, .vertex_count = 9,
+                                                      .index_buffer = br32, .index_type = 1 },
+                                   "index-restart-32"))
+            pix_judge(&r, t, DM_RGBA32F, "index-restart-32", &want, grad, false);
+         rwa_buffer_destroy(br16);
+         rwa_buffer_destroy(br32);
+      }
+      rwa_buffer_destroy(b16);
+      rwa_buffer_destroy(b32);
+      rwa_render_destroy(render);
+   }
+
+   /*
+    * 10-13: [[vertex_id]] and [[instance_id]], with a model. m5a_vids takes its corner out of
+    * a buffer by vertex id and moves it across by instance id: 2 pixels per instance. So the
+    * base vertex and the base instance decide where it lands and the colour says the two ids
+    * as well: r = vertex id / 64, g = instance id / 16. Metal includes the base in both.
+    */
+   {
+      struct rwa_render_shape ids = {
+         .color_format = { DM_RGBA32F }, .color_count = 1, .sample_count = 1,
+      };
+      struct rwa_render *probe = pix_render(&r, "m5a_vids", "m5a_fcolor", &ids, "ids-pipeline");
+      if (probe) {
+         /* a small triangle per slot of the buffer: decoys below slot 10, the real one at 10..12,
+          * at the top left, and a decoy again after it */
+         float posb[16][4];
+         for (unsigned i = 0; i < 16; i++) {
+            posb[i][0] = -0.875f + 0.0625f * (float)(i % 3 == 1 ? 8 : 0);
+            posb[i][1] = 0.875f - 0.0625f * (float)(i % 3 == 2 ? 8 : 0);
+            posb[i][2] = 0.0f;
+            posb[i][3] = 1.0f;
+         }
+         /* slot 10, 11, 12 are the corners; slots below are the same shape shifted down 8 px */
+         for (unsigned i = 0; i < 10; i++)
+            posb[i][1] -= 1.0f;
+         struct rwa_buffer *pb = pix_buffer(&r, posb, sizeof(posb));
+         const uint16_t idx[3] = { 0, 1, 2 };
+         struct rwa_buffer *ib = pix_buffer(&r, idx, sizeof(idx));
+         static const struct {
+            const char *name;
+            bool indexed;
+            unsigned first_or_base, instances, base_instance;
+         } cases[] = {
+            { "ids-indexed-basevertex", true, 10, 1, 0 },
+            { "ids-indexed-instances", true, 10, 3, 0 },
+            { "ids-indexed-baseinstance", true, 10, 2, 3 },
+            { "ids-nonindexed-start", false, 10, 1, 0 },
+            { "ids-nonindexed-baseinstance", false, 10, 3, 1 },
+         };
+         for (unsigned c = 0; pb && ib && c < COUNT_OF(cases); c++) {
+            struct rwa_texture *color[1] = { t };
+            struct rwa_buffer *vbufs[1] = { pb };
+            struct rwa_draw d = {
+               .color = color, .color_count = 1, .clear_color = black, .primitive = 3,
+               .vertex_count = 3, .instance_count = cases[c].instances,
+               .base_instance = cases[c].base_instance,
+               .vertex = { .buffers = vbufs, .buffer_count = 1 },
+            };
+            if (cases[c].indexed) {
+               d.index_buffer = ib;
+               d.base_vertex = (int)cases[c].first_or_base;
+            } else {
+               d.vertex_start = cases[c].first_or_base;
+            }
+            if (rwa_render_draw(probe, &d, r.why, sizeof(r.why)) != 0) {
+               pix_draw_failed(&r, cases[c].name);
+               continue;
+            }
+            dm_clear(&want, black);
+            for (unsigned i = 0; i < cases[c].instances; i++) {
+               unsigned iid = cases[c].base_instance + i;
+               struct pix_vertex tri3[3];
+               for (unsigned k = 0; k < 3; k++) {
+                  unsigned vid = cases[c].first_or_base + k;
+                  tri3[k].pos[0] = posb[vid][0] + (float)iid * 0.25f;
+                  tri3[k].pos[1] = posb[vid][1];
+                  tri3[k].pos[2] = 0.0f;
+                  tri3[k].pos[3] = 1.0f;
+                  tri3[k].col[0] = (float)vid / 64.0f;
+                  tri3[k].col[1] = (float)iid / 16.0f;
+                  tri3[k].col[2] = 0.0f;
+                  tri3[k].col[3] = 1.0f;
+               }
+               pix_model_tri(&want, &tri3[0], &tri3[1], &tri3[2], &whole, dm_whole(), 0, 0, false);
+            }
+            pix_judge(&r, t, DM_RGBA32F, cases[c].name, &want, grad, false);
+         }
+         rwa_buffer_destroy(pb);
+         rwa_buffer_destroy(ib);
+         rwa_render_destroy(probe);
+      }
+   }
+   rwa_texture_destroy(t);
+   return pix_close(&r);
+}
+
+/* ---- --draw-vertex --pixels ---- */
+
+/*
+ * A line in window coordinates into a picture, by the rule Gallium programs for one sample,
+ * Bresenham's (fd6_rasterizer.cc), in the words of Vulkan's own definition of it: one pixel per
+ * step of the major axis, the pixel whose centre is nearest at that step's centre, from the
+ * first endpoint up to and not including the last. A tie (a centre exactly half a pixel from
+ * the line) is left unjudged. Its colour is the vertices' own: one colour per line here,
+ * because what a line is measured for is where it is.
+ */
+static void
+pix_model_line(struct dm_picture *p, const float a[2], const float b[2], const float col[4])
+{
+   float dx = b[0] - a[0], dy = b[1] - a[1];
+   bool xmajor = (dx < 0 ? -dx : dx) >= (dy < 0 ? -dy : dy);
+   /* a line neither horizontal nor vertical nor on the diagonal has ends the two rules and
+    * the sub-pixel position can each take or leave: the middle is what tells them apart */
+   bool plain = dx == 0.0f || dy == 0.0f || dx == dy || dx == -dy;
+   float from = xmajor ? a[0] : a[1], to = xmajor ? b[0] : b[1];
+   int lo = (int)(from < to ? from : to) - 1, hi = (int)(from < to ? to : from) + 1;
+   for (int m = lo; m <= hi; m++) {
+      float at = (float)m + 0.5f;
+      float t = (at - from) / (to - from);
+      if (t < 0.0f || t >= 1.0f)
+         continue;
+      float other = (xmajor ? a[1] : a[0]) + t * (xmajor ? dy : dx);
+      int cell = (int)other;
+      float frac = other - (float)cell;
+      int x = xmajor ? m : cell, y = xmajor ? cell : m;
+      if (x < 0 || y < 0 || x >= DM_W || y >= DM_H)
+         continue;
+      float span = (to - from) < 0 ? from - to : to - from;
+      bool end = !plain && (t * span < 1.0f || (1.0f - t) * span < 1.0f);
+      if (frac == 0.0f || end) {
+         p->care[y][x] = 0;
+         /* and the pixel beside it, which the other reading of an end would take */
+         if (end && xmajor && y + 1 < DM_H)
+            p->care[y + 1][x] = 0;
+         if (end && xmajor && y > 0)
+            p->care[y - 1][x] = 0;
+         if (end && !xmajor && x + 1 < DM_W)
+            p->care[y][x + 1] = 0;
+         if (end && !xmajor && x > 0)
+            p->care[y][x - 1] = 0;
+         /* exactly on the grid either neighbour is the line's: M1 draws one on y = 3 in row 2 and
+          * one on x = 3 in column 2, in both directions (tools/air/mtlref) */
+         if (frac == 0.0f && xmajor && y > 0)
+            p->care[y - 1][x] = 0;
+         if (frac == 0.0f && !xmajor && x > 0)
+            p->care[y][x - 1] = 0;
+         continue;
+      }
+      memcpy(p->px[y][x], col, 4 * sizeof(float));
+   }
+   /*
+    * [M5b: a STEEP line's ends on a whole row, which is what run 094931 measured. prim-linelist's
+    * vertical line (14.5, 3) to (14.5, 15) on vk: (14, 2) drawn and (14, 14) not, "first (14,2) got
+    * 0 1 0 1", the whole line one row up from the rule above. The endpoint is exactly on the edge
+    * between two rows, on the diamond's corner of each. I blamed the negative viewport height, and
+    * that was wrong: real Metal on an M1 gives the same two pixels with a POSITIVE viewport, and
+    * reversing the line swaps them (tools/air/mtlref), so this is the line's direction: a diamond
+    * that keeps its bottom corner explains them, and these two are the only pixels of the test's
+    * lines where M1 differs from open diamond-exit. The horizontal line's ends (x = 2.0, 11.0) did
+    * not move, so this is for the major axis y only, and it is the two pixels concerned and no
+    * more: the rest of the line still has to be where it is.]
+    */
+   if (!xmajor) {
+      const float ends[2] = { a[1], b[1] };
+      const float xs[2] = { a[0], b[0] };
+      for (unsigned e = 0; e < 2; e++) {
+         int row = (int)ends[e], cell = (int)xs[e];
+         if ((float)row == ends[e] && row >= 1 && row <= DM_H && cell >= 0 && cell < DM_W)
+            p->care[row - 1][cell] = 0;
+      }
+   }
+}
+
+static void
+pix_model_point(struct dm_picture *p, const float c[2], float size, const float col[4])
+{
+   for (unsigned y = 0; y < DM_H; y++)
+      for (unsigned x = 0; x < DM_W; x++) {
+         float px = (float)x + 0.5f, py = (float)y + 0.5f;
+         /* the top-left rule, on sizes 2 and 4 where a centre falls on the square's edge (M1,
+          * tools/air/mtlref) */
+         if (px >= c[0] - size / 2.0f && px < c[0] + size / 2.0f && py >= c[1] - size / 2.0f &&
+             py < c[1] + size / 2.0f)
+            memcpy(p->px[y][x], col, 4 * sizeof(float));
+      }
+}
+
+static int
+run_pixels_vertex(const char *dir)
+{
+   struct pix r;
+   if (!pix_open(&r, dir, "draw-vertex"))
+      return 1;
+   static struct dm_picture want;
+   static const float black[4] = { 0, 0, 0, 0 };
+   const struct dm_viewport whole = { 0, 0, DM_W, DM_H };
+   struct rwa_texture *t = pix_target(&r, DM_RGBA32F);
+   if (!t)
+      return 1;
+   const float grad = 1.0f / 512.0f;
+   struct rwa_render_shape shape;
+   pix_shape_vattr(&shape, DM_RGBA32F);
+   struct rwa_render *render = pix_render(&r, "m5a_vattr", "m5a_fcolor", &shape, "vertex-pipeline");
+
+   struct pix_vertex tri[3];
+   for (unsigned i = 0; i < 3; i++)
+      tri[i] = pix_v(pix_tri_win[i][0], pix_tri_win[i][1], pix_tri_col[i][0], pix_tri_col[i][1],
+                     pix_tri_col[i][2], pix_tri_col[i][3]);
+   /* the same corners the other way round, clockwise as seen */
+   const struct pix_vertex tricw[3] = { tri[0], tri[2], tri[1] };
+
+   if (render) {
+      /* 1: which corner has pixels: row 0 on top, column 0 on the left, in this triangle's
+       * shape, whatever the back end. A y flip or an x flip draws somewhere the model has none. */
+      if (pix_draw_mesh(&r, render, t, tri, 3, (struct rwa_draw){ .primitive = 3 }, "orient-asymmetric")) {
+         dm_clear(&want, black);
+         pix_model_tri(&want, &tri[0], &tri[1], &tri[2], &whole, dm_whole(), 0, 0, false);
+         /* [M5b: and its map whichever way it comes out, not only when it differs: this one case is
+          * where a person can see which corner has pixels] */
+         if (pix_judge(&r, t, DM_RGBA32F, "orient-asymmetric", &want, grad, false))
+            pix_map(&r, t, DM_RGBA32F, "orient-asymmetric", &want);
+      }
+
+      /* 2-13: the face: both windings of triangle, under each of the three cull modes and
+       * each of the two front windings. Drawn and culled are both judged, by the picture. */
+      static const char *const cn[] = { "none", "front", "back" };
+      static const char *const wn[] = { "cw", "ccw" };
+      for (unsigned tw = 0; tw < 2; tw++) {
+         const struct pix_vertex *m = tw ? tri : tricw;
+         for (unsigned cull = 0; cull < 3; cull++)
+            for (unsigned fw = 0; fw < 2; fw++) {
+               char name[64];
+               snprintf(name, sizeof(name), "orient-%stri-cull%s-front%s", wn[tw], cn[cull], wn[fw]);
+               if (!pix_draw_mesh(&r, render, t, m, 3,
+                                  (struct rwa_draw){ .primitive = 3, .cull_mode = cull,
+                                                     .front_winding = fw }, name))
+                  continue;
+               dm_clear(&want, black);
+               pix_model_tri(&want, &m[0], &m[1], &m[2], &whole, dm_whole(), cull, fw, false);
+               pix_judge(&r, t, DM_RGBA32F, name, &want, grad, r.gallium && cull != 0);
+            }
+      }
+
+      /* 14-17: a viewport with an origin, whole quads through it; and a scissor, without and
+       * with one. A strip of four covering clip space, so the picture is the rectangle, with
+       * a gradient to say it is the whole of clip space inside it. */
+      struct pix_vertex quad[4];
+      for (unsigned i = 0; i < 4; i++)
+         quad[i] = pix_v((i & 1) ? DM_W : 0, (i & 2) ? DM_H : 0, (i & 1) ? 1.0f : 0.0f,
+                         (i & 2) ? 1.0f : 0.0f, 0.5f, 1.0f);
+      static const struct {
+         const char *name;
+         float vp[4];
+         unsigned sc[4];
+         bool has_vp, has_sc;
+      } rects[] = {
+         { "viewport-origin", { 4, 2, 8, 8 }, { 0 }, true, false },
+         { "viewport-lower-right", { 8, 8, 8, 8 }, { 0 }, true, false },
+         { "viewport-wide", { 1, 11, 14, 4 }, { 0 }, true, false },
+         { "scissor", { 0 }, { 3, 5, 7, 4 }, false, true },
+         { "scissor-corner", { 0 }, { 0, 12, 4, 4 }, false, true },
+         { "viewport-and-scissor", { 2, 2, 12, 12 }, { 6, 0, 4, 16 }, true, true },
+      };
+      for (unsigned c = 0; c < COUNT_OF(rects); c++) {
+         struct dm_viewport vp = whole;
+         struct dm_rect sc = dm_whole();
+         if (rects[c].has_vp)
+            vp = (struct dm_viewport){ rects[c].vp[0], rects[c].vp[1], rects[c].vp[2], rects[c].vp[3] };
+         if (rects[c].has_sc)
+            sc = (struct dm_rect){ (int)rects[c].sc[0], (int)rects[c].sc[1],
+                                   (int)(rects[c].sc[0] + rects[c].sc[2]),
+                                   (int)(rects[c].sc[1] + rects[c].sc[3]) };
+         if (!pix_draw_mesh(&r, render, t, quad, 4,
+                            (struct rwa_draw){ .primitive = 4,
+                                               .viewport = rects[c].has_vp ? rects[c].vp : NULL,
+                                               .scissor = rects[c].has_sc ? rects[c].sc : NULL },
+                            rects[c].name))
+            continue;
+         dm_clear(&want, black);
+         pix_model_tri(&want, &quad[0], &quad[1], &quad[2], &vp, sc, 0, 0, true);
+         pix_model_tri(&want, &quad[2], &quad[1], &quad[3], &vp, sc, 0, 0, true);
+         pix_judge(&r, t, DM_RGBA32F, rects[c].name, &want, grad, r.gallium);
+      }
+
+      /* 18-19: triangle list and strip, in one colour per primitive being no help: the strip's
+       * four vertices are three triangles' worth of corners only if the second is read right */
+      {
+         struct pix_vertex s[5];
+         static const float at[5][2] = { { 1, 2 }, { 1, 13 }, { 7, 3 }, { 8, 14 }, { 15, 7 } };
+         for (unsigned i = 0; i < 5; i++)
+            s[i] = pix_v(at[i][0] + 0.0625f, at[i][1] + 0.0625f, (i % 3 == 0) ? 1.0f : 0.0f,
+                         (i % 3 == 1) ? 1.0f : 0.0f, (i % 3 == 2) ? 1.0f : 0.0f, 1.0f);
+         if (pix_draw_mesh(&r, render, t, s, 5, (struct rwa_draw){ .primitive = 4 }, "prim-trianglestrip")) {
+            dm_clear(&want, black);
+            /* a strip's triangles share edges with colours that agree along them */
+            for (unsigned i = 0; i + 2 < 5; i++)
+               pix_model_tri(&want, &s[i], &s[i + 1], &s[i + 2], &whole, dm_whole(), 0, 0, false);
+            pix_judge(&r, t, DM_RGBA32F, "prim-trianglestrip", &want, grad, false);
+         }
+         const struct pix_vertex lst[6] = { s[0], s[1], s[2], s[4], s[2], s[3] };
+         if (pix_draw_mesh(&r, render, t, lst, 6, (struct rwa_draw){ .primitive = 3 }, "prim-trianglelist")) {
+            dm_clear(&want, black);
+            pix_model_tri(&want, &lst[0], &lst[1], &lst[2], &whole, dm_whole(), 0, 0, false);
+            pix_model_tri(&want, &lst[3], &lst[4], &lst[5], &whole, dm_whole(), 0, 0, false);
+            pix_judge(&r, t, DM_RGBA32F, "prim-trianglelist", &want, grad, false);
+         }
+      }
+
+      /* 20-21: lines. Corners on whole pixels: a horizontal and a vertical through pixel
+       * centres, a diagonal through them, and a shallow one, which is the one that tells
+       * Bresenham from a one-pixel rectangle (pix_model_line). */
+      {
+         static const struct { float a[2], b[2], c[4]; } ls[4] = {
+            { { 2.0f, 2.5f }, { 11.0f, 2.5f }, { 1, 0, 0, 1 } },
+            { { 14.5f, 3.0f }, { 14.5f, 15.0f }, { 0, 1, 0, 1 } },
+            { { 2.0f, 5.0f }, { 10.0f, 13.0f }, { 0, 0, 1, 1 } },
+            { { 1.0f, 15.0f }, { 14.0f, 10.625f }, { 1, 1, 0, 1 } },
+         };
+         struct pix_vertex v[8];
+         for (unsigned i = 0; i < 4; i++) {
+            v[i * 2] = pix_v(ls[i].a[0], ls[i].a[1], ls[i].c[0], ls[i].c[1], ls[i].c[2], ls[i].c[3]);
+            v[i * 2 + 1] = pix_v(ls[i].b[0], ls[i].b[1], ls[i].c[0], ls[i].c[1], ls[i].c[2], ls[i].c[3]);
+         }
+         if (pix_draw_mesh(&r, render, t, v, 8, (struct rwa_draw){ .primitive = 1 }, "prim-linelist")) {
+            dm_clear(&want, black);
+            for (unsigned i = 0; i < 4; i++)
+               pix_model_line(&want, ls[i].a, ls[i].b, ls[i].c);
+            pix_judge(&r, t, DM_RGBA32F, "prim-linelist", &want, grad, false);
+         }
+         /* a line strip: an L and a tail, one colour, and the corner not drawn twice wrong */
+         static const float st[4][2] = { { 2, 3.5f }, { 12, 3.5f }, { 12.5f, 13 }, { 3, 13.5f } };
+         struct pix_vertex lv[4];
+         static const float one[4] = { 1, 0, 1, 1 };
+         for (unsigned i = 0; i < 4; i++)
+            lv[i] = pix_v(st[i][0], st[i][1], one[0], one[1], one[2], one[3]);
+         if (pix_draw_mesh(&r, render, t, lv, 4, (struct rwa_draw){ .primitive = 2 }, "prim-linestrip")) {
+            dm_clear(&want, black);
+            for (unsigned i = 0; i < 3; i++)
+               pix_model_line(&want, st[i], st[i + 1], one);
+            pix_judge(&r, t, DM_RGBA32F, "prim-linestrip", &want, grad, false);
+         }
+      }
+
+      /* 22: a real stencil test: the triangle replaces a reference into a stencil the clear
+       * left at 3, and then the whole attachment's gradient is drawn where the stencil equals
+       * it. The triangle is counter-clockwise, so under Metal's default winding (clockwise is
+       * the front) it is BACK-facing: the front and back references differ, so which face the
+       * back end thinks it is decides the picture. */
+      {
+         struct rwa_render_shape zshape;
+         pix_shape_vattr(&zshape, DM_RGBA32F);
+         zshape.depth_format = MTL_DEPTH32_FLOAT_STENCIL8;
+         zshape.stencil_format = MTL_DEPTH32_FLOAT_STENCIL8;
+         struct rwa_render *zr = pix_render(&r, "m5a_vattr", "m5a_fcolor", &zshape, "stencil-pipeline");
+         const struct rwa_texture_shape zts = {
+            .pixel_format = MTL_DEPTH32_FLOAT_STENCIL8, .type = MTL_TEXTURE_TYPE_2D,
+            .width = DM_W, .height = DM_H, .depth = 1, .array_length = 1, .mip_levels = 1,
+            .sample_count = 1, .usage = MTL_USAGE_RENDER_TARGET,
+         };
+         struct rwa_texture *zt = rwa_texture_create(r.device, &zts, r.why, sizeof(r.why));
+         /* The two faces' read masks differ, and nothing reads them under Always, because
+          * air_metal.c turns Gallium's second enable on only when the faces differ: with one
+          * state and two references, Gallium uses the front's reference for both. */
+         const struct rwa_depth_stencil_state write = {
+            .depth_compare_function = 7,
+            .front = { .compare_function = 7, .depth_stencil_pass_operation = 2,
+                       .read_mask = 0xff, .write_mask = 0xff },
+            .back = { .compare_function = 7, .depth_stencil_pass_operation = 2,
+                      .read_mask = 0x7f, .write_mask = 0xff },
+         };
+         const struct rwa_depth_stencil_state test = {
+            .depth_compare_function = 7,
+            .front = { .compare_function = 2, .read_mask = 0xff, .write_mask = 0 },
+            .back = { .compare_function = 2, .read_mask = 0xff, .write_mask = 0 },
+         };
+         struct rwa_depth_stencil *ws = rwa_depth_stencil_create(r.device, &write, r.why, sizeof(r.why));
+         struct rwa_depth_stencil *ts = rwa_depth_stencil_create(r.device, &test, r.why, sizeof(r.why));
+         if (zr && zt && ws && ts) {
+            static const float zero = 1.0f;
+            static const unsigned three = 3;
+            for (unsigned pass = 0; pass < 2; pass++) {
+            /* first with one reference for both faces, which the face cannot change; then with
+             * two, which only the right face passes */
+            const char *sname = pass ? "stencil-backface-reference" : "stencil-reference";
+            bool ok = pix_draw_mesh(&r, zr, t, tri, 3,
+                                    (struct rwa_draw){ .primitive = 3, .depth = zt,
+                                                       .clear_depth = &zero, .clear_stencil = &three,
+                                                       .depth_stencil = ws,
+                                                       .stencil_reference = { pass ? 0x11 : 0x22, 0x22 } },
+                                    "stencil-write");
+            ok = ok && pix_draw_mesh(&r, zr, t, quad, 4,
+                                     (struct rwa_draw){ .primitive = 4, .depth = zt,
+                                                        .depth_stencil = ts,
+                                                        .stencil_reference = { 0x22, 0x22 } },
+                                     "stencil-test");
+            if (ok) {
+               /* the second draw clears colour: only the stencil says where it lands. The pixels
+                * the triangle covered hold 0x22, the rest 3. The strip's second triangle is the
+                * opposite winding of the first, so both reference values are 0x22 there. */
+               dm_clear(&want, black);
+               static struct dm_picture mask;
+               dm_clear(&mask, black);
+               const float mark[3][4] = { { 1, 1, 1, 1 }, { 1, 1, 1, 1 }, { 1, 1, 1, 1 } };
+               dm_triangle(&mask, pix_tri_win, mark, dm_whole(), false);
+               static struct dm_picture full;
+               dm_clear(&full, black);
+               pix_model_tri(&full, &quad[0], &quad[1], &quad[2], &whole, dm_whole(), 0, 0, true);
+               pix_model_tri(&full, &quad[2], &quad[1], &quad[3], &whole, dm_whole(), 0, 0, true);
+               for (unsigned y = 0; y < DM_H; y++)
+                  for (unsigned x = 0; x < DM_W; x++) {
+                     want.care[y][x] = mask.care[y][x];
+                     if (mask.px[y][x][3] > 0.5f)
+                        memcpy(want.px[y][x], full.px[y][x], sizeof(want.px[y][x]));
+                  }
+               pix_judge(&r, t, DM_RGBA32F, sname, &want, grad, false);
+            }
+            }
+         } else if (!zt || !ws || !ts) {
+            dm_refused(r.backend, "stencil-backface-reference", r.why);
+            r.refused++;
+         }
+         rwa_depth_stencil_destroy(ws);
+         rwa_depth_stencil_destroy(ts);
+         rwa_texture_destroy(zt);
+         rwa_render_destroy(zr);
+      }
+
+      /* 23: Load keeps what the pass before it drew: a checkerboard, then a triangle over it
+       * with no clear. Every pixel outside the triangle must still be its square's. */
+      {
+         struct rwa_render_shape cshape = {
+            .color_format = { DM_RGBA32F }, .color_count = 1, .sample_count = 1,
+         };
+         struct rwa_render *check = pix_render(&r, NULL, "m5a_fcheck", &cshape, "pass-load");
+         if (check) {
+            struct rwa_texture *color[1] = { t };
+            const struct rwa_draw cd = {
+               .color = color, .color_count = 1, .clear_color = black, .primitive = 4,
+               .vertex_count = 4,
+            };
+            static const float nothing[1][4] = { { 0 } };
+            if (rwa_render_draw(check, &cd, r.why, sizeof(r.why)) != 0) {
+               pix_draw_failed(&r, "pass-load");
+            } else if (pix_draw_mesh(&r, render, t, tri, 3,
+                                     (struct rwa_draw){ .primitive = 3, .color_clears = nothing,
+                                                        .color_clear_mask = 0,
+                                                        .clear_color = NULL }, "pass-load")) {
+               dm_clear(&want, black);
+               for (unsigned y = 0; y < DM_H; y++)
+                  for (unsigned x = 0; x < DM_W; x++)
+                     dm_check(x, y, want.px[y][x]);
+               pix_model_tri(&want, &tri[0], &tri[1], &tri[2], &whole, dm_whole(), 0, 0, false);
+               /* the Gallium library reads no color_clears: it keeps the attachment on its own
+                * NULL clear_color, which pix_draw_mesh left NULL by asking for color_clears */
+               pix_judge(&r, t, DM_RGBA32F, "pass-load", &want, grad, false);
+            }
+            rwa_render_destroy(check);
+         }
+      }
+
+      /* 24: a clear per attachment, which one colour for all of them could not say: attachment
+       * 0 clears to one colour, attachment 1 keeps what the destination fill put there. */
+      {
+         struct rwa_render_shape mshape = {
+            .color_format = { DM_RGBA32F, DM_RGBA32F }, .color_count = 2, .sample_count = 1,
+            .color_blend_count = 2,
+         };
+         const struct dm_blend keep = { 0, 0, 0, 1, 0, 1, 0, 0 };
+         pix_shape_blend(&mshape.color_blend[0], &keep);
+         pix_shape_blend(&mshape.color_blend[1], &keep);
+         struct rwa_texture *t2 = pix_target(&r, DM_RGBA32F);
+         struct rwa_render *m = pix_render(&r, NULL, "m5a_fmrt", &mshape, "pass-clear-per-attachment");
+         if (m && t2 && pix_fill_dst(&r, t2, DM_RGBA32F)) {
+            static const float clears[2][4] = { { 0.25f, 0.5f, 0.75f, 1.0f }, { 0 } };
+            struct rwa_texture *color[2] = { t, t2 };
+            const struct rwa_draw d = {
+               .color = color, .color_count = 2, .primitive = 4, .vertex_count = 4,
+               .color_clears = clears, .color_clear_mask = 1,
+            };
+            if (rwa_render_draw(m, &d, r.why, sizeof(r.why)) != 0) {
+               pix_draw_failed(&r, "pass-clear-per-attachment");
+            } else {
+               /* both masks are None, so what is left is the load actions alone */
+               dm_clear(&want, clears[0]);
+               pix_judge(&r, t, DM_RGBA32F, "pass-clear-attachment0", &want, 0.0f, r.gallium);
+               for (unsigned y = 0; y < DM_H; y++)
+                  for (unsigned x = 0; x < DM_W; x++)
+                     dm_dst(x, y, want.px[y][x]);
+               pix_judge(&r, t2, DM_RGBA32F, "pass-keep-attachment1", &want, 0.0f, r.gallium);
+            }
+         }
+         rwa_render_destroy(m);
+         rwa_texture_destroy(t2);
+      }
+      rwa_render_destroy(render);
+   }
+
+   /* 25: points, with the size from the shader, each its own colour, at pixel centres: 1, 3
+    * and 5 pixels. On Gallium the rasterizer state never turns the shader's size on
+    * (air_metal.c: point_size_per_vertex 0, point_size 0), so this is what it shows, if it
+    * shows anything: the size-0 clamp on real hardware, softpipe's own idea here. */
+   {
+      struct rwa_render_shape pshape = {
+         .color_format = { DM_RGBA32F }, .color_count = 1, .sample_count = 1,
+      };
+      pshape.vertex_attribute[0] = (struct rwa_vertex_attribute){ MTL_VF_FLOAT4, 0, 0 };
+      pshape.vertex_attribute[1] = (struct rwa_vertex_attribute){ MTL_VF_FLOAT4, 16, 0 };
+      pshape.vertex_attribute[2] = (struct rwa_vertex_attribute){ 28 /* Float */, 32, 0 };
+      pshape.vertex_layout[0] = (struct rwa_vertex_layout){ 48, MTL_STEP_PER_VERTEX, 1 };
+      struct rwa_render *points = pix_render(&r, "m5a_vpoint", "m5a_fcolor", &pshape, "prim-points");
+      if (points) {
+         struct { struct pix_vertex v; float size, pad[3]; } pv[3];
+         static const float at[3][2] = { { 2.5f, 2.5f }, { 7.5f, 12.5f }, { 12.5f, 5.5f } };
+         static const float size[3] = { 1.0f, 3.0f, 5.0f };
+         static const float col[3][4] = { { 1, 0, 0, 1 }, { 0, 1, 0, 1 }, { 0, 0, 1, 1 } };
+         for (unsigned i = 0; i < 3; i++) {
+            pv[i].v = pix_v(at[i][0], at[i][1], col[i][0], col[i][1], col[i][2], col[i][3]);
+            pv[i].size = size[i];
+            pv[i].pad[0] = pv[i].pad[1] = pv[i].pad[2] = 0.0f;
+         }
+         struct rwa_buffer *vb = pix_buffer(&r, pv, sizeof(pv));
+         if (vb) {
+            struct rwa_texture *color[1] = { t };
+            struct rwa_vertex_stream streams[1] = { { vb, 0 } };
+            const struct rwa_draw d = {
+               .color = color, .color_count = 1, .clear_color = black, .primitive = 0,
+               .vertex_count = 3, .vertex_streams = streams, .vertex_stream_count = 1,
+            };
+            if (rwa_render_draw(points, &d, r.why, sizeof(r.why)) != 0) {
+               pix_draw_failed(&r, "prim-points");
+            } else {
+               dm_clear(&want, black);
+               for (unsigned i = 0; i < 3; i++)
+                  pix_model_point(&want, at[i], size[i], col[i]);
+               pix_judge(&r, t, DM_RGBA32F, "prim-points", &want, grad, false);
+            }
+            rwa_buffer_destroy(vb);
+         }
+         rwa_render_destroy(points);
+      }
+   }
+   rwa_texture_destroy(t);
+   return pix_close(&r);
+}
+
+
+/* ---- M5b: --textures --pixels, --pixel-formats --pixels, --blit --pixels ---- */
+
+/*
+ * What those three modes were, and what this adds. --textures asks a library what each function
+ * declares and draws nothing; --pixel-formats draws one 16-bit word sixteen times, a word with one
+ * field set of Metal's four packed formats, to measure the table; --blit makes each of the six
+ * calls once on one level of one RGBA8 texture and compares bytes. Each keeps that form. The form
+ * here, one more to each like --draw-blend's:
+ *
+ *   air_metal_test [--gpu] --textures --pixels DIR       levels, slices, every texture type, the
+ *                                                        sampler's whole state, views, a pass into
+ *                                                        a level or slice with its neighbours read
+ *   air_metal_test [--gpu] --pixel-formats --pixels DIR  every format: its bytes in and out, a
+ *                                                        read, a sample, a render, by channel
+ *   air_metal_test [--gpu] --blit --pixels DIR           per level and per slice, regions at a
+ *                                                        non-zero origin, generate_mipmaps
+ *
+ * One result line per case (draw_model.h), against a picture or bytes computed here and in
+ * tex_model.h: every texel says where it is (tm_texel) and every attachment is a function of its
+ * pixel. Gallium's library has none of views, border colours, a pass into a level, or the formats
+ * it refuses; the first two read as "gallium-lacks" or "refused" and what it drew is in the digest.
+ * DIR holds tools/air/m5b_*.ll and m5a_fsrc.ll, assembled.
+ */
+#include "tex_model.h"
+
+struct pix_u {
+   float u0[4], u1[4], u2[4];
+   float lod, bias, ref, ref_base;
+   uint32_t index, select, pad[2];
+};
+
+enum {
+   TY_1D = 0, TY_1DA = 1, TY_2D = 2, TY_2DA = 3, TY_2DMS = 4, TY_CUBE = 5, TY_CUBEA = 6, TY_3D = 7,
+   TY_2DMSA = 8,
+   FMT_RGBA8 = 70,
+   USE_R = 1, USE_W = 2, USE_RT = 4, USE_FV = 16,
+};
+
+static struct rwa_texture *(*view_create)(struct rwa_texture *,
+                                          const struct rwa_texture_view_shape *, char *, size_t);
+
+static struct rwa_texture *
+tx_make(struct pix *r, unsigned type, unsigned fmt, unsigned w, unsigned h, unsigned d,
+        unsigned slices, unsigned mips, unsigned samples, unsigned usage, const char *name)
+{
+   const struct rwa_texture_shape ts = {
+      .pixel_format = fmt, .type = type, .width = w, .height = h, .depth = d,
+      .array_length = slices, .mip_levels = mips, .sample_count = samples, .usage = usage,
+   };
+   r->why[0] = '\0';
+   struct rwa_texture *t = rwa_texture_create(r->device, &ts, r->why, sizeof(r->why));
+   if (!t) {
+      dm_refused(r->backend, name, r->why);
+      r->refused++;
+   }
+   return t;
+}
+
+static struct rwa_texture *
+tx_view(struct pix *r, struct rwa_texture *parent, unsigned fmt, unsigned type, unsigned level,
+        unsigned nlevels, unsigned slice, unsigned nslices, const unsigned swizzle[4],
+        const char *name)
+{
+   if (!view_create) {
+      dm_refused(r->backend, name, "this library has no rwa_texture_view_create");
+      r->lacks++;
+      return NULL;
+   }
+   struct rwa_texture_view_shape vs = {
+      .pixel_format = fmt, .type = type, .base_level = level, .level_count = nlevels,
+      .base_slice = slice, .slice_count = nslices,
+   };
+   if (swizzle)
+      memcpy(vs.swizzle, swizzle, sizeof(vs.swizzle));
+   r->why[0] = '\0';
+   struct rwa_texture *t = view_create(parent, &vs, r->why, sizeof(r->why));
+   if (!t) {
+      dm_refused(r->backend, name, r->why);
+      r->refused++;
+   }
+   return t;
+}
+
+static struct rwa_sampler *
+tx_sampler(struct pix *r, unsigned as, unsigned at, unsigned ar, unsigned minf, unsigned magf,
+           unsigned mip, unsigned cmp, unsigned aniso, float lmin, float lmax, unsigned border,
+           const char *name)
+{
+   const struct rwa_sampler_state st = {
+      .address = { as, at, ar }, .min_filter = minf, .mag_filter = magf, .mip_filter = mip,
+      .compare_function = cmp, .max_anisotropy = aniso, .normalized_coordinates = 1,
+      .lod_min = lmin, .lod_max = lmax, .border_color = border,
+   };
+   r->why[0] = '\0';
+   struct rwa_sampler *s = rwa_sampler_create(r->device, &st, r->why, sizeof(r->why));
+   if (!s) {
+      dm_refused(r->backend, name, r->why);
+      r->refused++;
+   }
+   return s;
+}
+
+/* The default: nearest in all three, clamped: the texel. */
+static struct rwa_sampler *
+tx_nearest(struct pix *r)
+{
+   return tx_sampler(r, TM_EDGE, TM_EDGE, TM_EDGE, 0, 0, 1, 0, 1, 0.0f, 1000.0f, 0, "nearest");
+}
+
+/* One pipeline per module and attachment format, kept for the process: most cases share one. */
+static struct rwa_render *
+tx_pipeline(struct pix *r, const char *fs, unsigned fmt, unsigned samples, const char *name)
+{
+   static struct { char fs[32]; unsigned fmt, samples; struct rwa_render *render; } kept[96];
+   for (unsigned i = 0; i < COUNT_OF(kept); i++) {
+      if (!kept[i].render) {
+         const struct rwa_render_shape shape = {
+            .color_format = { fmt }, .color_count = 1, .sample_count = samples,
+         };
+         struct rwa_render *rn = pix_render(r, NULL, fs, &shape, name);
+         if (rn) {
+            snprintf(kept[i].fs, sizeof(kept[i].fs), "%s", fs);
+            kept[i].fmt = fmt;
+            kept[i].samples = samples;
+            kept[i].render = rn;
+         }
+         return rn;
+      }
+      if (!strcmp(kept[i].fs, fs) && kept[i].fmt == fmt && kept[i].samples == samples)
+         return kept[i].render;
+   }
+   return pix_render(r, NULL, fs, &(struct rwa_render_shape){ .color_format = { fmt },
+                     .color_count = 1, .sample_count = samples }, name);
+}
+
+/* A probe drawn over the whole 16x16 attachment `t`, with this texture and sampler and buffer. */
+static bool
+tx_draw(struct pix *r, struct rwa_texture *t, unsigned fmt, const char *fs,
+        struct rwa_texture *tex, struct rwa_sampler *smp, const struct pix_u *u, const char *name)
+{
+   struct rwa_render *render = tx_pipeline(r, fs, fmt, 1, name);
+   if (!render)
+      return false;
+   struct rwa_buffer *ub = u ? pix_buffer(r, u, sizeof(*u)) : NULL;
+   struct rwa_texture *color[1] = { t };
+   struct rwa_buffer *bufs[1] = { ub };
+   struct rwa_texture *texs[1] = { tex };
+   struct rwa_sampler *sams[1] = { smp };
+   const struct rwa_draw draw = {
+      .color = color, .color_count = 1, .primitive = 4, .vertex_count = 4,
+      .fragment = {
+         .buffers = bufs, .buffer_count = ub ? 1 : 0,
+         .textures = texs, .texture_count = tex ? 1 : 0,
+         .samplers = sams, .sampler_count = smp ? 1 : 0,
+      },
+   };
+   r->why[0] = '\0';
+   int rc = rwa_render_draw(render, &draw, r->why, sizeof(r->why));
+   if (ub)
+      rwa_buffer_destroy(ub);
+   if (rc != 0) {
+      pix_draw_failed(r, name);
+      return false;
+   }
+   return true;
+}
+
+/* The plain coordinate: pos.xy * scale + offset. */
+static struct pix_u
+tx_u(float sx, float sy, float ox, float oy, float lod)
+{
+   return (struct pix_u){ .u0 = { sx, sy, ox, oy }, .lod = lod };
+}
+
+/* Bytes in, and a line for what came back: exact. */
+static bool
+tx_put(struct pix *r, struct rwa_texture *t, unsigned level, unsigned slice, const void *bytes,
+       const char *name)
+{
+   r->why[0] = '\0';
+   if (rwa_texture_write(t, level, slice, NULL, NULL, bytes, 0, r->why, sizeof(r->why)) != 0) {
+      dm_refused(r->backend, name, r->why);
+      r->wrong++;
+      return false;
+   }
+   return true;
+}
+
+static void
+tx_check_level(struct pix *r, struct rwa_texture *t, unsigned level, unsigned slice, unsigned w,
+               unsigned h, const void *want, unsigned texel, const char *name, bool lacks)
+{
+   static uint8_t got[64 * 64 * 16 * 2];
+   const unsigned size[3] = { w, h, 1 };
+   const unsigned origin[3] = { 0, 0, 0 };
+   r->why[0] = '\0';
+   if (rwa_texture_read(t, level, slice, origin, size, got, 0, r->why, sizeof(r->why)) != 0) {
+      dm_refused(r->backend, name, r->why);
+      r->wrong++;
+      return;
+   }
+   bool ok = tm_bytes(r->backend, name, got, want, w * h, texel, w, lacks);
+   if (ok)
+      r->right++;
+   else if (lacks)
+      r->lacks++;
+   else
+      r->wrong++;
+}
+
+/* A picture of tm_texelf at (level, slice) over the attachment, the texel at (x, y) * size / 16. */
+static void
+tx_want_texels(struct dm_picture *want, unsigned level, unsigned slice, unsigned w, unsigned h)
+{
+   dm_clear(want, (const float[4]){ 0, 0, 0, 0 });
+   for (unsigned y = 0; y < DM_H; y++)
+      for (unsigned x = 0; x < DM_W; x++)
+         tm_texelf(level, slice, x * w / DM_W, y * h / DM_H, want->px[y][x]);
+}
+
+#define TX_EXACT (1.0f / 2048.0f)   /* k/255 in a float: no rounding worth the name */
+#define TX_FILTERED (1.0f / 255.0f + 1.0f / 2048.0f)   /* a filter's own fixed point: one step */
+
+/* ---- levels, slices, every type ---- */
+
+static void
+tx_levels_and_types(struct pix *r, struct rwa_texture *t16, struct rwa_sampler *near)
+{
+   static struct dm_picture want;
+   static uint8_t mem[64 * 64 * 4 * 8];
+   char name[64];
+
+   /* 2D: five levels, each written, read back and sampled */
+   struct rwa_texture *t = tx_make(r, TY_2D, FMT_RGBA8, 16, 16, 1, 1, 5, 1, USE_R | USE_RT, "tex-2d");
+   if (t) {
+      for (unsigned l = 0; l < 5; l++) {
+         unsigned w = 16 >> l;
+         snprintf(name, sizeof(name), "tex-2d-L%u-write", l);
+         tm_fill(mem, l, 0, w, w);
+         tx_put(r, t, l, 0, mem, name);
+      }
+      for (unsigned l = 0; l < 5; l++) {
+         unsigned w = 16 >> l;
+         tm_fill(mem, l, 0, w, w);
+         snprintf(name, sizeof(name), "tex-2d-L%u-read", l);
+         tx_check_level(r, t, l, 0, w, w, mem, 4, name, false);
+         snprintf(name, sizeof(name), "tex-2d-L%u-sample", l);
+         const struct pix_u u = tx_u(1.0f / 16, 1.0f / 16, 0, 0, (float)l);
+         if (tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, near, &u, name)) {
+            tx_want_texels(&want, l, 0, w, w);
+            pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+         }
+      }
+      /* a region at a non-zero origin of level 1, with a stride: the rest of the level as it was */
+      {
+         uint8_t region[3 * 2 * 8];
+         memset(region, 0xff, sizeof(region));
+         for (unsigned y = 0; y < 2; y++)
+            for (unsigned x = 0; x < 3; x++)
+               tm_texel(9, 9, x, y, region + y * 24 + x * 4);
+         const unsigned o[3] = { 2, 3, 0 }, s[3] = { 3, 2, 1 };
+         r->why[0] = '\0';
+         if (rwa_texture_write(t, 1, 0, o, s, region, 24, r->why, sizeof(r->why)) != 0) {
+            dm_refused(r->backend, "tex-2d-L1-region", r->why);
+            r->wrong++;
+         } else {
+            tm_fill(mem, 1, 0, 8, 8);
+            for (unsigned y = 0; y < 2; y++)
+               for (unsigned x = 0; x < 3; x++)
+                  tm_texel(9, 9, x, y, mem + ((size_t)(y + 3) * 8 + (x + 2)) * 4);
+            tx_check_level(r, t, 1, 0, 8, 8, mem, 4, "tex-2d-L1-region", false);
+         }
+      }
+      rwa_texture_destroy(t);
+   }
+
+   /* 2DArray: four slices of three levels */
+   t = tx_make(r, TY_2DA, FMT_RGBA8, 16, 16, 1, 4, 3, 1, USE_R, "tex-2darray");
+   if (t) {
+      for (unsigned l = 0; l < 3; l++)
+         for (unsigned s = 0; s < 4; s++) {
+            tm_fill(mem, l, s, 16 >> l, 16 >> l);
+            tx_put(r, t, l, s, mem, "tex-2darray-write");
+         }
+      for (unsigned l = 0; l < 3; l++)
+         for (unsigned s = 0; s < 4; s++) {
+            unsigned w = 16 >> l;
+            tm_fill(mem, l, s, w, w);
+            snprintf(name, sizeof(name), "tex-2darray-L%u-S%u-read", l, s);
+            tx_check_level(r, t, l, s, w, w, mem, 4, name, false);
+            snprintf(name, sizeof(name), "tex-2darray-L%u-S%u-sample", l, s);
+            struct pix_u u = tx_u(1.0f / 16, 1.0f / 16, 0, 0, (float)l);
+            u.index = s;
+            if (tx_draw(r, t16, DM_RGBA32F, "m5b_f2darr", t, near, &u, name)) {
+               tx_want_texels(&want, l, s, w, w);
+               pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+            }
+         }
+      rwa_texture_destroy(t);
+   }
+
+   /* 1D and 1DArray: every row of the attachment reads by x alone. One level: real Metal aborts on a
+    * 1D texture with more, and MSL has no texture1d at a level (tools/air/mtlref). */
+   t = tx_make(r, TY_1D, FMT_RGBA8, 16, 1, 1, 1, 1, 1, USE_R, "tex-1d");
+   if (t) {
+      for (unsigned l = 0; l < 1; l++) {
+         tm_fill(mem, l, 0, 16 >> l, 1);
+         tx_put(r, t, l, 0, mem, "tex-1d-write");
+         snprintf(name, sizeof(name), "tex-1d-L%u-read", l);
+         tx_check_level(r, t, l, 0, 16 >> l, 1, mem, 4, name, false);
+         snprintf(name, sizeof(name), "tex-1d-L%u-sample", l);
+         const struct pix_u u = tx_u(1.0f / 16, 0, 0, 0, (float)l);
+         if (tx_draw(r, t16, DM_RGBA32F, "m5b_f1d", t, near, &u, name)) {
+            dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+            for (unsigned y = 0; y < DM_H; y++)
+               for (unsigned x = 0; x < DM_W; x++)
+                  tm_texelf(l, 0, x >> l, 0, want.px[y][x]);
+            pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+         }
+      }
+      rwa_texture_destroy(t);
+   }
+   t = tx_make(r, TY_1DA, FMT_RGBA8, 16, 1, 1, 3, 1, 1, USE_R, "tex-1darray");
+   if (t) {
+      for (unsigned s = 0; s < 3; s++) {
+         tm_fill(mem, 0, s, 16, 1);
+         tx_put(r, t, 0, s, mem, "tex-1darray-write");
+      }
+      for (unsigned s = 0; s < 3; s++) {
+         tm_fill(mem, 0, s, 16, 1);
+         snprintf(name, sizeof(name), "tex-1darray-S%u-read", s);
+         tx_check_level(r, t, 0, s, 16, 1, mem, 4, name, false);
+         snprintf(name, sizeof(name), "tex-1darray-S%u-sample", s);
+         struct pix_u u = tx_u(1.0f / 16, 0, 0, 0, 0.0f);
+         u.index = s;
+         if (tx_draw(r, t16, DM_RGBA32F, "m5b_f1darr", t, near, &u, name)) {
+            dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+            for (unsigned y = 0; y < DM_H; y++)
+               for (unsigned x = 0; x < DM_W; x++)
+                  tm_texelf(0, s, x, 0, want.px[y][x]);
+            pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+         }
+      }
+      rwa_texture_destroy(t);
+   }
+
+   /* Cube and CubeArray: each face its own texels, each axis direction landing on its face
+    * texel for texel (tm_cube_axes): the seams are not in it, every centre is inside a face */
+   t = tx_make(r, TY_CUBE, FMT_RGBA8, 16, 16, 1, 1, 2, 1, USE_R, "tex-cube");
+   if (t) {
+      for (unsigned f = 0; f < 6; f++)
+         for (unsigned l = 0; l < 2; l++) {
+            tm_fill(mem, l, f, 16 >> l, 16 >> l);
+            tx_put(r, t, l, f, mem, "tex-cube-write");
+         }
+      for (unsigned f = 0; f < 6; f++)
+         for (unsigned l = 0; l < 2; l++) {
+            unsigned w = 16 >> l;
+            tm_fill(mem, l, f, w, w);
+            snprintf(name, sizeof(name), "tex-cube-F%u-L%u-read", f, l);
+            tx_check_level(r, t, l, f, w, w, mem, 4, name, false);
+            snprintf(name, sizeof(name), "tex-cube-F%u-L%u-sample", f, l);
+            struct pix_u u = { .lod = (float)l };
+            tm_cube_axes(f, u.u0, u.u1, u.u2);
+            if (tx_draw(r, t16, DM_RGBA32F, "m5b_fcube", t, near, &u, name)) {
+               tx_want_texels(&want, l, f, w, w);
+               pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+            }
+         }
+      rwa_texture_destroy(t);
+   }
+   t = tx_make(r, TY_CUBEA, FMT_RGBA8, 16, 16, 1, 2, 1, 1, USE_R, "tex-cubearray");
+   if (t) {
+      for (unsigned s = 0; s < 12; s++) {
+         tm_fill(mem, 0, s, 16, 16);
+         tx_put(r, t, 0, s, mem, "tex-cubearray-write");
+      }
+      for (unsigned c = 0; c < 2; c++)
+         for (unsigned f = 0; f < 6; f += 5) {
+            snprintf(name, sizeof(name), "tex-cubearray-C%u-F%u-sample", c, f);
+            struct pix_u u = { .index = c };
+            tm_cube_axes(f, u.u0, u.u1, u.u2);
+            if (tx_draw(r, t16, DM_RGBA32F, "m5b_fcubearr", t, near, &u, name)) {
+               tx_want_texels(&want, 0, c * 6 + f, 16, 16);
+               pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+            }
+         }
+      rwa_texture_destroy(t);
+   }
+
+   /* 3D: three levels, whose depth halves too. A slice of tm_texel is a z here. */
+   t = tx_make(r, TY_3D, FMT_RGBA8, 16, 16, 8, 1, 3, 1, USE_R, "tex-3d");
+   if (t) {
+      for (unsigned l = 0; l < 3; l++) {
+         unsigned w = 16 >> l, d = 8 >> l;
+         for (unsigned z = 0; z < d; z++)
+            tm_fill(mem + (size_t)z * w * w * 4, l, z, w, w);
+         tx_put(r, t, l, 0, mem, "tex-3d-write");
+         for (unsigned z = 0; z < d; z += d > 2 ? 3 : 1) {
+            const unsigned o[3] = { 0, 0, z }, s[3] = { w, w, 1 };
+            static uint8_t got[16 * 16 * 4];
+            snprintf(name, sizeof(name), "tex-3d-L%u-Z%u-read", l, z);
+            r->why[0] = '\0';
+            if (rwa_texture_read(t, l, 0, o, s, got, 0, r->why, sizeof(r->why)) != 0) {
+               dm_refused(r->backend, name, r->why);
+               r->wrong++;
+               continue;
+            }
+            if (tm_bytes(r->backend, name, got, mem + (size_t)z * w * w * 4, w * w, 4, w, false))
+               r->right++;
+            else
+               r->wrong++;
+            snprintf(name, sizeof(name), "tex-3d-L%u-Z%u-sample", l, z);
+            struct pix_u u = tx_u(1.0f / 16, 1.0f / 16, 0, 0, (float)l);
+            u.u1[0] = ((float)z + 0.5f) / (float)d;
+            if (tx_draw(r, t16, DM_RGBA32F, "m5b_f3d", t, near, &u, name)) {
+               tx_want_texels(&want, l, z, w, w);
+               pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+            }
+         }
+      }
+      rwa_texture_destroy(t);
+   }
+}
+
+/* ---- the sampler ---- */
+
+static void
+tx_want_address(struct dm_picture *want, unsigned as, unsigned at, float scale, float off,
+                const float border[4])
+{
+   for (unsigned y = 0; y < DM_H; y++) {
+      for (unsigned x = 0; x < DM_W; x++) {
+         float u = ((float)x + 0.5f) * scale + off, v = ((float)y + 0.5f) * scale + off;
+         int i = tm_wrap(as, u, 16), j = tm_wrap(at, v, 16);
+         want->care[y][x] = 1;
+         if (i < 0 || j < 0)
+            memcpy(want->px[y][x], border, 4 * sizeof(float));
+         else
+            tm_texelf(0, 0, (unsigned)i, (unsigned)j, want->px[y][x]);
+      }
+   }
+}
+
+static void
+tx_samplers(struct pix *r, struct rwa_texture *t16, struct rwa_sampler *near)
+{
+   static struct dm_picture want;
+   static uint8_t mem[16 * 16 * 4];
+   char name[64];
+   static const char *const mode_name[6] = {
+      "edge", "mirroredge", "repeat", "mirror", "zero", "border",
+   };
+   /* levels that differ, the texels saying which */
+   struct rwa_texture *t = tx_make(r, TY_2D, FMT_RGBA8, 16, 16, 1, 1, 5, 1, USE_R, "sampler-tex");
+   if (!t)
+      return;
+   for (unsigned l = 0; l < 5; l++) {
+      tm_fill(mem, l, 0, 16 >> l, 16 >> l);
+      tx_put(r, t, l, 0, mem, "sampler-tex-write");
+   }
+   /* ADDRESS MODES, the coordinate going outside [0, 1] both ways: u in (-1, 2) across the
+    * attachment, at no texel's edge (three times a half-odd over sixteen) */
+   const float scale = 3.0f / 16.0f, off = -1.0f;
+   const float zero[4] = { 0, 0, 0, 0 };
+   for (unsigned m = 0; m < 6; m++) {
+      snprintf(name, sizeof(name), "sampler-addr-%s", mode_name[m]);
+      struct rwa_sampler *s = tx_sampler(r, m, m, m, 0, 0, 1, 0, 1, 0, 1000, 0, name);
+      const struct pix_u u = tx_u(scale, scale, off, off, 0.0f);
+      if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, s, &u, name)) {
+         tx_want_address(&want, m, m, scale, off, zero);
+         pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+      }
+      rwa_sampler_destroy(s);
+   }
+   /* two axes that differ, so s and t cannot be exchanged */
+   {
+      struct rwa_sampler *s = tx_sampler(r, TM_REPEAT, TM_MIRROR, TM_EDGE, 0, 0, 1, 0, 1, 0, 1000,
+                                         0, "sampler-addr-repeat-mirror");
+      const struct pix_u u = tx_u(scale, scale, off, off, 0.0f);
+      if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, s, &u, "sampler-addr-repeat-mirror")) {
+         tx_want_address(&want, TM_REPEAT, TM_MIRROR, scale, off, zero);
+         pix_judge(r, t16, DM_RGBA32F, "sampler-addr-repeat-mirror", &want, TX_EXACT, false);
+      }
+      rwa_sampler_destroy(s);
+   }
+   /* BORDER COLOURS, Apple's three; the Gallium library reads transparent black for all */
+   {
+      static const float colours[3][4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 1 }, { 1, 1, 1, 1 } };
+      static const char *const cn[3] = { "transparent", "black", "white" };
+      for (unsigned b = 0; b < 3; b++) {
+         snprintf(name, sizeof(name), "sampler-border-%s", cn[b]);
+         struct rwa_sampler *s = tx_sampler(r, TM_BORDER, TM_BORDER, TM_BORDER, 0, 0, 1, 0, 1, 0,
+                                            1000, b, name);
+         const struct pix_u u = tx_u(scale, scale, off, off, 0.0f);
+         if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, s, &u, name)) {
+            tx_want_address(&want, TM_BORDER, TM_BORDER, scale, off, colours[b]);
+            pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, r->gallium && b != 0);
+         }
+         rwa_sampler_destroy(s);
+      }
+      /* and one Vulkan cannot have: two colours in a sampler. A refusal is the right line. */
+      r->why[0] = '\0';
+      const struct rwa_sampler_state two = {
+         .address = { TM_ZERO, TM_BORDER, TM_EDGE }, .max_anisotropy = 1,
+         .normalized_coordinates = 1, .lod_max = 1000, .border_color = 2,
+      };
+      struct rwa_sampler *s = rwa_sampler_create(r->device, &two, r->why, sizeof(r->why));
+      printf("drvtest: draw-result %s sampler-border-two %s: %s\n", r->backend,
+             s ? "made" : "refused", s ? "" : r->why);
+      r->refused += s ? 0 : 1;
+      if (s)
+         rwa_sampler_destroy(s);
+   }
+   /* clamp_to_zero on a format with no alpha, in Apple's own words: "opaque zero (0,0,0,1) for
+    * images without an alpha channel" */
+   {
+      struct rwa_texture *t8 = tx_make(r, TY_2D, 10, 16, 16, 1, 1, 1, 1, USE_R, "sampler-zero-r8");
+      struct rwa_sampler *s = tx_sampler(r, TM_ZERO, TM_ZERO, TM_ZERO, 0, 0, 1, 0, 1, 0, 1000, 0,
+                                         "sampler-zero-r8");
+      if (t8 && s) {
+         static uint8_t r8[16 * 16];
+         for (unsigned i = 0; i < 256; i++)
+            r8[i] = (uint8_t)i;
+         tx_put(r, t8, 0, 0, r8, "sampler-zero-r8");
+         const struct pix_u u = tx_u(scale, scale, off, off, 0.0f);
+         if (tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t8, s, &u, "sampler-zero-r8")) {
+            dm_clear(&want, (const float[4]){ 0, 0, 0, 1 });
+            for (unsigned y = 0; y < DM_H; y++)
+               for (unsigned x = 0; x < DM_W; x++) {
+                  int i = tm_wrap(TM_ZERO, ((float)x + 0.5f) * scale + off, 16);
+                  int j = tm_wrap(TM_ZERO, ((float)y + 0.5f) * scale + off, 16);
+                  if (i >= 0 && j >= 0)
+                     want.px[y][x][0] = (float)(j * 16 + i) / 255.0f;
+               }
+            /* Gallium's mapping is transparent black in every channel (air_metal.c), which is
+             * not Apple's sentence for this format: its line says what it does */
+            pix_judge(r, t16, DM_RGBA32F, "sampler-zero-r8", &want, TX_EXACT, r->gallium);
+         }
+      }
+      rwa_sampler_destroy(s);
+      rwa_texture_destroy(t8);
+   }
+   /* A BORDER ON A FORMAT WITHOUT ALL FOUR CHANNELS: what real Metal reads outside (M1 Max,
+    * tools/air/mtlref, cases sampler-border-*), which is the colour through the format and not the
+    * colour as named: R8's transparent is opaque, because R8 has no alpha, and A8 is R8 with a
+    * swizzle, so black reads alpha 0 and white alpha 1. The A8 black may be that GPU's. Vulkan
+    * names the colour without the format, so these are the rows that can differ. */
+   {
+      static const struct {
+         unsigned fmt;
+         const char *name;
+         float outside[3][4];
+      } fb[] = {
+         { 10, "R8", { { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 1, 0, 0, 1 } } },
+         { 1, "A8", { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 1 } } },
+         { 30, "RG8", { { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 1, 1, 0, 1 } } },
+         { 40, "B5G6R5", { { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 1, 1, 1, 1 } } },
+      };
+      static const char *const cn[3] = { "transparent", "black", "white" };
+      static uint8_t bytes[16 * 16 * 2];
+      for (unsigned f = 0; f < COUNT_OF(fb); f++) {
+         const struct tm_format *tf = NULL;
+         float inside[4];
+         for (unsigned i = 0; i < COUNT_OF(tm_formats); i++)
+            if (tm_formats[i].mtl == fb[f].fmt)
+               tf = &tm_formats[i];
+         memset(bytes, 100, sizeof(bytes));
+         tm_format_read(tf, bytes, inside);
+         snprintf(name, sizeof(name), "sampler-border-%s", fb[f].name);
+         struct rwa_texture *tb = tx_make(r, TY_2D, fb[f].fmt, 16, 16, 1, 1, 1, 1, USE_R, name);
+         if (!tb)
+            continue;
+         tx_put(r, tb, 0, 0, bytes, name);
+         for (unsigned b = 0; b < 3; b++) {
+            snprintf(name, sizeof(name), "sampler-border-%s-%s", fb[f].name, cn[b]);
+            struct rwa_sampler *s = tx_sampler(r, TM_BORDER, TM_BORDER, TM_BORDER, 0, 0, 1, 0, 1, 0,
+                                               1000, b, name);
+            const struct pix_u u = tx_u(scale, scale, off, off, 0.0f);
+            if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", tb, s, &u, name)) {
+               for (unsigned y = 0; y < DM_H; y++)
+                  for (unsigned x = 0; x < DM_W; x++) {
+                     int i = tm_wrap(TM_BORDER, ((float)x + 0.5f) * scale + off, 16);
+                     int j = tm_wrap(TM_BORDER, ((float)y + 0.5f) * scale + off, 16);
+                     want.care[y][x] = 1;
+                     memcpy(want.px[y][x], i < 0 || j < 0 ? fb[f].outside[b] : inside,
+                            4 * sizeof(float));
+                  }
+               pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, r->gallium);
+            }
+            rwa_sampler_destroy(s);
+         }
+         rwa_texture_destroy(tb);
+      }
+   }
+   /* THE LEVEL. Nearest and linear between two levels at an explicit LOD */
+   {
+      struct rwa_sampler *s = tx_sampler(r, TM_EDGE, TM_EDGE, TM_EDGE, 0, 0, 1, 0, 1, 0, 1000, 0,
+                                         "sampler-mip-nearest");
+      const struct pix_u lo = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 1.25f);
+      /* Vulkan and Metal round to the nearest level: 1.25 is level 1 and 1.75 level 2 */
+      if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, s, &lo, "sampler-mip-nearest-1.25")) {
+         tx_want_texels(&want, 1, 0, 8, 8);
+         pix_judge(r, t16, DM_RGBA32F, "sampler-mip-nearest-1.25", &want, TX_EXACT, false);
+      }
+      const struct pix_u hi = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 1.75f);
+      if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, s, &hi, "sampler-mip-nearest-1.75")) {
+         tx_want_texels(&want, 2, 0, 4, 4);
+         pix_judge(r, t16, DM_RGBA32F, "sampler-mip-nearest-1.75", &want, TX_EXACT, false);
+      }
+      rwa_sampler_destroy(s);
+      s = tx_sampler(r, TM_EDGE, TM_EDGE, TM_EDGE, 0, 0, 2, 0, 1, 0, 1000, 0, "sampler-mip-linear");
+      const struct pix_u mid = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 1.5f);
+      if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, s, &mid, "sampler-mip-linear-1.5")) {
+         dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+         for (unsigned y = 0; y < DM_H; y++)
+            for (unsigned x = 0; x < DM_W; x++) {
+               float a[4], b[4];
+               tm_texelf(1, 0, x / 2, y / 2, a);
+               tm_texelf(2, 0, x / 4, y / 4, b);
+               for (unsigned c = 0; c < 4; c++)
+                  want.px[y][x][c] = (a[c] + b[c]) / 2.0f;
+            }
+         pix_judge(r, t16, DM_RGBA32F, "sampler-mip-linear-1.5", &want, TX_FILTERED, false);
+      }
+      rwa_sampler_destroy(s);
+      /* not mipmapped: level 0 whatever the LOD */
+      s = tx_sampler(r, TM_EDGE, TM_EDGE, TM_EDGE, 0, 0, 0, 0, 1, 0, 1000, 0, "sampler-mip-none");
+      const struct pix_u far = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 3.0f);
+      if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, s, &far, "sampler-mip-none")) {
+         tx_want_texels(&want, 0, 0, 16, 16);
+         pix_judge(r, t16, DM_RGBA32F, "sampler-mip-none", &want, TX_EXACT, false);
+      }
+      rwa_sampler_destroy(s);
+   }
+   /* THE LOD CLAMP. By the derivatives: a coordinate stepping 4 texels a pixel is level 2, and the
+    * clamp moves it. And through an explicit level, where Apple's header says otherwise ("Clamp
+    * values are ignored for texture sample variants that specify an explicit level of detail") and
+    * real Metal on an M1 Max clamps, with mip filter nearest and linear alike; A11 not measured. The
+    * three rows below are that measurement, and the expected values. */
+   {
+      static const struct { const char *name; float scale, lmin, lmax, bias; unsigned level; } cases[] = {
+         { "sampler-lod-derivative", 4.0f / 16, 0, 1000, 0, 2 },
+         { "sampler-lod-clamp-max", 4.0f / 16, 0, 1.0f, 0, 1 },
+         { "sampler-lod-clamp-min", 1.0f / 16, 3.0f, 1000, 0, 3 },
+         { "sampler-lod-bias", 1.0f / 16, 0, 1000, 2.0f, 2 },
+         { "sampler-lod-bias-clamp", 1.0f / 16, 0, 1.0f, 3.0f, 1 },
+      };
+      for (unsigned i = 0; i < COUNT_OF(cases); i++) {
+         struct rwa_sampler *s = tx_sampler(r, TM_REPEAT, TM_REPEAT, TM_EDGE, 0, 0, 1, 0, 1,
+                                            cases[i].lmin, cases[i].lmax, 0, cases[i].name);
+         struct pix_u u = tx_u(cases[i].scale, cases[i].scale, 0, 0, 0.0f);
+         u.bias = cases[i].bias;
+         if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_f2dimp", t, s, &u, cases[i].name)) {
+            unsigned l = cases[i].level, w = 16 >> l;
+            dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+            for (unsigned y = 0; y < DM_H; y++)
+               for (unsigned x = 0; x < DM_W; x++)
+                  tm_texelf(l, 0, (unsigned)tm_wrap(TM_REPEAT, ((float)x + 0.5f) * cases[i].scale, w),
+                            (unsigned)tm_wrap(TM_REPEAT, ((float)y + 0.5f) * cases[i].scale, w),
+                            want.px[y][x]);
+            pix_judge(r, t16, DM_RGBA32F, cases[i].name, &want, TX_EXACT, false);
+         }
+         rwa_sampler_destroy(s);
+      }
+      static const struct { const char *name; float lmin, lmax; unsigned level[4]; } clamps[] = {
+         { "2-2", 2.0f, 2.0f, { 2, 2, 2, 2 } },
+         { "2-1000", 2.0f, 1000.0f, { 2, 2, 2, 3 } },
+         { "0-1", 0.0f, 1.0f, { 0, 1, 1, 1 } },
+      };
+      for (unsigned c = 0; c < COUNT_OF(clamps); c++) {
+         for (unsigned mip = 1; mip <= 2; mip++) {
+            struct rwa_sampler *s = tx_sampler(r, TM_EDGE, TM_EDGE, TM_EDGE, 0, 0, mip, 0, 1,
+                                               clamps[c].lmin, clamps[c].lmax, 0,
+                                               "sampler-lod-clamp-explicit");
+            for (unsigned ask = 0; s && ask < 4; ask++) {
+               snprintf(name, sizeof(name), "sampler-lod-clamp-explicit-%s-%s-L%u", clamps[c].name,
+                        mip == 1 ? "nearest" : "linear", ask);
+               const struct pix_u u = tx_u(1.0f / 16, 1.0f / 16, 0, 0, (float)ask);
+               if (tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, s, &u, name)) {
+                  unsigned l = clamps[c].level[ask];
+                  tx_want_texels(&want, l, 0, 16 >> l, 16 >> l);
+                  pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+               }
+            }
+            rwa_sampler_destroy(s);
+         }
+      }
+   }
+   /* A LINEAR FILTER between four texels at weights a quarter and three quarters */
+   {
+      struct rwa_sampler *s = tx_sampler(r, TM_EDGE, TM_EDGE, TM_EDGE, 1, 1, 1, 0, 1, 0, 1000, 0,
+                                         "sampler-linear");
+      const float o = 1.0f / 64.0f;
+      const struct pix_u u = tx_u(1.0f / 16, 1.0f / 16, o, o, 0.0f);
+      if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, s, &u, "sampler-linear")) {
+         dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+         for (unsigned y = 0; y < DM_H; y++)
+            for (unsigned x = 0; x < DM_W; x++) {
+               int i0, i1, j0, j1;
+               float wx, wy, a[4], b[4], c_[4], d[4];
+               tm_linear_axis(TM_EDGE, ((float)x + 0.5f) / 16 + o, 16, &i0, &i1, &wx);
+               tm_linear_axis(TM_EDGE, ((float)y + 0.5f) / 16 + o, 16, &j0, &j1, &wy);
+               tm_texelf(0, 0, i0, j0, a);
+               tm_texelf(0, 0, i1, j0, b);
+               tm_texelf(0, 0, i0, j1, c_);
+               tm_texelf(0, 0, i1, j1, d);
+               for (unsigned c = 0; c < 4; c++)
+                  want.px[y][x][c] = (a[c] * (1 - wx) + b[c] * wx) * (1 - wy) +
+                                     (c_[c] * (1 - wx) + d[c] * wx) * wy;
+            }
+         pix_judge(r, t16, DM_RGBA32F, "sampler-linear", &want, TX_FILTERED, false);
+      }
+      rwa_sampler_destroy(s);
+   }
+   /* ANISOTROPY has only to run and stay within what it filters: a texture whose channels all lie
+    * in [64, 192] of 255, stretched along x, with every level holding the same range. */
+   {
+      struct rwa_texture *ta = tx_make(r, TY_2D, FMT_RGBA8, 16, 16, 1, 1, 5, 1, USE_R, "sampler-aniso");
+      struct rwa_sampler *s = tx_sampler(r, TM_REPEAT, TM_REPEAT, TM_EDGE, 1, 1, 2, 0, 16, 0, 1000,
+                                         0, "sampler-aniso");
+      if (ta && s) {
+         for (unsigned l = 0; l < 5; l++) {
+            unsigned w = 16 >> l;
+            for (unsigned i = 0; i < w * w * 4; i++)
+               mem[i] = (uint8_t)(64 + (i * 37) % 129);
+            tx_put(r, ta, l, 0, mem, "sampler-aniso");
+         }
+         const struct pix_u u = tx_u(4.0f / 16, 1.0f / 16, 0, 0, 0.0f);
+         if (tx_draw(r, t16, DM_RGBA32F, "m5b_f2dimp", ta, s, &u, "sampler-aniso")) {
+            const float mid = 128.0f / 255.0f;
+            dm_clear(&want, (const float[4]){ mid, mid, mid, mid });
+            pix_judge(r, t16, DM_RGBA32F, "sampler-aniso", &want, 64.0f / 255.0f + TX_FILTERED, false);
+         }
+      }
+      rwa_sampler_destroy(s);
+      rwa_texture_destroy(ta);
+   }
+   /* COMPARE, each of Metal's eight, against a known depth: a clear to 4.5/16, and a reference
+    * that is the pixel's own x over 16, so x = 4 is Equal exactly and which side passes is seen. */
+   {
+      static const char *const fn_name[8] = {
+         "never", "less", "equal", "lessequal", "greater", "notequal", "greaterequal", "always",
+      };
+      const float depth = 4.5f / 16.0f;
+      struct rwa_texture *z = tx_make(r, TY_2D, 252, 16, 16, 1, 1, 1, 1, USE_R | USE_RT, "sampler-compare");
+      if (z) {
+         r->why[0] = '\0';
+         if (rwa_clear_depth_stencil(z, &depth, NULL, r->why, sizeof(r->why)) != 0) {
+            dm_refused(r->backend, "sampler-compare-clear", r->why);
+            r->wrong++;
+         }
+         for (unsigned f = 0; f < 8; f++) {
+            snprintf(name, sizeof(name), "sampler-compare-%s", fn_name[f]);
+            struct rwa_sampler *s = tx_sampler(r, TM_EDGE, TM_EDGE, TM_EDGE, 0, 0, 1, f, 1, 0, 1000,
+                                               0, name);
+            struct pix_u u = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 0.0f);
+            u.ref = 1.0f / 16;
+            if (s && tx_draw(r, t16, DM_RGBA32F, "m5b_fcmp", z, s, &u, name)) {
+               dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+               for (unsigned y = 0; y < DM_H; y++)
+                  for (unsigned x = 0; x < DM_W; x++) {
+                     want.px[y][x][0] = tm_compare(f, ((float)x + 0.5f) / 16, depth) ? 1.0f : 0.0f;
+                     want.px[y][x][1] = ((float)y + 0.5f) / 16;
+                     want.px[y][x][2] = 0.25f;
+                     want.px[y][x][3] = 1.0f;
+                  }
+               pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+            }
+            rwa_sampler_destroy(s);
+         }
+         rwa_texture_destroy(z);
+      }
+   }
+   /* THE SHADER'S OWN SAMPLERS: the same answers from the words in the module */
+   {
+      static const unsigned modes[4] = { TM_EDGE, TM_REPEAT, TM_MIRROR, TM_ZERO };
+      for (unsigned i = 0; i < 4; i++) {
+         snprintf(name, sizeof(name), "sampler-own-%s", mode_name[modes[i]]);
+         struct pix_u u = tx_u(scale, scale, off, off, 0.0f);
+         u.select = i;
+         if (tx_draw(r, t16, DM_RGBA32F, "m5b_fown", t, NULL, &u, name)) {
+            tx_want_address(&want, modes[i], modes[i], scale, off, zero);
+            pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+         }
+      }
+      struct pix_u lin = tx_u(1.0f / 16, 1.0f / 16, 1.0f / 64, 1.0f / 64, 0.0f);
+      lin.select = 4;
+      if (tx_draw(r, t16, DM_RGBA32F, "m5b_fown", t, NULL, &lin, "sampler-own-linear")) {
+         for (unsigned y = 0; y < DM_H; y++)
+            for (unsigned x = 0; x < DM_W; x++) {
+               int i0, i1, j0, j1;
+               float wx, wy, a[4], b[4], c_[4], d[4];
+               tm_linear_axis(TM_EDGE, ((float)x + 0.5f) / 16 + 1.0f / 64, 16, &i0, &i1, &wx);
+               tm_linear_axis(TM_EDGE, ((float)y + 0.5f) / 16 + 1.0f / 64, 16, &j0, &j1, &wy);
+               tm_texelf(0, 0, i0, j0, a);
+               tm_texelf(0, 0, i1, j0, b);
+               tm_texelf(0, 0, i0, j1, c_);
+               tm_texelf(0, 0, i1, j1, d);
+               for (unsigned c = 0; c < 4; c++)
+                  want.px[y][x][c] = (a[c] * (1 - wx) + b[c] * wx) * (1 - wy) +
+                                     (c_[c] * (1 - wx) + d[c] * wx) * wy;
+               want.care[y][x] = 1;
+            }
+         pix_judge(r, t16, DM_RGBA32F, "sampler-own-linear", &want, TX_FILTERED, false);
+      }
+      struct pix_u mip = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 1.5f);
+      mip.select = 5;
+      if (tx_draw(r, t16, DM_RGBA32F, "m5b_fown", t, NULL, &mip, "sampler-own-miplinear")) {
+         dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+         for (unsigned y = 0; y < DM_H; y++)
+            for (unsigned x = 0; x < DM_W; x++) {
+               float a[4], b[4];
+               tm_texelf(1, 0, x / 2, y / 2, a);
+               tm_texelf(2, 0, x / 4, y / 4, b);
+               for (unsigned c = 0; c < 4; c++)
+                  want.px[y][x][c] = (a[c] + b[c]) / 2.0f;
+            }
+         pix_judge(r, t16, DM_RGBA32F, "sampler-own-miplinear", &want, TX_FILTERED, false);
+      }
+      /* the word's LOD clamp [1, 2], through the derivatives: 4/16 would be level 2, 1/16 level 0 */
+      static const struct { const char *name; float scale; unsigned level; } own_lod[] = {
+         { "sampler-own-lodclamp-min", 1.0f / 16, 1 },
+         { "sampler-own-lodclamp-max", 16.0f / 16, 2 },
+      };
+      for (unsigned i = 0; i < COUNT_OF(own_lod); i++) {
+         /* clamp to edge, so the coordinate stays inside by keeping it small at the big scale */
+         const float sc = own_lod[i].scale;
+         struct pix_u u = tx_u(sc, sc, 0, 0, 0.0f);
+         if (tx_draw(r, t16, DM_RGBA32F, "m5b_fownlod", t, NULL, &u, own_lod[i].name)) {
+            unsigned l = own_lod[i].level, w = 16 >> l;
+            dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+            for (unsigned y = 0; y < DM_H; y++)
+               for (unsigned x = 0; x < DM_W; x++)
+                  tm_texelf(l, 0, (unsigned)tm_wrap(TM_EDGE, ((float)x + 0.5f) * sc, w),
+                            (unsigned)tm_wrap(TM_EDGE, ((float)y + 0.5f) * sc, w), want.px[y][x]);
+            pix_judge(r, t16, DM_RGBA32F, own_lod[i].name, &want, TX_EXACT, false);
+         }
+      }
+      static const float colours[3][4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 1 }, { 1, 1, 1, 1 } };
+      static const char *const bn[3] = { "transparent", "black", "white" };
+      for (unsigned b = 0; b < 3; b++) {
+         snprintf(name, sizeof(name), "sampler-own-border-%s", bn[b]);
+         struct pix_u u = tx_u(scale, scale, off, off, 0.0f);
+         u.select = b;
+         if (tx_draw(r, t16, DM_RGBA32F, "m5b_fownb", t, NULL, &u, name)) {
+            tx_want_address(&want, TM_BORDER, TM_BORDER, scale, off, colours[b]);
+            pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+         }
+      }
+   }
+   rwa_texture_destroy(t);
+   (void)near;
+}
+
+/* ---- views ---- */
+
+static void
+tx_views(struct pix *r, struct rwa_texture *t16, struct rwa_sampler *near)
+{
+   static struct dm_picture want;
+   static uint8_t mem[16 * 16 * 4 * 2];
+   char name[64];
+   struct rwa_texture *p = tx_make(r, TY_2D, FMT_RGBA8, 16, 16, 1, 1, 5, 1, USE_R | USE_RT | USE_FV,
+                                   "view-parent");
+   if (!p)
+      return;
+   for (unsigned l = 0; l < 5; l++) {
+      tm_fill(mem, l, 0, 16 >> l, 16 >> l);
+      tx_put(r, p, l, 0, mem, "view-parent");
+   }
+   /* another format of the one size: BGRA8 reads the same bytes with red and blue exchanged */
+   struct rwa_texture *v = tx_view(r, p, 80, TY_2D, 0, 0, 0, 0, NULL, "view-format-bgra8");
+   const struct pix_u top = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 0.0f);
+   if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", v, near, &top, "view-format-bgra8")) {
+      tx_want_texels(&want, 0, 0, 16, 16);
+      for (unsigned y = 0; y < DM_H; y++)
+         for (unsigned x = 0; x < DM_W; x++) {
+            float t = want.px[y][x][0];
+            want.px[y][x][0] = want.px[y][x][2];
+            want.px[y][x][2] = t;
+         }
+      pix_judge(r, t16, DM_RGBA32F, "view-format-bgra8", &want, TX_EXACT, false);
+   }
+   rwa_texture_destroy(v);
+   /* sRGB: the twin decodes what the parent reads raw */
+   v = tx_view(r, p, 71, TY_2D, 0, 0, 0, 0, NULL, "view-format-srgb");
+   if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", v, near, &top, "view-format-srgb")) {
+      tx_want_texels(&want, 0, 0, 16, 16);
+      for (unsigned y = 0; y < DM_H; y++)
+         for (unsigned x = 0; x < DM_W; x++)
+            for (unsigned c = 0; c < 3; c++)
+               want.px[y][x][c] = dm_adreno_srgb_decode[dm_unorm8(want.px[y][x][c])];
+      /* M5c: against this GPU's measured curve (adreno_srgb.h), and the row's own word */
+      dm_right_word = "adreno-srgb";
+      pix_judge(r, t16, DM_RGBA32F, "view-format-srgb", &want, 1.0f / 65536.0f, false);
+      dm_right_word = "ok";
+   }
+   rwa_texture_destroy(v);
+   /* an integer format: the word, whole, through a read */
+   v = tx_view(r, p, 53, TY_2D, 0, 0, 0, 0, NULL, "view-format-r32uint");
+   if (v) {
+      struct pix_u u = tx_u(1, 1, 0, 0, 0.0f);
+      if (tx_draw(r, t16, DM_RGBA32F, "m5b_freadu", v, NULL, &u, "view-format-r32uint")) {
+         dm_clear(&want, (const float[4]){ 0, 0, 0, 1 });
+         for (unsigned y = 0; y < DM_H; y++)
+            for (unsigned x = 0; x < DM_W; x++) {
+               uint8_t b[4];
+               uint32_t w;
+               tm_texel(0, 0, x, y, b);
+               memcpy(&w, b, 4);
+               want.px[y][x][0] = (float)w;
+            }
+         pix_judge(r, t16, DM_RGBA32F, "view-format-r32uint", &want, 1024.0f, false);
+      }
+      rwa_texture_destroy(v);
+   }
+   /* one level, whose level 0 is the parent's level 2 */
+   v = tx_view(r, p, 0, TY_2D, 2, 1, 0, 0, NULL, "view-level");
+   if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", v, near, &top, "view-level")) {
+      tx_want_texels(&want, 2, 0, 4, 4);
+      pix_judge(r, t16, DM_RGBA32F, "view-level", &want, TX_EXACT, false);
+   }
+   /* written through the view, read back through the parent: one image */
+   if (v) {
+      tm_fill(mem, 7, 7, 4, 4);
+      tx_put(r, v, 0, 0, mem, "view-write");
+      tx_check_level(r, p, 2, 0, 4, 4, mem, 4, "view-write-parent-read", false);
+      tm_fill(mem, 2, 0, 4, 4);
+      tx_put(r, p, 2, 0, mem, "view-write");
+   }
+   rwa_texture_destroy(v);
+   /* two levels, read at its own level 1 */
+   v = tx_view(r, p, 0, TY_2D, 1, 2, 0, 0, NULL, "view-levels");
+   const struct pix_u one = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 1.0f);
+   if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", v, near, &one, "view-levels")) {
+      tx_want_texels(&want, 2, 0, 4, 4);
+      pix_judge(r, t16, DM_RGBA32F, "view-levels", &want, TX_EXACT, false);
+   }
+   rwa_texture_destroy(v);
+   /* A SWIZZLE, each channel from another: MTLTextureSwizzle Zero 0, One 1, R 2, G 3, B 4, A 5 */
+   {
+      static const struct { const char *name; unsigned s[4]; } sw[] = {
+         { "view-swizzle-abgr", { 5, 4, 3, 2 } },
+         { "view-swizzle-gbra", { 3, 4, 2, 5 } },
+         { "view-swizzle-01rg", { 0, 1, 2, 3 } },
+         { "view-swizzle-a01b", { 5, 0, 1, 4 } },
+      };
+      for (unsigned i = 0; i < COUNT_OF(sw); i++) {
+         v = tx_view(r, p, 0, TY_2D, 0, 1, 0, 0, sw[i].s, sw[i].name);
+         if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", v, near, &top, sw[i].name)) {
+            dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+            for (unsigned y = 0; y < DM_H; y++)
+               for (unsigned x = 0; x < DM_W; x++) {
+                  float t[4];
+                  tm_texelf(0, 0, x, y, t);
+                  for (unsigned c = 0; c < 4; c++)
+                     want.px[y][x][c] = sw[i].s[c] == 0 ? 0.0f : sw[i].s[c] == 1 ? 1.0f
+                                                                : t[sw[i].s[c] - 2];
+               }
+            pix_judge(r, t16, DM_RGBA32F, sw[i].name, &want, TX_EXACT, false);
+         }
+         rwa_texture_destroy(v);
+      }
+   }
+   /* the parent goes first, and the view still reads: the image goes with the last of them */
+   v = tx_view(r, p, 0, TY_2D, 1, 1, 0, 0, NULL, "view-outlives-parent");
+   rwa_texture_destroy(p);
+   if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", v, near, &top, "view-outlives-parent")) {
+      tx_want_texels(&want, 1, 0, 8, 8);
+      pix_judge(r, t16, DM_RGBA32F, "view-outlives-parent", &want, TX_EXACT, false);
+   }
+   rwa_texture_destroy(v);
+
+   /* slices: one of an array as a 2D, a window of it as an array, six as a cube */
+   struct rwa_texture *a = tx_make(r, TY_2DA, FMT_RGBA8, 16, 16, 1, 8, 1, 1, USE_R, "view-array");
+   if (a) {
+      for (unsigned s = 0; s < 8; s++) {
+         tm_fill(mem, 0, s, 16, 16);
+         tx_put(r, a, 0, s, mem, "view-array");
+      }
+      v = tx_view(r, a, 0, TY_2D, 0, 1, 3, 1, NULL, "view-slice");
+      if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", v, near, &top, "view-slice")) {
+         tx_want_texels(&want, 0, 3, 16, 16);
+         pix_judge(r, t16, DM_RGBA32F, "view-slice", &want, TX_EXACT, false);
+      }
+      rwa_texture_destroy(v);
+      v = tx_view(r, a, 0, TY_2DA, 0, 1, 2, 3, NULL, "view-slices");
+      struct pix_u ui = top;
+      ui.index = 2;
+      if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_f2darr", v, near, &ui, "view-slices")) {
+         tx_want_texels(&want, 0, 4, 16, 16);
+         pix_judge(r, t16, DM_RGBA32F, "view-slices", &want, TX_EXACT, false);
+      }
+      rwa_texture_destroy(v);
+      v = tx_view(r, a, 0, TY_CUBE, 0, 1, 2, 6, NULL, "view-cube");
+      struct pix_u uc = { 0 };
+      tm_cube_axes(4, uc.u0, uc.u1, uc.u2);
+      if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_fcube", v, near, &uc, "view-cube")) {
+         tx_want_texels(&want, 0, 6, 16, 16);
+         pix_judge(r, t16, DM_RGBA32F, "view-cube", &want, TX_EXACT, false);
+      }
+      rwa_texture_destroy(v);
+      /* and what Metal does not have: refused by name */
+      r->why[0] = '\0';
+      if (view_create) {
+         const struct rwa_texture_view_shape bad = { .type = TY_3D };
+         struct rwa_texture *b = view_create(a, &bad, r->why, sizeof(r->why));
+         printf("drvtest: draw-result %s view-3d-of-array %s: %s\n", r->backend,
+                b ? "made" : "refused", b ? "" : r->why);
+         r->refused += b ? 0 : 1;
+         if (b)
+            rwa_texture_destroy(b);
+      }
+      rwa_texture_destroy(a);
+   }
+   /* the stencil of a combined depth format, as an unsigned integer */
+   {
+      struct rwa_texture *z = tx_make(r, TY_2D, 260, 16, 16, 1, 1, 1, 1, USE_R | USE_RT, "view-x32s8");
+      if (z) {
+         const float d = 0.5f;
+         const unsigned sv = 42;
+         r->why[0] = '\0';
+         if (rwa_clear_depth_stencil(z, &d, &sv, r->why, sizeof(r->why)) == 0) {
+            v = tx_view(r, z, 261, TY_2D, 0, 1, 0, 1, NULL, "view-x32s8");
+            struct pix_u u = tx_u(1, 1, 0, 0, 0.0f);
+            if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_freadu", v, NULL, &u, "view-x32s8")) {
+               dm_clear(&want, (const float[4]){ 42, 0, 0, 1 });
+               /* the three a stencil has not got are the format's, and not what is measured */
+               for (unsigned y = 0; y < DM_H; y++)
+                  for (unsigned x = 0; x < DM_W; x++)
+                     for (unsigned c = 1; c < 3; c++)
+                        want.px[y][x][c] = 0.0f;
+               pix_judge(r, t16, DM_RGBA32F, "view-x32s8", &want, TX_EXACT, false);
+            }
+            rwa_texture_destroy(v);
+         }
+         rwa_texture_destroy(z);
+      }
+   }
+   /* A swizzled view of a depth texture, through a depth2d read: real Metal takes it, and abgr's red
+    * is the texel's alpha, 1.0 (M1 Max, tools/air/mtlref). air_vk.c refused it until this row. */
+   {
+      struct rwa_texture *z = tx_make(r, TY_2D, 252, 16, 16, 1, 1, 1, 1, USE_R | USE_RT, "view-depth");
+      if (z) {
+         const float d = 0.5f;
+         static const unsigned abgr[4] = { 5, 4, 3, 2 };
+         static const struct {
+            const char *name;
+            const unsigned *sw;
+            float red;
+         } cases[] = { { "view-depth", NULL, 0.5f }, { "view-depth-swizzle", abgr, 1.0f } };
+         r->why[0] = '\0';
+         if (rwa_clear_depth_stencil(z, &d, NULL, r->why, sizeof(r->why)) == 0) {
+            for (unsigned c = 0; c < COUNT_OF(cases); c++) {
+               v = tx_view(r, z, 252, TY_2D, 0, 1, 0, 1, cases[c].sw, cases[c].name);
+               struct pix_u u = tx_u(1, 1, 0, 0, 0.0f);
+               if (v && tx_draw(r, t16, DM_RGBA32F, "m5b_fdread", v, NULL, &u, cases[c].name)) {
+                  dm_clear(&want, (const float[4]){ cases[c].red, 0.25f, 0.5f, 1 });
+                  pix_judge(r, t16, DM_RGBA32F, cases[c].name, &want, TX_EXACT, false);
+               }
+               rwa_texture_destroy(v);
+            }
+         }
+         rwa_texture_destroy(z);
+      }
+   }
+}
+
+/* ---- a pass into a level or a slice, with what is beside it ---- */
+
+static bool
+tx_draw_at(struct pix *r, struct rwa_texture *t, unsigned level, unsigned slice, unsigned fmt,
+           const char *fs, const char *name, const float *clear)
+{
+   struct rwa_render *render = tx_pipeline(r, fs, fmt, 1, name);
+   if (!render)
+      return false;
+   struct rwa_texture *color[1] = { t };
+   const unsigned lv[1] = { level }, sl[1] = { slice };
+   const struct rwa_draw draw = {
+      .color = color, .color_count = 1, .primitive = 4, .vertex_count = 4,
+      .color_level = lv, .color_slice = sl, .clear_color = clear,
+   };
+   r->why[0] = '\0';
+   if (rwa_render_draw(render, &draw, r->why, sizeof(r->why)) != 0) {
+      dm_refused(r->backend, name, r->why);
+      if (r->gallium)
+         r->lacks++;
+      else
+         r->refused++;
+      return false;
+   }
+   return true;
+}
+
+/* m5a_fsrc's picture on RGBA8, w x h, tight, the pixel's own (x, y) */
+static void
+tx_fsrc_bytes(uint8_t *to, unsigned w, unsigned h)
+{
+   for (unsigned y = 0; y < h; y++)
+      for (unsigned x = 0; x < w; x++) {
+         float s[4];
+         dm_src(x, y, s);
+         for (unsigned c = 0; c < 4; c++)
+            to[((size_t)y * w + x) * 4 + c] = (uint8_t)dm_unorm8(s[c]);
+      }
+}
+
+static void
+tx_render_into(struct pix *r, struct rwa_sampler *near)
+{
+   static uint8_t mem[32 * 32 * 4];
+   char name[64];
+   const bool lk = r->gallium;
+
+   /* level 1 of three: rendered; levels 0 and 2 as written */
+   struct rwa_texture *t = tx_make(r, TY_2D, FMT_RGBA8, 32, 32, 1, 1, 3, 1, USE_R | USE_RT, "render-level");
+   if (t) {
+      for (unsigned l = 0; l < 3; l++) {
+         tm_fill(mem, l, 0, 32 >> l, 32 >> l);
+         tx_put(r, t, l, 0, mem, "render-level");
+      }
+      if (tx_draw_at(r, t, 1, 0, FMT_RGBA8, "m5a_fsrc", "render-level1", NULL)) {
+         tx_fsrc_bytes(mem, 16, 16);
+         tx_check_level(r, t, 1, 0, 16, 16, mem, 4, "render-level1", lk);
+         tm_fill(mem, 0, 0, 32, 32);
+         tx_check_level(r, t, 0, 0, 32, 32, mem, 4, "render-level1-neighbour0", lk);
+         tm_fill(mem, 2, 0, 8, 8);
+         tx_check_level(r, t, 2, 0, 8, 8, mem, 4, "render-level1-neighbour2", lk);
+      }
+      /* and from level 0 of the same image, through a view, into level 1 of it: one layout for two
+       * subresources (THE LAYOUT OF ONE IMAGE in air_vk.c) */
+      struct rwa_texture *v = tx_view(r, t, 0, TY_2D, 0, 1, 0, 1, NULL, "render-from-own-level");
+      if (v) {
+         tm_fill(mem, 0, 0, 32, 32);
+         tx_put(r, t, 0, 0, mem, "render-from-own-level");
+         struct rwa_render *render = tx_pipeline(r, "m5b_f2d", FMT_RGBA8, 1, "render-from-own-level");
+         const struct pix_u u = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 0.0f);
+         struct rwa_buffer *ub = pix_buffer(r, &u, sizeof(u));
+         struct rwa_texture *color[1] = { t };
+         struct rwa_buffer *bufs[1] = { ub };
+         struct rwa_texture *texs[1] = { v };
+         struct rwa_sampler *sams[1] = { near };
+         const unsigned lv[1] = { 1 };
+         const struct rwa_draw draw = {
+            .color = color, .color_count = 1, .primitive = 4, .vertex_count = 4, .color_level = lv,
+            .fragment = { .buffers = bufs, .buffer_count = 1, .textures = texs, .texture_count = 1,
+                          .samplers = sams, .sampler_count = 1 },
+         };
+         r->why[0] = '\0';
+         if (render && ub && rwa_render_draw(render, &draw, r->why, sizeof(r->why)) == 0) {
+            /* (x + 0.5) / 16 on a 32-wide level is exactly the edge at 2x + 1, and the floor takes
+             * the upper texel. I wrote (2x, 2y); real Metal (M1 Max, tools/air/mtlref) and this
+             * GPU both read (2x + 1, 2y + 1). */
+            for (unsigned y = 0; y < 16; y++)
+               for (unsigned x = 0; x < 16; x++)
+                  tm_texel(0, 0, x * 2 + 1, y * 2 + 1, mem + ((size_t)y * 16 + x) * 4);
+            tx_check_level(r, t, 1, 0, 16, 16, mem, 4, "render-from-own-level", false);
+         } else {
+            pix_draw_failed(r, "render-from-own-level");
+         }
+         rwa_buffer_destroy(ub);
+         rwa_texture_destroy(v);
+      }
+      /* a clear of one level, through a view of it (what hkmetal.m does for a pass with no draw) */
+      v = tx_view(r, t, 0, TY_2D, 2, 1, 0, 1, NULL, "clear-level2");
+      if (v) {
+         const double c[4] = { 0.5, 0.25, 0.75, 1.0 };
+         r->why[0] = '\0';
+         if (rwa_clear_color(v, c, r->why, sizeof(r->why)) == 0) {
+            for (unsigned i = 0; i < 64; i++) {
+               mem[i * 4 + 0] = 128;
+               mem[i * 4 + 1] = 64;
+               mem[i * 4 + 2] = 191;
+               mem[i * 4 + 3] = 255;
+            }
+            tx_check_level(r, t, 2, 0, 8, 8, mem, 4, "clear-level2", false);
+         } else {
+            dm_refused(r->backend, "clear-level2", r->why);
+            r->refused++;
+         }
+         rwa_texture_destroy(v);
+      }
+      rwa_texture_destroy(t);
+   }
+
+   /* slice 2 of four */
+   t = tx_make(r, TY_2DA, FMT_RGBA8, 16, 16, 1, 4, 1, 1, USE_R | USE_RT, "render-slice");
+   if (t) {
+      for (unsigned s = 0; s < 4; s++) {
+         tm_fill(mem, 0, s, 16, 16);
+         tx_put(r, t, 0, s, mem, "render-slice");
+      }
+      if (tx_draw_at(r, t, 0, 2, FMT_RGBA8, "m5a_fsrc", "render-slice2", NULL)) {
+         tx_fsrc_bytes(mem, 16, 16);
+         tx_check_level(r, t, 0, 2, 16, 16, mem, 4, "render-slice2", lk);
+         tm_fill(mem, 0, 1, 16, 16);
+         tx_check_level(r, t, 0, 1, 16, 16, mem, 4, "render-slice2-neighbour1", lk);
+         tm_fill(mem, 0, 3, 16, 16);
+         tx_check_level(r, t, 0, 3, 16, 16, mem, 4, "render-slice2-neighbour3", lk);
+      }
+      rwa_texture_destroy(t);
+   }
+   /* a face of a cube */
+   t = tx_make(r, TY_CUBE, FMT_RGBA8, 16, 16, 1, 1, 1, 1, USE_R | USE_RT, "render-cube");
+   if (t) {
+      for (unsigned s = 0; s < 6; s++) {
+         tm_fill(mem, 0, s, 16, 16);
+         tx_put(r, t, 0, s, mem, "render-cube");
+      }
+      if (tx_draw_at(r, t, 0, 3, FMT_RGBA8, "m5a_fsrc", "render-cube-face3", NULL)) {
+         tx_fsrc_bytes(mem, 16, 16);
+         tx_check_level(r, t, 0, 3, 16, 16, mem, 4, "render-cube-face3", lk);
+         tm_fill(mem, 0, 2, 16, 16);
+         tx_check_level(r, t, 0, 2, 16, 16, mem, 4, "render-cube-face3-neighbour2", lk);
+      }
+      rwa_texture_destroy(t);
+   }
+   /* a depth plane of a 3D texture */
+   t = tx_make(r, TY_3D, FMT_RGBA8, 16, 16, 4, 1, 1, 1, USE_R | USE_RT, "render-3d");
+   if (t) {
+      static uint8_t all[16 * 16 * 4 * 4];
+      for (unsigned z = 0; z < 4; z++)
+         tm_fill(all + (size_t)z * 16 * 16 * 4, 0, z, 16, 16);
+      tx_put(r, t, 0, 0, all, "render-3d");
+      if (tx_draw_at(r, t, 0, 2, FMT_RGBA8, "m5a_fsrc", "render-3d-plane2", NULL)) {
+         static uint8_t got[16 * 16 * 4];
+         for (unsigned z = 1; z < 4; z++) {
+            const unsigned o[3] = { 0, 0, z }, s[3] = { 16, 16, 1 };
+            snprintf(name, sizeof(name), z == 2 ? "render-3d-plane2" : "render-3d-plane2-neighbour%u", z);
+            r->why[0] = '\0';
+            if (rwa_texture_read(t, 0, 0, o, s, got, 0, r->why, sizeof(r->why)) != 0) {
+               dm_refused(r->backend, name, r->why);
+               r->wrong++;
+               continue;
+            }
+            if (z == 2)
+               tx_fsrc_bytes(mem, 16, 16);
+            else
+               memcpy(mem, all + (size_t)z * 16 * 16 * 4, 16 * 16 * 4);
+            if (tm_bytes(r->backend, name, got, mem, 256, 4, 16, lk))
+               r->right++;
+            else if (lk)
+               r->lacks++;
+            else
+               r->wrong++;
+         }
+      }
+      /* its clear, through the view of one plane. The CONTRACT's row and not Metal's: real Metal
+       * aborts on a 2D view of a 3D texture (tools/air/mtlref), so metal_drv_test must not ask
+       * for one. rwa_texture_view_create has it because hkmetal.m clears through such a view. */
+      struct rwa_texture *v = tx_view(r, t, 0, TY_2D, 0, 1, 1, 1, NULL, "clear-3d-plane1");
+      if (v) {
+         const double c[4] = { 1, 0, 0, 1 };
+         static uint8_t got[16 * 16 * 4];
+         const unsigned o[3] = { 0, 0, 1 }, s[3] = { 16, 16, 1 };
+         r->why[0] = '\0';
+         if (rwa_clear_color(v, c, r->why, sizeof(r->why)) == 0 &&
+             rwa_texture_read(t, 0, 0, o, s, got, 0, r->why, sizeof(r->why)) == 0) {
+            for (unsigned i = 0; i < 256; i++) {
+               mem[i * 4] = 255;
+               mem[i * 4 + 1] = mem[i * 4 + 2] = 0;
+               mem[i * 4 + 3] = 255;
+            }
+            if (tm_bytes(r->backend, "clear-3d-plane1", got, mem, 256, 4, 16, false))
+               r->right++;
+            else
+               r->wrong++;
+         } else {
+            dm_refused(r->backend, "clear-3d-plane1", r->why);
+            r->refused++;
+         }
+         rwa_texture_destroy(v);
+      }
+      rwa_texture_destroy(t);
+   }
+   /* a slice of a 1D array, whose one row is the picture's row 0. Metal's validation layer refuses
+    * a pass into a 1D array and without it the pass runs, on M1 (tools/air/mtlref). */
+   t = tx_make(r, TY_1DA, FMT_RGBA8, 16, 1, 1, 2, 1, 1, USE_R | USE_RT, "render-1darray");
+   if (t) {
+      tm_fill(mem, 0, 0, 16, 1);
+      tx_put(r, t, 0, 0, mem, "render-1darray");
+      tm_fill(mem, 0, 1, 16, 1);
+      tx_put(r, t, 0, 1, mem, "render-1darray");
+      if (tx_draw_at(r, t, 0, 1, FMT_RGBA8, "m5a_fsrc", "render-1darray-slice1", NULL)) {
+         tx_fsrc_bytes(mem, 16, 1);
+         tx_check_level(r, t, 0, 1, 16, 1, mem, 4, "render-1darray-slice1", lk);
+         tm_fill(mem, 0, 0, 16, 1);
+         tx_check_level(r, t, 0, 0, 16, 1, mem, 4, "render-1darray-slice1-neighbour0", lk);
+      }
+      rwa_texture_destroy(t);
+   }
+   /* a slice of a multisample array, read back by a shader, sample by sample */
+   t = tx_make(r, TY_2DMSA, FMT_RGBA8, 16, 16, 1, 3, 1, 4, USE_R | USE_RT, "render-msarray");
+   if (t) {
+      struct rwa_render *render = tx_pipeline(r, "m5a_fsrc", FMT_RGBA8, 4, "render-msarray");
+      struct rwa_texture *color[1] = { t };
+      const unsigned sl[1] = { 1 };
+      const float black[4] = { 0, 0, 0, 0 };
+      const struct rwa_draw draw = {
+         .color = color, .color_count = 1, .primitive = 4, .vertex_count = 4, .color_slice = sl,
+         .clear_color = black,
+      };
+      r->why[0] = '\0';
+      if (render && rwa_render_draw(render, &draw, r->why, sizeof(r->why)) == 0) {
+         struct rwa_texture *t16 = pix_target(r, DM_RGBA32F);
+         for (unsigned smp = 0; smp < 2; smp++) {
+            snprintf(name, sizeof(name), "render-msarray-slice1-sample%u", smp);
+            struct pix_u u = tx_u(1, 1, 0, 0, 0.0f);
+            u.index = 1;
+            u.select = smp * 3;
+            if (t16 && tx_draw(r, t16, DM_RGBA32F, "m5b_fmsarr", t, NULL, &u, name)) {
+               static struct dm_picture want;
+               dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+               for (unsigned y = 0; y < DM_H; y++)
+                  for (unsigned x = 0; x < DM_W; x++) {
+                     float s[4];
+                     dm_src(x, y, s);
+                     for (unsigned c = 0; c < 4; c++)
+                        want.px[y][x][c] = (float)dm_unorm8(s[c]) / 255.0f;
+                  }
+               pix_judge(r, t16, DM_RGBA32F, name, &want, TX_EXACT, false);
+            }
+         }
+         rwa_texture_destroy(t16);
+      } else if (render) {
+         pix_draw_failed(r, "render-msarray");
+      }
+      rwa_texture_destroy(t);
+   }
+   /* a depth attachment at level 1: the clear lands there and level 0 keeps its own */
+   t = tx_make(r, TY_2D, 252, 32, 32, 1, 1, 2, 1, USE_R | USE_RT, "render-depth-level");
+   if (t) {
+      struct rwa_texture *c16 = pix_target(r, DM_RGBA32F);
+      const struct rwa_render_shape shape = {
+         .color_format = { DM_RGBA32F }, .color_count = 1, .depth_format = 252, .sample_count = 1,
+      };
+      struct rwa_render *render = pix_render(r, NULL, "m5a_fsrc", &shape, "render-depth-level1");
+      const float d0 = 0.75f, d1 = 0.25f;
+      r->why[0] = '\0';
+      if (render && c16 && rwa_clear_depth_stencil(t, &d0, NULL, r->why, sizeof(r->why)) == 0) {
+         struct rwa_texture *color[1] = { c16 };
+         const struct rwa_draw draw = {
+            .color = color, .color_count = 1, .primitive = 4, .vertex_count = 4, .depth = t,
+            .clear_depth = &d1, .depth_level = 1,
+         };
+         if (rwa_render_draw(render, &draw, r->why, sizeof(r->why)) == 0) {
+            float got0 = 0.0f, got1 = 0.0f;
+            const unsigned o[3] = { 3, 3, 0 }, s[3] = { 1, 1, 1 };
+            r->why[0] = '\0';
+            int rc = rwa_depth_read(t, 0, 0, o, s, &got0, NULL, r->why, sizeof(r->why)) |
+                     rwa_depth_read(t, 1, 0, o, s, &got1, NULL, r->why, sizeof(r->why));
+            bool ok = rc == 0 && got0 == d0 && got1 == d1;
+            printf("drvtest: draw-result %s render-depth-level1 %s digest %08x%08x expected "
+                   "%08x%08x\n", r->backend, ok ? "ok" : lk ? "gallium-lacks" : "DIFFERS",
+                   *(uint32_t *)&got0, *(uint32_t *)&got1, *(const uint32_t *)&d0,
+                   *(const uint32_t *)&d1);
+            if (ok)
+               r->right++;
+            else if (lk)
+               r->lacks++;
+            else
+               r->wrong++;
+         } else {
+            pix_draw_failed(r, "render-depth-level1");
+         }
+      }
+      if (render)
+         rwa_render_destroy(render);
+      rwa_texture_destroy(c16);
+      rwa_texture_destroy(t);
+   }
+}
+
+static int
+run_pixels_textures(const char *dir)
+{
+   struct pix r;
+   if (!pix_open(&r, dir, "textures"))
+      return 1;
+   *(void **)&view_create = dlsym(RTLD_DEFAULT, "rwa_texture_view_create");
+   struct rwa_texture *t16 = pix_target(&r, DM_RGBA32F);
+   struct rwa_sampler *near = tx_nearest(&r);
+   if (t16 && near) {
+      tx_levels_and_types(&r, t16, near);
+      rwa_finish(r.device, r.why, sizeof(r.why));
+      tx_samplers(&r, t16, near);
+      rwa_finish(r.device, r.why, sizeof(r.why));
+      tx_views(&r, t16, near);
+      rwa_finish(r.device, r.why, sizeof(r.why));
+      tx_render_into(&r, near);
+   }
+   rwa_finish(r.device, r.why, sizeof(r.why));
+   rwa_sampler_destroy(near);
+   rwa_texture_destroy(t16);
+   fflush(stdout);
+   /* (the pipelines tx_pipeline keeps go with the process: pix_close's device close says so) */
+   printf("drvtest: draw-summary %s %s %u ok, %u differ, %u gallium-lacks, %u refused\n",
+          r.backend, r.mode, r.right, r.wrong, r.lacks, r.refused);
+   fflush(stdout);
+   return r.wrong ? 1 : 0;
+}
+
+/* ---- formats ---- */
+
+/* Per format: what goes in comes out, what a shader reads is the model's by channel, and what a
+ * render leaves is the model's by channel, with the width of a channel's own rounding. */
+static void
+pix_srgb_note(struct pix *r, struct rwa_texture *t, const struct tm_format *f, const uint8_t *mem,
+              const char *name)
+{
+   static float got[DM_W * DM_H * 4];
+   float worst = 0.0f, book[4];
+   const float *const kept = dm_srgb_curve;
+   const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { DM_W, DM_H, 1 };
+   if (rwa_texture_read(t, 0, 0, origin, extent, got, 0, r->why, sizeof(r->why)) != 0)
+      return;
+   dm_srgb_curve = NULL;
+   for (unsigned y = 0; y < DM_H; y++)
+      for (unsigned x = 0; x < DM_W; x++) {
+         tm_format_read(f, mem + ((size_t)y * DM_W + x) * f->bytes, book);
+         for (unsigned c = 0; c < 4; c++) {
+            float e = got[(y * DM_W + x) * 4 + c] - book[c];
+            e = e < 0.0f ? -e : e;
+            worst = e > worst ? e : worst;
+         }
+      }
+   dm_srgb_curve = kept;
+   printf("drvtest: draw-note %s %s max-error-from-book %.7f measured-bound %.7f\n", r->backend, name,
+          worst, dm_adreno_srgb_bound());
+}
+
+static void
+tx_one_format(struct pix *r, const struct tm_format *f, struct rwa_texture *t16,
+              struct rwa_sampler *near)
+{
+   static struct dm_picture want;
+   static uint8_t mem[DM_W * DM_H * 16], got[DM_W * DM_H * 16], expect[DM_W * DM_H * 16];
+   char name[80];
+   const bool is_int = f->kind == TM_UINT || f->kind == TM_SINT;
+   /* M5b: what its reads and renders are judged by: real Metal's table, but on the Gallium library
+    * the mirror it keeps on purpose for 40-43 (tex_model.h). Those rows print "gallium-mirror" when
+    * they are that, and DIFFERS when they are neither: not "ok", since they are not real Metal. */
+   const struct tm_format *m = r->gallium && tm_gallium_mirror(f->mtl)
+                                  ? tm_gallium_mirror(f->mtl) : f;
+   const bool mirrored = m != f;
+
+   snprintf(name, sizeof(name), "pf-%s", f->name);
+   struct rwa_texture *t = tx_make(r, TY_2D, f->mtl, DM_W, DM_H, 1, 1, 1, 1,
+                                   USE_R | (f->renderable ? USE_RT : 0), name);
+   if (!t)
+      return;
+   for (unsigned y = 0; y < DM_H; y++)
+      for (unsigned x = 0; x < DM_W; x++)
+         tm_format_texel(f, x, y, mem + ((size_t)y * DM_W + x) * f->bytes);
+   snprintf(name, sizeof(name), "pf-%s-bytes", f->name);
+   if (!tx_put(r, t, 0, 0, mem, name)) {
+      rwa_texture_destroy(t);
+      return;
+   }
+   tx_check_level(r, t, 0, 0, DM_W, DM_H, mem, f->bytes, name, false);
+
+   /* a read, then a sample, in a float attachment */
+   dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+   /* M5c: an sRGB read, against this GPU's measured curve (adreno_srgb.h), and the row's own word */
+   const bool srgb = f->kind == TM_SRGB;
+   dm_srgb_curve = srgb ? dm_adreno_srgb_decode : NULL;
+   const float slop = srgb ? 1.0f / 65536.0f : tm_format_slop(f);
+   for (unsigned y = 0; y < DM_H; y++)
+      for (unsigned x = 0; x < DM_W; x++)
+         tm_format_read(m, mem + ((size_t)y * DM_W + x) * f->bytes, want.px[y][x]);
+   snprintf(name, sizeof(name), "pf-%s-read", f->name);
+   struct pix_u u = tx_u(1, 1, 0, 0, 0.0f);
+   dm_right_word = mirrored ? "gallium-mirror" : srgb ? "adreno-srgb" : "ok";
+   if (tx_draw(r, t16, DM_RGBA32F, f->kind == TM_UINT ? "m5b_freadu" : f->kind == TM_SINT
+               ? "m5b_freadi" : "m5b_fread", t, NULL, &u, name) &&
+       pix_judge(r, t16, DM_RGBA32F, name, &want, slop, false) && mirrored) {
+      r->right--;
+      r->mirror++;
+   }
+   if (srgb)
+      pix_srgb_note(r, t16, f, mem, name);
+   if (!is_int) {
+      snprintf(name, sizeof(name), "pf-%s-sample", f->name);
+      u = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 0.0f);
+      if (tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, near, &u, name) &&
+          pix_judge(r, t16, DM_RGBA32F, name, &want, slop, false) && mirrored) {
+         r->right--;
+         r->mirror++;
+      }
+      if (srgb)
+         pix_srgb_note(r, t16, f, mem, name);
+   }
+   dm_right_word = "ok";
+   dm_srgb_curve = NULL;
+
+   /* a render: the pixel's own colour, through the format */
+   if (f->renderable) {
+      snprintf(name, sizeof(name), "pf-%s-render", f->name);
+      const char *fs = f->kind == TM_UINT ? "m5b_fuint" : f->kind == TM_SINT ? "m5b_fsint"
+                                                                             : "m5a_fsrc";
+      if (tx_draw_at(r, t, 0, 0, f->mtl, fs, name, NULL)) {
+         unsigned bad = 0, fx = 0, fy = 0;
+         const unsigned steps = f->kind == TM_SRGB ? 5 : f->kind == TM_RG11B10 ? 2 : 1;
+         r->why[0] = '\0';
+         if (rwa_texture_read(t, 0, 0, NULL, NULL, got, 0, r->why, sizeof(r->why)) != 0) {
+            dm_refused(r->backend, name, r->why);
+            r->wrong++;
+            rwa_texture_destroy(t);
+            return;
+         }
+         for (unsigned y = 0; y < DM_H; y++)
+            for (unsigned x = 0; x < DM_W; x++) {
+               float v[4];
+               if (f->kind == TM_UINT) {
+                  v[0] = (float)x;
+                  v[1] = (float)y;
+                  v[2] = (float)(x + y);
+                  v[3] = 3.0f;
+               } else if (f->kind == TM_SINT) {
+                  v[0] = (float)x - 8.0f;
+                  v[1] = (float)y - 8.0f;
+                  v[2] = (float)(x + y) - 16.0f;
+                  v[3] = -1.0f;
+               } else {
+                  dm_src(x, y, v);
+               }
+               uint8_t *e = expect + ((size_t)y * DM_W + x) * f->bytes;
+               tm_format_write(m, v, e);
+               if (!tm_format_close(m, got + ((size_t)y * DM_W + x) * f->bytes, e, steps)) {
+                  if (!bad) {
+                     fx = x;
+                     fy = y;
+                  }
+                  bad++;
+               }
+            }
+         uint64_t dg = dm_fnv(got, (size_t)DM_W * DM_H * f->bytes, 0xcbf29ce484222325ull);
+         uint64_t de = dm_fnv(expect, (size_t)DM_W * DM_H * f->bytes, 0xcbf29ce484222325ull);
+         printf("drvtest: draw-result %s %s %s digest %016llx expected %016llx\n", r->backend, name,
+                bad ? "DIFFERS" : mirrored ? "gallium-mirror" : "ok", (unsigned long long)dg,
+                (unsigned long long)de);
+         if (bad) {
+            printf("drvtest: draw-diff %s %s %u of 256 texels differ, first (%u,%u) got", r->backend,
+                   name, bad, fx, fy);
+            for (unsigned b = 0; b < f->bytes; b++)
+               printf(" %02x", got[((size_t)fy * DM_W + fx) * f->bytes + b]);
+            printf(" expected");
+            for (unsigned b = 0; b < f->bytes; b++)
+               printf(" %02x", expect[((size_t)fy * DM_W + fx) * f->bytes + b]);
+            printf("\n");
+            r->wrong++;
+         } else if (mirrored) {
+            r->mirror++;
+         } else {
+            r->right++;
+         }
+      }
+   }
+   rwa_texture_destroy(t);
+}
+
+/*
+ * THE COMPRESSED FORMATS, with blocks that decode to a known colour with no arithmetic worth the
+ * name: one block per texel of a 4x4 grid, each with its own colour, so a block read from the wrong
+ * place is seen. Known decodes, by the two specifications:
+ *   ASTC    a void-extent block: 0xfc 0xfd then six 0xff, then RGBA as UNORM16: exactly that colour
+ *   ETC2    individual mode, table 0, every pixel index 0, whose modifier is +2: R = 17 * r4 + 2
+ *   EAC     multiplier 0: R = base * 8 + 1 of 2047, for the 11-bit forms; base, for RGBA8's alpha
+ *   RGB8A1  differential mode's bit is "opaque" there: differences of 0, the same modifier
+ */
+struct tx_cformat {
+   unsigned mtl;
+   const char *name;
+   unsigned bw, bh, kind;    /* kind: 0 astc, 1 astc srgb, 2 etc2, 3 etc2 srgb, 4 r11, 5 rg11,
+                              * 6 rgba8, 7 rgba8 srgb, 8 rgb8a1, 9 rgb8a1 srgb */
+};
+
+static void
+tx_block(const struct tx_cformat *cf, unsigned bx, unsigned by, uint8_t *to, unsigned *size,
+         float out[4])
+{
+   unsigned r4 = (bx * 3 + 2) & 15, g4 = (by * 3 + 5) & 15, b4 = (bx + by * 2 + 8) & 15;
+   unsigned a8 = 40 + bx * 40 + by * 7;
+   memset(to, 0, 16);
+   if (cf->kind <= 1) {
+      static const uint8_t head[8] = { 0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+      uint16_t c[4] = { (uint16_t)(r4 * 4369), (uint16_t)(g4 * 4369), (uint16_t)(b4 * 4369),
+                        (uint16_t)(a8 * 257) };
+      memcpy(to, head, 8);
+      memcpy(to + 8, c, 8);
+      *size = 16;
+      for (unsigned i = 0; i < 4; i++)
+         out[i] = (float)c[i] / 65535.0f;
+      if (cf->kind == 1)
+         for (unsigned i = 0; i < 3; i++)
+            out[i] = dm_srgb_decode((float)(c[i] >> 8) / 255.0f);
+      return;
+   }
+   if (cf->kind == 4 || cf->kind == 5) {
+      to[0] = (uint8_t)(r4 * 16 + 3);
+      /* multiplier 0 is read as 1/8, so the modifier comes in whole: table 0, index 0, is -3 */
+      out[0] = (float)(to[0] * 8 + 1) / 2047.0f;
+      out[1] = 0;
+      out[2] = 0;
+      out[3] = 1;
+      *size = 8;
+      if (cf->kind == 5) {
+         to[8] = (uint8_t)(g4 * 16 + 3);
+         out[1] = (float)(to[8] * 8 + 1) / 2047.0f;
+         *size = 16;
+      }
+      return;
+   }
+   uint8_t *rgb = to;
+   *size = 8;
+   out[3] = 1.0f;
+   if (cf->kind == 6 || cf->kind == 7) {
+      to[0] = (uint8_t)a8;
+      out[3] = (float)a8 / 255.0f;
+      rgb = to + 8;
+      *size = 16;
+   }
+   unsigned cr, cg, cb;
+   if (cf->kind == 8 || cf->kind == 9) {
+      unsigned r5 = r4 * 2, g5 = g4 * 2, b5 = b4 * 2;
+      rgb[0] = (uint8_t)(r5 << 3);
+      rgb[1] = (uint8_t)(g5 << 3);
+      rgb[2] = (uint8_t)(b5 << 3);
+      rgb[3] = 2;   /* table 0 twice, the "opaque" bit, no flip */
+      cr = ((r5 << 3) | (r5 >> 2)) + 2;
+      cg = ((g5 << 3) | (g5 >> 2)) + 2;
+      cb = ((b5 << 3) | (b5 >> 2)) + 2;
+   } else {
+      rgb[0] = (uint8_t)(r4 << 4 | r4);
+      rgb[1] = (uint8_t)(g4 << 4 | g4);
+      rgb[2] = (uint8_t)(b4 << 4 | b4);
+      rgb[3] = 0;   /* table 0 twice, individual, no flip */
+      cr = r4 * 17 + 2;
+      cg = g4 * 17 + 2;
+      cb = b4 * 17 + 2;
+   }
+   cr = cr > 255 ? 255 : cr;
+   cg = cg > 255 ? 255 : cg;
+   cb = cb > 255 ? 255 : cb;
+   const bool srgb = cf->kind == 3 || cf->kind == 7 || cf->kind == 9;
+   out[0] = srgb ? dm_srgb_decode((float)cr / 255.0f) : (float)cr / 255.0f;
+   out[1] = srgb ? dm_srgb_decode((float)cg / 255.0f) : (float)cg / 255.0f;
+   out[2] = srgb ? dm_srgb_decode((float)cb / 255.0f) : (float)cb / 255.0f;
+}
+
+static void
+tx_compressed(struct pix *r, struct rwa_texture *t16, struct rwa_sampler *near)
+{
+   static const struct tx_cformat cf[] = {
+      { 170, "EAC_R11Unorm", 4, 4, 4 }, { 174, "EAC_RG11Unorm", 4, 4, 5 },
+      { 178, "EAC_RGBA8", 4, 4, 6 }, { 179, "EAC_RGBA8_sRGB", 4, 4, 7 },
+      { 180, "ETC2_RGB8", 4, 4, 2 }, { 181, "ETC2_RGB8_sRGB", 4, 4, 3 },
+      { 182, "ETC2_RGB8A1", 4, 4, 8 }, { 183, "ETC2_RGB8A1_sRGB", 4, 4, 9 },
+      { 204, "ASTC_4x4_LDR", 4, 4, 0 }, { 186, "ASTC_4x4_sRGB", 4, 4, 1 },
+      { 212, "ASTC_8x8_LDR", 8, 8, 0 }, { 218, "ASTC_12x12_LDR", 12, 12, 0 },
+      { 207, "ASTC_6x5_LDR", 6, 5, 0 },
+   };
+   static uint8_t mem[4 * 4 * 16], got[4 * 4 * 16];
+   static struct dm_picture want;
+   char name[64];
+   for (unsigned i = 0; i < COUNT_OF(cf); i++) {
+      const unsigned w = cf[i].bw * 4, h = cf[i].bh * 4;
+      snprintf(name, sizeof(name), "cf-%s", cf[i].name);
+      struct rwa_texture *t = tx_make(r, TY_2D, cf[i].mtl, w, h, 1, 1, 1, 1, USE_R, name);
+      if (!t)
+         continue;
+      unsigned size = 16;
+      dm_clear(&want, (const float[4]){ 0, 0, 0, 0 });
+      static float colour[4][4][4];
+      for (unsigned by = 0; by < 4; by++)
+         for (unsigned bx = 0; bx < 4; bx++) {
+            uint8_t block[16];
+            tx_block(&cf[i], bx, by, block, &size, colour[by][bx]);
+            memcpy(mem + (size_t)(by * 4 + bx) * size, block, size);
+         }
+      for (unsigned y = 0; y < DM_H; y++)
+         for (unsigned x = 0; x < DM_W; x++)
+            memcpy(want.px[y][x], colour[y / 4][x / 4], 4 * sizeof(float));
+      snprintf(name, sizeof(name), "cf-%s-bytes", cf[i].name);
+      const unsigned o[3] = { 0, 0, 0 }, s[3] = { w, h, 1 };
+      r->why[0] = '\0';
+      if (rwa_texture_write(t, 0, 0, o, s, mem, 4 * size, r->why, sizeof(r->why)) != 0 ||
+          rwa_texture_read(t, 0, 0, o, s, got, 4 * size, r->why, sizeof(r->why)) != 0) {
+         dm_refused(r->backend, name, r->why);
+         r->refused++;
+      } else {
+         if (tm_bytes(r->backend, name, got, mem, 16, size, 4, false))
+            r->right++;
+         else
+            r->wrong++;
+         snprintf(name, sizeof(name), "cf-%s-sample", cf[i].name);
+         const struct pix_u u = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 0.0f);
+         if (tx_draw(r, t16, DM_RGBA32F, "m5b_f2d", t, near, &u, name))
+            pix_judge(r, t16, DM_RGBA32F, name, &want, 1.0f / 256.0f, false);
+      }
+      rwa_texture_destroy(t);
+   }
+}
+
+/*
+ * --srgb-curve --pixels DIR: this GPU's two sRGB curves, measured, because they are not the book's
+ * (draw_model.h, DM_SRGB_LINEAR_SLOP): run 111109's sRGB read rows are 0.0028 from the book where
+ * an M1 is within 0.00012, with the same digest on both back ends.
+ *
+ *   srgb-decode BACKEND C v...   what R8Unorm_sRGB's code C, C+1 ... reads as, sampled nearest into
+ *                                an RGBA32Float attachment: 16 a line, all 256 codes
+ *   srgb-encode BACKEND C k...   the first k of k/65536 that RGBA8Unorm_sRGB stores as code C, C+1
+ *                                ...: 16 a line, -1 for a code never stored
+ *   srgb-encode-order BACKEND N  how many samples went down a code on the way up (0 is a curve)
+ */
+static int
+run_pixels_srgb(const char *dir)
+{
+   struct pix r;
+   if (!pix_open(&r, dir, "srgb-curve"))
+      return 1;
+   static float src[16 * 16 * 4];
+   static uint8_t got8[DM_W * DM_H * 4];
+   static float gotf[DM_W * DM_H * 4];
+   static int first[256];
+   const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { DM_W, DM_H, 1 };
+   struct rwa_texture *t16 = pix_target(&r, DM_RGBA32F), *t8 = pix_target(&r, DM_RGBA8_SRGB);
+   struct rwa_sampler *near = tx_nearest(&r);
+   struct rwa_texture *r8 = tx_make(&r, TY_2D, 11, 16, 16, 1, 1, 1, 1, USE_R, "srgb-decode");
+   struct rwa_texture *ramp = tx_make(&r, TY_2D, 125, 16, 16, 1, 1, 1, 1, USE_R, "srgb-encode");
+   struct rwa_render *render = tx_pipeline(&r, "m5b_fread", DM_RGBA8_SRGB, 1, "srgb-encode");
+   const struct pix_u u = tx_u(1.0f / 16, 1.0f / 16, 0, 0, 0.0f);
+   struct rwa_buffer *ub = pix_buffer(&r, &u, sizeof(u));
+
+   if (t16 && r8 && near) {
+      static uint8_t codes[256];
+      for (unsigned i = 0; i < 256; i++)
+         codes[i] = (uint8_t)i;
+      tx_put(&r, r8, 0, 0, codes, "srgb-decode");
+      if (tx_draw(&r, t16, DM_RGBA32F, "m5b_f2d", r8, near, &u, "srgb-decode") &&
+          rwa_texture_read(t16, 0, 0, origin, extent, gotf, 0, r.why, sizeof(r.why)) == 0) {
+         for (unsigned y = 0; y < 16; y++) {
+            printf("drvtest: srgb-decode %s %u", r.backend, y * 16);
+            for (unsigned x = 0; x < 16; x++)
+               printf(" %.9g", gotf[(y * 16 + x) * 4]);
+            printf("\n");
+         }
+      }
+   }
+   if (t8 && ramp && render && ub) {
+      unsigned down = 0;
+      int last = 0;
+      for (unsigned i = 0; i < 256; i++)
+         first[i] = -1;
+      for (unsigned k = 0; k < 257; k++) {
+         for (unsigned i = 0; i < 256; i++) {
+            float v = (float)(k * 256 + i) / 65536.0f;
+            src[i * 4] = src[i * 4 + 1] = src[i * 4 + 2] = v;
+            src[i * 4 + 3] = 1.0f;
+         }
+         if (!tx_put(&r, ramp, 0, 0, src, "srgb-encode"))
+            break;
+         struct rwa_texture *color[1] = { t8 };
+         struct rwa_buffer *bufs[1] = { ub };
+         struct rwa_texture *texs[1] = { ramp };
+         const struct rwa_draw draw = {
+            .color = color, .color_count = 1, .primitive = 4, .vertex_count = 4,
+            .fragment = { .buffers = bufs, .buffer_count = 1, .textures = texs, .texture_count = 1 },
+         };
+         r.why[0] = '\0';
+         if (rwa_render_draw(render, &draw, r.why, sizeof(r.why)) != 0) {
+            pix_draw_failed(&r, "srgb-encode");
+            break;
+         }
+         if (rwa_texture_read(t8, 0, 0, origin, extent, got8, 0, r.why, sizeof(r.why)) != 0) {
+            dm_refused(r.backend, "srgb-encode", r.why);
+            r.refused++;
+            break;
+         }
+         for (unsigned i = 0; i < 256; i++) {
+            int c = got8[i * 4];
+            if (first[c] < 0)
+               first[c] = (int)(k * 256 + i);
+            down += c < last;
+            last = c;
+         }
+      }
+      for (unsigned y = 0; y < 16; y++) {
+         printf("drvtest: srgb-encode %s %u", r.backend, y * 16);
+         for (unsigned x = 0; x < 16; x++)
+            printf(" %d", first[y * 16 + x]);
+         printf("\n");
+      }
+      printf("drvtest: srgb-encode-order %s %u\n", r.backend, down);
+   }
+   rwa_finish(r.device, r.why, sizeof(r.why));
+   if (ub)
+      rwa_buffer_destroy(ub);
+   rwa_sampler_destroy(near);
+   rwa_texture_destroy(ramp);
+   rwa_texture_destroy(r8);
+   rwa_texture_destroy(t8);
+   rwa_texture_destroy(t16);
+   return 0;
+}
+
+static int
+run_pixels_formats(const char *dir)
+{
+   struct pix r;
+   if (!pix_open(&r, dir, "pixel-formats"))
+      return 1;
+   setenv("RWA_PACKED16", "1", 1);
+   struct rwa_texture *t16 = pix_target(&r, DM_RGBA32F);
+   struct rwa_sampler *near = tx_nearest(&r);
+   if (t16 && near) {
+      for (unsigned i = 0; i < COUNT_OF(tm_formats); i++)
+         tx_one_format(&r, &tm_formats[i], t16, near);
+      tx_compressed(&r, t16, near);
+   }
+   rwa_finish(r.device, r.why, sizeof(r.why));
+   rwa_sampler_destroy(near);
+   rwa_texture_destroy(t16);
+   printf("drvtest: draw-summary %s %s %u ok, %u differ, %u gallium-lacks, %u refused\n",
+          r.backend, r.mode, r.right, r.wrong, r.lacks, r.refused);
+   if (r.mirror)
+      printf("drvtest: draw-mirror %s %s %u rows are the Gallium library's mirrored 16-bit table\n",
+             r.backend, r.mode, r.mirror);
+   fflush(stdout);
+   return r.wrong ? 1 : 0;
+}
+
+/* ---- blits ---- */
+
+static void
+tx_blit_finish(struct pix *r)
+{
+   r->why[0] = '\0';
+   if (rwa_finish(r->device, r->why, sizeof(r->why)) != 0)
+      printf("air_metal_test: rwa_finish: %s\n", r->why);
+}
+
+/* A gradient in every channel, in a level, so a box of four is not one of its corners. */
+static void
+tx_gradient(uint8_t *to, unsigned w, unsigned h, unsigned slice)
+{
+   for (unsigned y = 0; y < h; y++)
+      for (unsigned x = 0; x < w; x++) {
+         uint8_t *t = to + ((size_t)y * w + x) * 4;
+         t[0] = (uint8_t)(x * 255 / (w - 1 ? w - 1 : 1));
+         t[1] = (uint8_t)(y * 255 / (h - 1 ? h - 1 : 1));
+         t[2] = (uint8_t)((x + y) * 127 / (w + h - 2 ? (w + h - 2) / 2 : 1) / 2);
+         t[3] = (uint8_t)(255 - x * 7 - slice * 20);
+      }
+}
+
+/* One level of a chain against the level above as it reads back (tm_box_level). */
+static void
+tx_mip_check(struct pix *r, struct rwa_texture *t, unsigned slice, unsigned levels, unsigned w,
+             bool srgb, const char *word)
+{
+   static uint8_t above[64 * 64 * 4], level[64 * 64 * 4], box[64 * 64 * 4];
+   char name[64];
+   r->why[0] = '\0';
+   unsigned aw = w;
+   if (rwa_texture_read(t, 0, slice, NULL, NULL, above, 0, r->why, sizeof(r->why)) != 0) {
+      dm_refused(r->backend, word, r->why);
+      r->wrong++;
+      return;
+   }
+   for (unsigned l = 1; l < levels; l++) {
+      unsigned lw = aw > 1 ? aw / 2 : 1;
+      snprintf(name, sizeof(name), "%s-L%u", word, l);
+      if (rwa_texture_read(t, l, slice, NULL, NULL, level, 0, r->why, sizeof(r->why)) != 0) {
+         dm_refused(r->backend, name, r->why);
+         r->wrong++;
+         return;
+      }
+      int max = 0;
+      unsigned bad = tm_box_level(above, aw, aw, level, lw, lw, srgb, srgb ? 2 : 1, &max);
+      for (unsigned y = 0; y < lw; y++)
+         for (unsigned x = 0; x < lw; x++)
+            for (unsigned c = 0; c < 4; c++) {
+               unsigned sum = 0;
+               for (unsigned dy = 0; dy < 2; dy++)
+                  for (unsigned dx = 0; dx < 2; dx++)
+                     sum += above[((size_t)(y * 2 + dy) * aw + x * 2 + dx) * 4 + c];
+               box[((size_t)y * lw + x) * 4 + c] = (uint8_t)((sum + 2) / 4);
+            }
+      printf("drvtest: draw-result %s %s %s digest %016llx expected %016llx\n", r->backend, name,
+             bad ? "DIFFERS" : "ok",
+             (unsigned long long)dm_fnv(level, (size_t)lw * lw * 4, 0xcbf29ce484222325ull),
+             (unsigned long long)dm_fnv(box, (size_t)lw * lw * 4, 0xcbf29ce484222325ull));
+      printf("drvtest: draw-box %s %s largest difference %d steps, %u values past the tolerance\n",
+             r->backend, name, max, bad);
+      if (bad)
+         r->wrong++;
+      else
+         r->right++;
+      memcpy(above, level, (size_t)lw * lw * 4);
+      aw = lw;
+   }
+}
+
+static int
+run_pixels_blit(const char *dir)
+{
+   struct pix r;
+   if (!pix_open(&r, dir, "blit"))
+      return 1;
+   *(void **)&view_create = dlsym(RTLD_DEFAULT, "rwa_texture_view_create");
+   static uint8_t mem[32 * 32 * 4 * 8], exp[32 * 32 * 4 * 8];
+   const unsigned bg = 0;
+   (void)bg;
+
+   /* a region of level 1 of one texture into level 1 of another, at origins that are not zero */
+   struct rwa_texture *a = tx_make(&r, TY_2D, FMT_RGBA8, 16, 16, 1, 1, 3, 1, USE_R, "blit-copy-level");
+   struct rwa_texture *b = tx_make(&r, TY_2D, FMT_RGBA8, 16, 16, 1, 1, 3, 1, USE_R, "blit-copy-level");
+   if (a && b) {
+      for (unsigned l = 0; l < 3; l++) {
+         tm_fill(mem, l, 0, 16 >> l, 16 >> l);
+         tx_put(&r, a, l, 0, mem, "blit-copy-level");
+         tm_fill(mem, l, 5, 16 >> l, 16 >> l);
+         tx_put(&r, b, l, 0, mem, "blit-copy-level");
+      }
+      const unsigned so[3] = { 1, 2, 0 }, sz[3] = { 4, 3, 1 }, dso[3] = { 3, 4, 0 };
+      r.why[0] = '\0';
+      if (rwa_copy_texture(a, 0, 1, so, sz, b, 0, 1, dso, r.why, sizeof(r.why)) != 0) {
+         dm_refused(r.backend, "blit-copy-level", r.why);
+         r.refused++;
+      } else {
+         tx_blit_finish(&r);
+         tm_fill(exp, 1, 5, 8, 8);
+         for (unsigned y = 0; y < 3; y++)
+            for (unsigned x = 0; x < 4; x++)
+               tm_texel(1, 0, x + 1, y + 2, exp + ((size_t)(y + 4) * 8 + x + 3) * 4);
+         tx_check_level(&r, b, 1, 0, 8, 8, exp, 4, "blit-copy-level", false);
+         tm_fill(exp, 0, 5, 16, 16);
+         tx_check_level(&r, b, 0, 0, 16, 16, exp, 4, "blit-copy-level-neighbour", false);
+      }
+      /* one image, one level into another: the GENERAL path */
+      const unsigned s2[3] = { 0, 0, 0 }, z2[3] = { 2, 2, 1 }, d2[3] = { 1, 1, 0 };
+      r.why[0] = '\0';
+      if (rwa_copy_texture(a, 0, 0, s2, z2, a, 0, 2, d2, r.why, sizeof(r.why)) != 0) {
+         dm_refused(r.backend, "blit-copy-sameimage", r.why);
+         r.refused++;
+      } else {
+         tx_blit_finish(&r);
+         tm_fill(exp, 2, 0, 4, 4);
+         for (unsigned y = 0; y < 2; y++)
+            for (unsigned x = 0; x < 2; x++)
+               tm_texel(0, 0, x, y, exp + ((size_t)(y + 1) * 4 + x + 1) * 4);
+         tx_check_level(&r, a, 2, 0, 4, 4, exp, 4, "blit-copy-sameimage", false);
+      }
+   }
+   rwa_texture_destroy(a);
+   rwa_texture_destroy(b);
+
+   /* a slice into another slice of another array; a cube's face into an array's slice */
+   a = tx_make(&r, TY_2DA, FMT_RGBA8, 16, 16, 1, 3, 1, 1, USE_R, "blit-copy-slice");
+   b = tx_make(&r, TY_2DA, FMT_RGBA8, 16, 16, 1, 6, 1, 1, USE_R, "blit-copy-slice");
+   struct rwa_texture *c = tx_make(&r, TY_CUBE, FMT_RGBA8, 16, 16, 1, 1, 1, 1, USE_R, "blit-copy-cube");
+   if (a && b && c) {
+      for (unsigned s = 0; s < 3; s++) {
+         tm_fill(mem, 0, s, 16, 16);
+         tx_put(&r, a, 0, s, mem, "blit-copy-slice");
+      }
+      for (unsigned s = 0; s < 6; s++) {
+         tm_fill(mem, 1, s, 16, 16);
+         tx_put(&r, b, 0, s, mem, "blit-copy-slice");
+         tm_fill(mem, 2, s, 16, 16);
+         tx_put(&r, c, 0, s, mem, "blit-copy-cube");
+      }
+      const unsigned so[3] = { 5, 6, 0 }, sz[3] = { 7, 8, 1 }, dso[3] = { 2, 1, 0 };
+      r.why[0] = '\0';
+      if (rwa_copy_texture(a, 1, 0, so, sz, b, 3, 0, dso, r.why, sizeof(r.why)) != 0) {
+         dm_refused(r.backend, "blit-copy-slice", r.why);
+         r.refused++;
+      } else {
+         tx_blit_finish(&r);
+         tm_fill(exp, 1, 3, 16, 16);
+         for (unsigned y = 0; y < 8; y++)
+            for (unsigned x = 0; x < 7; x++)
+               tm_texel(0, 1, x + 5, y + 6, exp + ((size_t)(y + 1) * 16 + x + 2) * 4);
+         tx_check_level(&r, b, 0, 3, 16, 16, exp, 4, "blit-copy-slice", false);
+         tm_fill(exp, 1, 2, 16, 16);
+         tx_check_level(&r, b, 0, 2, 16, 16, exp, 4, "blit-copy-slice-neighbour", false);
+      }
+      r.why[0] = '\0';
+      if (rwa_copy_texture(c, 4, 0, NULL, NULL, b, 5, 0, NULL, r.why, sizeof(r.why)) != 0) {
+         dm_refused(r.backend, "blit-copy-cube", r.why);
+         r.refused++;
+      } else {
+         tx_blit_finish(&r);
+         tm_fill(exp, 2, 4, 16, 16);
+         tx_check_level(&r, b, 0, 5, 16, 16, exp, 4, "blit-copy-cube", false);
+      }
+   }
+   rwa_texture_destroy(a);
+   rwa_texture_destroy(b);
+   rwa_texture_destroy(c);
+
+   /* 3D: a stack of planes, at a z that is not zero */
+   a = tx_make(&r, TY_3D, FMT_RGBA8, 8, 8, 8, 1, 1, 1, USE_R, "blit-copy-3d");
+   b = tx_make(&r, TY_3D, FMT_RGBA8, 8, 8, 8, 1, 1, 1, USE_R, "blit-copy-3d");
+   if (a && b) {
+      for (unsigned z = 0; z < 8; z++)
+         tm_fill(mem + (size_t)z * 8 * 8 * 4, 0, z, 8, 8);
+      tx_put(&r, a, 0, 0, mem, "blit-copy-3d");
+      for (unsigned z = 0; z < 8; z++)
+         tm_fill(mem + (size_t)z * 8 * 8 * 4, 1, z, 8, 8);
+      tx_put(&r, b, 0, 0, mem, "blit-copy-3d");
+      const unsigned so[3] = { 1, 1, 2 }, sz[3] = { 3, 2, 2 }, dso[3] = { 4, 5, 3 };
+      r.why[0] = '\0';
+      if (rwa_copy_texture(a, 0, 0, so, sz, b, 0, 0, dso, r.why, sizeof(r.why)) != 0) {
+         dm_refused(r.backend, "blit-copy-3d", r.why);
+         r.refused++;
+      } else {
+         tx_blit_finish(&r);
+         for (unsigned z = 0; z < 8; z++)
+            tm_fill(exp + (size_t)z * 8 * 8 * 4, 1, z, 8, 8);
+         for (unsigned z = 0; z < 2; z++)
+            for (unsigned y = 0; y < 2; y++)
+               for (unsigned x = 0; x < 3; x++)
+                  tm_texel(0, z + 2, x + 1, y + 1,
+                           exp + (((size_t)(z + 3) * 8 + y + 5) * 8 + x + 4) * 4);
+         static uint8_t got[8 * 8 * 8 * 4];
+         r.why[0] = '\0';
+         if (rwa_texture_read(b, 0, 0, NULL, NULL, got, 0, r.why, sizeof(r.why)) != 0) {
+            dm_refused(r.backend, "blit-copy-3d", r.why);
+            r.wrong++;
+         } else if (tm_bytes(r.backend, "blit-copy-3d", got, exp, 512, 4, 8, false)) {
+            r.right++;
+         } else {
+            r.wrong++;
+         }
+      }
+   }
+   rwa_texture_destroy(a);
+   rwa_texture_destroy(b);
+
+   /* buffer into level 1, slice 2: bytes per row wider than the region, an offset, an origin */
+   a = tx_make(&r, TY_2DA, FMT_RGBA8, 16, 16, 1, 3, 2, 1, USE_R, "blit-buffer");
+   struct rwa_buffer *buf = rwa_buffer_create(r.device, 4096, r.why, sizeof(r.why));
+   if (a && buf) {
+      uint8_t *m = rwa_buffer_map(buf);
+      for (unsigned s = 0; s < 3; s++)
+         for (unsigned l = 0; l < 2; l++) {
+            tm_fill(mem, l, s, 16 >> l, 16 >> l);
+            tx_put(&r, a, l, s, mem, "blit-buffer");
+         }
+      memset(m, 0xa5, 4096);
+      const unsigned row = 5 * 4 + 12;
+      for (unsigned y = 0; y < 4; y++)
+         for (unsigned x = 0; x < 5; x++)
+            tm_texel(12, 12, x, y, m + 64 + (size_t)y * row + x * 4);
+      const unsigned sz[3] = { 5, 4, 1 }, dso[3] = { 1, 2, 0 };
+      r.why[0] = '\0';
+      if (rwa_copy_buffer_to_texture(buf, 64, row, 0, sz, a, 2, 1, dso, r.why, sizeof(r.why)) != 0) {
+         dm_refused(r.backend, "blit-buffer-to-level1-slice2", r.why);
+         r.refused++;
+      } else {
+         tx_blit_finish(&r);
+         tm_fill(exp, 1, 2, 8, 8);
+         for (unsigned y = 0; y < 4; y++)
+            for (unsigned x = 0; x < 5; x++)
+               tm_texel(12, 12, x, y, exp + ((size_t)(y + 2) * 8 + x + 1) * 4);
+         tx_check_level(&r, a, 1, 2, 8, 8, exp, 4, "blit-buffer-to-level1-slice2", false);
+         tm_fill(exp, 1, 1, 8, 8);
+         tx_check_level(&r, a, 1, 1, 8, 8, exp, 4, "blit-buffer-to-level1-slice2-neighbour", false);
+      }
+      /* and out again, into a buffer whose gaps must stay as they were */
+      memset(m, 0x5a, 4096);
+      r.why[0] = '\0';
+      if (rwa_copy_texture_to_buffer(a, 0, 0, dso, sz, buf, 128, row, 0, r.why, sizeof(r.why)) != 0) {
+         dm_refused(r.backend, "blit-level0-slice0-to-buffer", r.why);
+         r.refused++;
+      } else {
+         tx_blit_finish(&r);
+         memset(exp, 0x5a, 4096);
+         for (unsigned y = 0; y < 4; y++)
+            for (unsigned x = 0; x < 5; x++)
+               tm_texel(0, 0, x + 1, y + 2, exp + 128 + (size_t)y * row + x * 4);
+         static uint8_t copy[4096];
+         memcpy(copy, m, 4096);
+         if (tm_bytes(r.backend, "blit-level0-slice0-to-buffer", copy, exp, 1024, 4, 32, false))
+            r.right++;
+         else
+            r.wrong++;
+      }
+   }
+   /* a 3D region with bytes per image wider than its rows */
+   b = tx_make(&r, TY_3D, FMT_RGBA8, 8, 8, 4, 1, 1, 1, USE_R, "blit-buffer-3d");
+   if (b && buf) {
+      uint8_t *m = rwa_buffer_map(buf);
+      for (unsigned z = 0; z < 4; z++)
+         tm_fill(mem + (size_t)z * 8 * 8 * 4, 3, z, 8, 8);
+      tx_put(&r, b, 0, 0, mem, "blit-buffer-3d");
+      const unsigned row = 3 * 4, image = row * 5;
+      memset(m, 0xa5, 4096);
+      for (unsigned z = 0; z < 2; z++)
+         for (unsigned y = 0; y < 2; y++)
+            for (unsigned x = 0; x < 3; x++)
+               tm_texel(14, z, x, y, m + (size_t)z * image + (size_t)y * row + x * 4);
+      const unsigned sz[3] = { 3, 2, 2 }, dso[3] = { 2, 3, 1 };
+      r.why[0] = '\0';
+      if (rwa_copy_buffer_to_texture(buf, 0, row, image, sz, b, 0, 0, dso, r.why, sizeof(r.why)) != 0) {
+         dm_refused(r.backend, "blit-buffer-3d", r.why);
+         r.refused++;
+      } else {
+         tx_blit_finish(&r);
+         memcpy(exp, mem, 4 * 8 * 8 * 4);
+         for (unsigned z = 0; z < 2; z++)
+            for (unsigned y = 0; y < 2; y++)
+               for (unsigned x = 0; x < 3; x++)
+                  tm_texel(14, z, x, y, exp + (((size_t)(z + 1) * 8 + y + 3) * 8 + x + 2) * 4);
+         static uint8_t got[8 * 8 * 4 * 4];
+         r.why[0] = '\0';
+         if (rwa_texture_read(b, 0, 0, NULL, NULL, got, 0, r.why, sizeof(r.why)) != 0) {
+            dm_refused(r.backend, "blit-buffer-3d", r.why);
+            r.wrong++;
+         } else if (tm_bytes(r.backend, "blit-buffer-3d", got, exp, 256, 4, 8, false)) {
+            r.right++;
+         } else {
+            r.wrong++;
+         }
+      }
+   }
+   rwa_texture_destroy(a);
+   rwa_texture_destroy(b);
+   rwa_buffer_destroy(buf);
+
+   /* GENERATE MIPMAPS: a gradient, each level against the box of the level above as read back */
+   {
+      static const struct { const char *word; unsigned fmt, type, slices; bool srgb; } mip[] = {
+         { "blit-mip-rgba8", FMT_RGBA8, TY_2D, 1, false },
+         { "blit-mip-bgra8", 80, TY_2D, 1, false },
+         { "blit-mip-srgb", 71, TY_2D, 1, true },
+         { "blit-mip-array", FMT_RGBA8, TY_2DA, 3, false },
+         { "blit-mip-cube", FMT_RGBA8, TY_CUBE, 6, false },
+      };
+      for (unsigned i = 0; i < COUNT_OF(mip); i++) {
+         a = tx_make(&r, mip[i].type, mip[i].fmt, 32, 32, 1, mip[i].type == TY_2DA ? 3 : 1, 6, 1,
+                     USE_R | USE_RT, mip[i].word);
+         if (!a)
+            continue;
+         for (unsigned s = 0; s < mip[i].slices; s++) {
+            tx_gradient(mem, 32, 32, s);
+            tx_put(&r, a, 0, s, mem, mip[i].word);
+         }
+         r.why[0] = '\0';
+         if (rwa_generate_mipmaps(a, r.why, sizeof(r.why)) != 0) {
+            dm_refused(r.backend, mip[i].word, r.why);
+            r.refused++;
+         } else {
+            tx_blit_finish(&r);
+            for (unsigned s = 0; s < mip[i].slices; s += mip[i].slices > 1 ? mip[i].slices - 1 : 1) {
+               char word[64];
+               snprintf(word, sizeof(word), "%s-S%u", mip[i].word, s);
+               tx_mip_check(&r, a, s, 6, 32, mip[i].srgb, word);
+            }
+         }
+         rwa_texture_destroy(a);
+      }
+      /* and a 3D chain, whose depth halves with the rest: one level, the eight of each box */
+      a = tx_make(&r, TY_3D, FMT_RGBA8, 16, 16, 8, 1, 2, 1, USE_R | USE_RT, "blit-mip-3d");
+      if (a) {
+         static uint8_t vol[16 * 16 * 8 * 4], lev[8 * 8 * 4 * 4], box3[8 * 8 * 4 * 4];
+         for (unsigned z = 0; z < 8; z++)
+            for (unsigned y = 0; y < 16; y++)
+               for (unsigned x = 0; x < 16; x++) {
+                  uint8_t *t = vol + (((size_t)z * 16 + y) * 16 + x) * 4;
+                  t[0] = (uint8_t)(x * 16);
+                  t[1] = (uint8_t)(y * 16);
+                  t[2] = (uint8_t)(z * 32);
+                  t[3] = (uint8_t)(255 - x * 4 - z * 8);
+               }
+         tx_put(&r, a, 0, 0, vol, "blit-mip-3d");
+         r.why[0] = '\0';
+         if (rwa_generate_mipmaps(a, r.why, sizeof(r.why)) != 0 ||
+             rwa_texture_read(a, 1, 0, NULL, NULL, lev, 0, r.why, sizeof(r.why)) != 0) {
+            dm_refused(r.backend, "blit-mip-3d", r.why);
+            r.refused++;
+         } else {
+            int max = 0;
+            for (unsigned z = 0; z < 4; z++)
+               for (unsigned y = 0; y < 8; y++)
+                  for (unsigned x = 0; x < 8; x++)
+                     for (unsigned c = 0; c < 4; c++) {
+                        unsigned sum = 0;
+                        for (unsigned k = 0; k < 8; k++)
+                           sum += vol[(((size_t)(z * 2 + (k >> 2)) * 16 + y * 2 + ((k >> 1) & 1)) * 16 +
+                                       x * 2 + (k & 1)) * 4 + c];
+                        uint8_t v = (uint8_t)((sum + 4) / 8);
+                        box3[(((size_t)z * 8 + y) * 8 + x) * 4 + c] = v;
+                        int d = (int)lev[(((size_t)z * 8 + y) * 8 + x) * 4 + c] - (int)v;
+                        d = d < 0 ? -d : d;
+                        max = d > max ? d : max;
+                     }
+            printf("drvtest: draw-result %s blit-mip-3d-L1 %s digest %016llx expected %016llx\n",
+                   r.backend, max > 1 ? "DIFFERS" : "ok",
+                   (unsigned long long)dm_fnv(lev, sizeof(lev), 0xcbf29ce484222325ull),
+                   (unsigned long long)dm_fnv(box3, sizeof(box3), 0xcbf29ce484222325ull));
+            printf("drvtest: draw-box %s blit-mip-3d-L1 largest difference %d steps\n", r.backend,
+                   max);
+            if (max > 1)
+               r.wrong++;
+            else
+               r.right++;
+         }
+         rwa_texture_destroy(a);
+      }
+      /* a format that cannot be filtered: what each library answers is the line */
+      a = tx_make(&r, TY_2D, 73, 16, 16, 1, 1, 5, 1, USE_R | USE_RT, "blit-mip-uint");
+      if (a) {
+         r.why[0] = '\0';
+         int rc = rwa_generate_mipmaps(a, r.why, sizeof(r.why));
+         printf("drvtest: draw-result %s blit-mip-uint %s: %s\n", r.backend, rc ? "refused" : "made",
+                rc ? r.why : "");
+         r.refused += rc ? 1 : 0;
+         rwa_texture_destroy(a);
+      }
+   }
+   tx_blit_finish(&r);
+   return pix_close(&r);
+}
+
 int
 main(int argc, char **argv)
 {
+   /* --gpu first: the GPU and not softpipe (RWA_SOFTWARE=0), for the phone, where an rc job
+    * line has no environment of its own to set it in. Built against either library of the
+    * contract -- libhackiosair (Gallium) or libvulkan_freedreno (Vulkan, tools/mesa/air/
+    * air_vk.c, which has no software path) -- the same draw is then the same question asked
+    * of both back ends in one boot (Metal over Vulkan, M3a: fragpos.bc, whose every pixel is
+    * its own position, so a back end that drew nothing or drew elsewhere cannot agree).
+    */
+   if (argc >= 2 && !strcmp(argv[1], "--gpu")) {
+      setenv("RWA_SOFTWARE", "0", 1);
+      argv[1] = argv[0];
+      argv++;
+      argc--;
+   }
+   /* --tu-debug FLAGS next, for the same reason: turnip's TU_DEBUG (sysmem, gmem, noubwc,
+    * ... comma-separated) for one run, set before any device is opened -- turnip reads it
+    * once, when the first instance is made -- so that one boot can run the same draw with
+    * sysmem and with GMEM rendering forced (asked for after run 054947). The Gallium
+    * library ignores it; the result lines name it after the back end. */
+   /* ... and the switches of --surface self's draw (run_surface_self, after run 060507),
+    * in any order with --tu-debug, all before the mode. */
+   for (;;) {
+      /* --ir3-debug FLAGS: ir3's IR3_SHADER_DEBUG for this run, turnip reading it as it does
+       * TU_DEBUG. `disasm` puts the NIR and the machine code of every shader in the log, which is
+       * how a question about what a shader's instructions ask for gets asked of the real
+       * compiler with the real flags (M5c, the precision of an sRGB read's sam). */
+      if (argc >= 3 && !strcmp(argv[1], "--ir3-debug")) {
+         setenv("IR3_SHADER_DEBUG", argv[2], 1);
+         printf("air_metal_test: IR3_SHADER_DEBUG=%s for this run\n", argv[2]);
+         argv[2] = argv[0];
+         argv += 2;
+         argc -= 2;
+         continue;
+      }
+      if (argc >= 3 && !strcmp(argv[1], "--tu-debug")) {
+         setenv("TU_DEBUG", argv[2], 1);
+         printf("air_metal_test: TU_DEBUG=%s for this run\n", argv[2]);
+      } else if (argc >= 2 && !strcmp(argv[1], "--vk-noseen")) {
+         setenv("AIR_VK_NOSEEN", "1", 1);
+         printf("air_metal_test: AIR_VK_NOSEEN=1 for this run\n");
+         argv[1] = argv[0];
+         argv++;
+         argc--;
+         continue;
+#ifdef __APPLE__
+      } else if (argc >= 3 && !strcmp(argv[1], "--fence-delay-us")) {
+         surface_fence_delay_us = (unsigned) atoi(argv[2]);
+      } else if (argc >= 2 && !strcmp(argv[1], "--predraw-flush")) {
+         surface_predraw_flush = true;
+         argv[1] = argv[0];
+         argv++;
+         argc--;
+         continue;
+      } else if (argc >= 2 && !strcmp(argv[1], "--read-noclean")) {
+         surface_read_noclean = true;
+         argv[1] = argv[0];
+         argv++;
+         argc--;
+         continue;
+      } else if (argc >= 2 && !strcmp(argv[1], "--read-civac")) {
+         surface_read_civac = true;     /* (the default since M4) */
+         argv[1] = argv[0];
+         argv++;
+         argc--;
+         continue;
+      } else if (argc >= 2 && !strcmp(argv[1], "--read-sysflush")) {
+         surface_read_civac = false;    /* the flushed reads as before M4: sys_dcache_flush */
+         argv[1] = argv[0];
+         argv++;
+         argc--;
+         continue;
+#endif
+      } else {
+         break;
+      }
+      argv[2] = argv[0];
+      argv += 2;
+      argc -= 2;
+   }
    /* --draw puts a fragment shader through rwa_render_*; without it the program
     * dispatches a kernel through rwa_compute_*, as it did before. The two are separate
     * because a fragment shader handed to rwa_compute_create is refused ("is a fragment
@@ -6375,9 +10994,9 @@ main(int argc, char **argv)
     * first: it is the answer a caller needs BEFORE it can make the textures the two
     * modes below make.
     */
-   if (argc >= 2 && !strcmp(argv[1], "--blit"))
+   if (argc >= 2 && !strcmp(argv[1], "--blit") && !(argc >= 3 && !strcmp(argv[2], "--pixels")))
       return run_blit();
-   if (argc >= 2 && !strcmp(argv[1], "--textures")) {
+   if (argc >= 2 && !strcmp(argv[1], "--textures") && !(argc >= 3 && !strcmp(argv[2], "--pixels"))) {
       if (argc < 3) {
          fprintf(stderr, "usage: air_metal_test --textures FILE.metallib [FUNCTION]\n");
          return 2;
@@ -6410,11 +11029,32 @@ main(int argc, char **argv)
    }
 
    /* --surface takes no .metallib at all: it is about memory, not about a shader. */
+   /* "self" for the ID makes the surface here (run_surface_self, the phone only): the one
+    * form that writes into it, because a surface made by this program is the only one it
+    * may write. */
+   if (argc >= 3 && !strcmp(argv[1], "--surface") && !strcmp(argv[2], "self")) {
+#ifdef __APPLE__
+      if (argc < 6) {
+         fprintf(stderr, "usage: air_metal_test --surface self WIDTH HEIGHT ROWBYTES "
+                         "[MTLPixelFormat [FILE FUNCTION]]\n");
+         return 2;
+      }
+      return run_surface_self((unsigned) atoi(argv[3]), (unsigned) atoi(argv[4]),
+                              (unsigned) atoi(argv[5]),
+                              argc > 6 ? (unsigned) atoi(argv[6]) : 80,
+                              argc > 8 ? argv[7] : NULL, argc > 8 ? argv[8] : NULL);
+#else
+      fprintf(stderr, "air_metal_test: --surface self makes an IOSurface, and this machine "
+                      "has none\n");
+      return 2;
+#endif
+   }
    if (argc >= 2 && !strcmp(argv[1], "--surface")) {
       return run_surface(argc > 2 ? atoi(argv[2]) : 1,
                          argc > 3 ? (unsigned) atoi(argv[3]) : 1080,
                          argc > 4 ? (unsigned) atoi(argv[4]) : 2400,
-                         argc > 5 ? (unsigned) atoi(argv[5]) : 4352);
+                         argc > 5 ? (unsigned) atoi(argv[5]) : 4352,
+                         80 /* MTLPixelFormatBGRA8Unorm */);
    }
 
    if (argc >= 2 && !strcmp(argv[1], "--draw")) {
@@ -6441,6 +11081,28 @@ main(int argc, char **argv)
     * right answer. Two arguments, like --pixel-formats: a container and a fragment
     * function whose output this program controls through the texture it samples.
     */
+   /* M5a: a second form of each of the five modes that have one (run_pixels_*, at --pixels). */
+   if (argc >= 4 && !strcmp(argv[2], "--pixels")) {
+      /* M5b: and the three modes of textures, formats and blits */
+      if (!strcmp(argv[1], "--textures"))
+         return run_pixels_textures(argv[3]);
+      if (!strcmp(argv[1], "--pixel-formats"))
+         return run_pixels_formats(argv[3]);
+      if (!strcmp(argv[1], "--blit"))
+         return run_pixels_blit(argv[3]);
+      if (!strcmp(argv[1], "--srgb-curve"))
+         return run_pixels_srgb(argv[3]);
+      if (!strcmp(argv[1], "--draw-blend"))
+         return run_pixels_blend(argv[3]);
+      if (!strcmp(argv[1], "--draw-attrib"))
+         return run_pixels_attrib(argv[3]);
+      if (!strcmp(argv[1], "--attrib-sweep"))
+         return run_pixels_sweep(argv[3]);
+      if (!strcmp(argv[1], "--draw-index"))
+         return run_pixels_index(argv[3]);
+      if (!strcmp(argv[1], "--draw-vertex"))
+         return run_pixels_vertex(argv[3]);
+   }
    if (argc >= 2 && !strcmp(argv[1], "--draw-blend")) {
       if (argc < 4) {
          fprintf(stderr, "usage: %s --draw-blend FILE.metallib FUNCTION\n", argv[0]);
@@ -6554,7 +11216,7 @@ main(int argc, char **argv)
 
    if (argc < 2) {
       fprintf(stderr, "usage: air_metal_test FILE.metallib [FUNCTION "
-                      "[MTLPixelFormat[,...] [FILL]]]\n"
+                      "[MTLPixelFormat[,...] [FILL [GROUPS [THREADS [index]]]]]]\n"
                       "       air_metal_test --textures FILE.metallib [FUNCTION]\n"
                       "       air_metal_test --draw FILE.metallib FUNCTION "
                       "[MTLPixelFormat[,...] "
@@ -6584,6 +11246,20 @@ main(int argc, char **argv)
     * one that wrote zeros.
     */
    unsigned fill = argc > 4 ? (unsigned)strtoul(argv[4], NULL, 0) & 0xff : 0xa5;
+
+   /* And what every texture is seeded with: air_run's texels unless the seventh argument,
+    * TEXELS, is "index" (M3d-2: index_texel_value, for tools/air/sample3d.ll). After
+    * GROUPS and THREADS because an rc.jobs line has no environment to say it in, and a
+    * word that is not "index" is refused rather than read as the default.
+    */
+   bool index_texels = false;
+   if (argc > 7) {
+      if (strcmp(argv[7], "index") != 0) {
+         fprintf(stderr, "air_metal_test: TEXELS is \"index\" or nothing, not %s\n", argv[7]);
+         return 2;
+      }
+      index_texels = true;
+   }
 
    /* One format per texture slot, comma separated, each optionally followed by ":" and
     * an MTLTextureType (2 is 2D and the default, 7 is 3D). Per slot and not per kernel
@@ -6670,6 +11346,8 @@ main(int argc, char **argv)
                          why, sizeof(why));
    if (!compute) {
       printf("air_metal_test: rwa_compute_create: %s\n", why);
+      printf("air_metal_test: compute-result %s %s no-pipeline %s\n", backend_word(), name,
+             why);
       rwa_device_close(device);
       return 1;
    }
@@ -6735,7 +11413,10 @@ main(int argc, char **argv)
          for (unsigned y = 0; y < TEX; y++)
             for (unsigned x = 0; x < TEX; x++) {
                float v[4];
-               texel_value(i, x, y, z, v);
+               if (index_texels)
+                  index_texel_value(i, x, y, z, v);
+               else
+                  texel_value(i, x, y, z, v);
                for (unsigned c = 0; c < 4; c++) {
                   unsigned k = texel_index(x, y, z) + c;
                   if (is_float[i])
@@ -6750,10 +11431,16 @@ main(int argc, char **argv)
          return 1;
       }
    }
-   for (unsigned i = 0; i < ntex; i++)
-      printf("air_metal_test: texture %u is %ux%ux%u of pixel format %u, texel (x,y,z) = "
-             "(100+x+%u, 200+y, 300+x+y+z, 400)\n", i, extent[i][0], extent[i][1],
-             extent[i][2], format[i], 1000 * i);
+   for (unsigned i = 0; i < ntex; i++) {
+      if (index_texels)
+         printf("air_metal_test: texture %u is %ux%ux%u of pixel format %u, texel (x,y,z) = "
+                "(x+4y+16z+%u, 1, 0, 1)\n", i, extent[i][0], extent[i][1], extent[i][2],
+                format[i], TEX * TEX * TEX * i);
+      else
+         printf("air_metal_test: texture %u is %ux%ux%u of pixel format %u, texel (x,y,z) = "
+                "(100+x+%u, 200+y, 300+x+y+z, 400)\n", i, extent[i][0], extent[i][1],
+                extent[i][2], format[i], 1000 * i);
+   }
 
    /* and a sampler per slot the API is expected to fill. Nearest, clamped and in
     * pixels, which is what air_run binds in its compute path: a kernel's own
@@ -6789,10 +11476,26 @@ main(int argc, char **argv)
       .textures = textures, .texture_count = ntex,
       .samplers = samplers, .sampler_count = nsamp,
    };
-   const unsigned groups[3] = { 1, 1, 1 };
-   const unsigned group_size[3] = { TEX, TEX, 1 };
+   /* One group of TEX x TEX threads, air_run's grid, unless the fifth and sixth arguments
+    * say otherwise (M3d): GROUPS and THREADS as WxHxD. tools/air/sysvals.ll is the kernel
+    * they are for -- it writes every system value a thread has, and only a grid of more
+    * than one group, of a group that is not square, makes those values say anything
+    * (threadgroup_position_in_grid is 0 everywhere in a grid of one). */
+   unsigned groups[3] = { 1, 1, 1 };
+   unsigned group_size[3] = { TEX, TEX, 1 };
+   if (argc > 5 && sscanf(argv[5], "%ux%ux%u", &groups[0], &groups[1], &groups[2]) != 3) {
+      fprintf(stderr, "air_metal_test: GROUPS is WxHxD, not %s\n", argv[5]);
+      return 2;
+   }
+   if (argc > 6 &&
+       sscanf(argv[6], "%ux%ux%u", &group_size[0], &group_size[1], &group_size[2]) != 3) {
+      fprintf(stderr, "air_metal_test: THREADS is WxHxD, not %s\n", argv[6]);
+      return 2;
+   }
    if (rwa_dispatch(compute, &bindings, groups, group_size, why, sizeof(why)) != 0) {
       printf("air_metal_test: rwa_dispatch: %s\n", why);
+      printf("air_metal_test: compute-result %s %s refused-dispatch %s\n", backend_word(),
+             name, why);
       rwa_compute_destroy(compute);
       for (unsigned i = 0; i < count; i++)
          rwa_buffer_destroy(buffers[i]);
@@ -6805,10 +11508,17 @@ main(int argc, char **argv)
    }
    if (rwa_finish(device, why, sizeof(why)) != 0) {
       printf("air_metal_test: rwa_finish: %s\n", why);
+      printf("air_metal_test: compute-result %s %s refused-dispatch %s\n", backend_word(),
+             name, why);
       return 1;
    }
    printf("air_metal_test: dispatched %ux%ux%u threadgroups of %ux%ux%u threads\n",
           groups[0], groups[1], groups[2], group_size[0], group_size[1], group_size[2]);
+
+   /* the result line's fields, gathered as the outputs are looked at (M3d) */
+   char result[1024] = "";
+   size_t result_at = 0;
+   unsigned outputs = 0;
 
    for (unsigned i = 0; i < count; i++) {
       const uint32_t *words = rwa_buffer_map(buffers[i]);
@@ -6819,6 +11529,12 @@ main(int argc, char **argv)
       printf("air_metal_test: buffer %u %s; first six words %08x %08x %08x %08x %08x %08x\n",
              i, changed ? "was written" : "came back as it went in", words[0], words[1],
              words[2], words[3], words[4], words[5]);
+      if (changed && result_at < sizeof(result)) {
+         outputs++;
+         result_at += snprintf(result + result_at, sizeof(result) - result_at, " b%u %016llx",
+                               i, (unsigned long long)fnv1a64(words,
+                                                              rwa_buffer_size(buffers[i])));
+      }
    }
 
    /* and every texture read back, which is the half of this a buffer cannot stand in
@@ -6836,6 +11552,14 @@ main(int argc, char **argv)
       bool changed = memcmp(&got, &written[i], sizeof(got)) != 0;
       printf("air_metal_test: texture %u %s\n", i,
              changed ? "was written" : "came back as it went in");
+      /* the level as read, extent[i] texels of 16 bytes: what the result line digests */
+      if (changed && result_at < sizeof(result)) {
+         outputs++;
+         result_at += snprintf(result + result_at, sizeof(result) - result_at, " t%u %016llx",
+                               i, (unsigned long long)fnv1a64(&got, (size_t)extent[i][0] *
+                                                              extent[i][1] * extent[i][2] *
+                                                              16));
+      }
       print_texel("texture", i, 0, 0, 0, &got, is_float[i]);
       print_texel("texture", i, 1, 1, extent[i][2] > 1 ? 1 : 0, &got, is_float[i]);
 
@@ -6858,6 +11582,10 @@ main(int argc, char **argv)
              memcmp(&texel, (const char *)&got + texel_index(1, 1, z) * sizeof(float),
                     sizeof(texel)) == 0 ? "is" : "IS NOT");
    }
+   /* before the processor's own one-texel write below changes texture 0 */
+   printf("air_metal_test: compute-result %s %s ran%s\n", backend_word(), name,
+          outputs ? result : " unchanged");
+   fflush(stdout);
 
    /* And the same question on the write side, which the dispatch cannot ask: one texel
     * written at an origin a whole-level write never visits. Afterwards exactly that

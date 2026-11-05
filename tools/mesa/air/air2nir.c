@@ -41,6 +41,13 @@
  * an entry point of the corpus and must not be counted as one.
  */
 static bool library_wrapper = false;
+/* --not-defined: every function constant unset, which is a specialized function given no values
+ * (air_to_nir_options.partial_constants), as against every one defined and zero */
+static bool not_defined = false;
+/* --constants I=HEX,I=HEX...: those set and every other unset, what hkmetal's `spec` line prints:
+ * what a specialization of CoreAnimation's compiles to */
+static struct air_constant_value given[256];
+static unsigned num_given = 0;
 
 static const nir_shader_compiler_options default_options = {
    .lower_fdiv = false,
@@ -302,7 +309,8 @@ eval_module(const struct module_ref *mod)
    const char *err = NULL;
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
-   struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+   struct air_to_nir_options options = { .constants = not_defined ? given : fc, .num_constants = not_defined ? num_given : num_fc,
+                                        .partial_constants = not_defined,
                                         .library_wrapper = library_wrapper };
    struct air_shader_info info;
    nir_shader *nir = air_to_nir(ctx, mod->bitcode, mod->size, NULL, &options,
@@ -395,7 +403,8 @@ interface_module(const struct module_ref *mod)
    const char *err = NULL;
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
-   struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+   struct air_to_nir_options options = { .constants = not_defined ? given : fc, .num_constants = not_defined ? num_given : num_fc,
+                                        .partial_constants = not_defined,
                                         .library_wrapper = library_wrapper };
    struct air_shader_info info;
    nir_shader *nir = air_to_nir(ctx, mod->bitcode, mod->size, NULL, &options,
@@ -479,7 +488,8 @@ report_one(const struct module_ref *mod)
     */
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
-   struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+   struct air_to_nir_options options = { .constants = not_defined ? given : fc, .num_constants = not_defined ? num_given : num_fc,
+                                        .partial_constants = not_defined,
                                         .library_wrapper = library_wrapper };
    if (num_fc)
       printf("\tfc=%u", num_fc);
@@ -523,8 +533,24 @@ main(int argc, char **argv)
 {
    enum { TRANSLATE, LL, LIST, REPORT, EVAL, INTERFACE } mode = TRANSLATE;
    int i = 1;
-   while (i < argc && !strcmp(argv[i], "--library"))
-      library_wrapper = true, i++;
+   for (; i < argc && (!strcmp(argv[i], "--library") || !strcmp(argv[i], "--not-defined") ||
+                       !strcmp(argv[i], "--constants")); i++) {
+      if (!strcmp(argv[i], "--library")) {
+         library_wrapper = true;
+      } else if (!strcmp(argv[i], "--not-defined")) {
+         not_defined = true;
+      } else if (i + 1 < argc) {
+         not_defined = true;
+         for (char *p = argv[++i]; *p && num_given < 256;) {
+            given[num_given].index = strtoul(p, &p, 10);
+            if (*p == '=')
+               p++;
+            given[num_given++].bits = strtoull(p, &p, 16);
+            if (*p == ',')
+               p++;
+         }
+      }
+   }
    if (i < argc && !strcmp(argv[i], "--ll"))
       mode = LL, i++;
    else if (i < argc && !strcmp(argv[i], "--list"))
@@ -537,7 +563,7 @@ main(int argc, char **argv)
       mode = INTERFACE, i++;
    if (i >= argc) {
       fprintf(stderr,
-              "usage: air2nir [--library] "
+              "usage: air2nir [--library] [--not-defined | --constants I=HEX,...] "
               "[--ll | --list | --report | --eval | --interface] "
               "FILE [FUNCTION]\n");
       return 2;
@@ -606,7 +632,8 @@ main(int argc, char **argv)
       }
       struct air_constant_value *fc;
       unsigned num_fc = air_module_function_constants(ctx, mods[k].bitcode, mods[k].size, &fc);
-      struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+      struct air_to_nir_options options = { .constants = not_defined ? given : fc, .num_constants = not_defined ? num_given : num_fc,
+                                        .partial_constants = not_defined,
                                         .library_wrapper = library_wrapper };
       struct air_shader_info info;
       nir_shader *nir = air_to_nir(ctx, mods[k].bitcode, mods[k].size, NULL, &options,

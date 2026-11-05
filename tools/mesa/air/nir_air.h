@@ -163,6 +163,17 @@ struct air_resource {
     */
    unsigned argbuf_set;
    unsigned argbuf_id;
+
+   /* M5c: how many consecutive descriptors this is: an array's length, or 1. `.index` is the first
+    * of them, and an array member's `argbuf_id` the first of its ids. The second integer after
+    * `air.location_index`, which docs/air.md inferred, and real Metal's compiler confirms it on an
+    * M1 (`array<texture2d<float>, 3>` says 0, 3; docs/air.md).
+    */
+   unsigned array_size;
+
+   /* M5c: gated by a function constant (`air.function_constant` on it): what the constant is, only
+    * the running shader knows, and a pipeline that turns it off need not bind it. */
+   bool gated;
 };
 
 struct air_varying {
@@ -318,7 +329,19 @@ struct air_shader_info {
    const char **notes;
 
    unsigned threadgroup_bytes; /* static threadgroup memory */
+
+   /* M5c: an array of descriptors is indexed at run time, so a texture or sampler instruction has a
+    * texture_offset or sampler_offset source and a buffer or image one an index source that is not
+    * a constant (air_ptr_index). air_vk.c binds that; air_metal.c refuses it by name. */
+   bool indexed_descriptors;
+   /* M5e: what this function's translation is known by on disk (A TRANSLATION KEPT ON DISK); all zero: nothing */
+   uint8_t cache_key[20];
 };
+
+/* (A TRANSLATION KEPT ON DISK) a file of the cache, for the back end's own things kept by the same key. */
+bool air_cache_path(const uint8_t key[20], const char *suffix, char *path, size_t path_size);
+void *air_cache_read(const char *path, size_t *size);
+void air_cache_write(const char *path, const void *bytes, size_t size);
 
 /* The word, field by field. A runtime that holds only `sampler_state` can call
  * this; `air_resource.sampler` is what it returns.
@@ -330,11 +353,17 @@ struct air_sampler_state air_decode_sampler_state(uint64_t word);
 struct air_constant_value {
    unsigned index;     /* the function constant's index */
    uint64_t bits;      /* its value, as the bits of its type */
+   uint64_t bits_hi;   /* M5c: and the second word of one wider than 64 bits (float4) */
 };
 
 struct air_to_nir_options {
    const struct air_constant_value *constants;
    unsigned num_constants;
+
+   /* M5c: the list is what the application set, and a constant not on it is NOT DEFINED
+    * (is_function_constant_defined says false, and its value is 0: real Metal's is undefined).
+    * False is what every caller before this meant: every constant is on the list. */
+   bool partial_constants;
 
    /* Translate an air.visible library function by generating an entry point
     * that calls it: argument i read from device buffer 0 at byte 16*i, the
@@ -373,6 +402,19 @@ nir_shader *air_to_nir(void *mem_ctx, const void *bitcode, size_t size,
  */
 unsigned air_module_function_constants(void *mem_ctx, const void *bitcode, size_t size,
                                        struct air_constant_value **out);
+
+/* M5c: what `!air.function_constants` says of each: `!{ptr @global, !"float", !"fc_f", i32 1, i1
+ * false}`, read off real Metal's output on an M1 (the i1 is true of a constant read without
+ * is_function_constant_defined around it, which is what Metal refuses a function for leaving out).
+ * The strings live under mem_ctx.
+ */
+struct air_constant_decl {
+   unsigned index;
+   const char *type, *name;
+   bool required;
+};
+unsigned air_module_function_constant_decls(void *mem_ctx, const void *bitcode, size_t size,
+                                            struct air_constant_decl **out);
 
 /* What the module is, without translating it: the stage from its metadata
  * (MESA_SHADER_NONE for visible functions, -1 when unknown) and the air.*

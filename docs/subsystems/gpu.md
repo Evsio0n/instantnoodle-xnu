@@ -155,8 +155,9 @@ pause, no fault.
 
 **Do not read "Metal runs" as "Metal apps work".** What exists is an experimental driver, off by default.
 
-- `metal=1`: Metal serves test programs. `metal=2 metal_profile=1`: Metal is handed to the whole system (backboardd's
-  compositor too); this reaches the home screen. Metal for the whole system is **not** the default; chronod's widgets
+- `metal=1`: Metal serves test programs. `metal=2 metal_profile=1`: Metal is given to every process that asks
+  (SpringBoard, chronod, mediaserverd); backboardd opens the device and still composes through hk-gl unless `camtl=1`
+  puts CoreAnimation on Metal too (verified on phone, runs 124103 and 125612). This reaches the home screen. Metal for the whole system is **not** the default; chronod's widgets
   still have two pipelines refused.
 - The driver is `userland/src/hkmetal.m` (about 7,500 lines): a `_MTLDevice` subclass declared in source, registered
   via Metal's own `MTLAddDevice` with `MTLDeviceSPI` declared at run time (`class_addProtocol`); it opens `HKGPU`
