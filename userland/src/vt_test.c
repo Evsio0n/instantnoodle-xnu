@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
 
 static uint64_t
 now_ms(void)
@@ -330,6 +331,78 @@ pixels(OSType kind, size_t width, size_t height, size_t to_width, size_t to_heig
 	}
 }
 
+/*
+ * A quarter turn with a scale, 420f to 420f: what CMPhoto asks for a portrait photo (run 022942), and what the CPU may not do
+ * (vtPixelRotation_IsValidForSoftware), so a refusal here is its -12914. Grey across the source: down the result, for a turn
+ * clockwise, with chroma 128. 0xAA left behind says nothing was written.
+ */
+static void
+turned_pixels(size_t width, size_t height, size_t to_width, size_t to_height, int gpu)
+{
+	CFStringRef gpu_key = spi_key("kVTPixelRotationPropertyKey_EnableGPUAcceleratedTransfer");
+	const OSType kind = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+	VTPixelRotationSessionRef session = NULL;
+	CVPixelBufferRef from = picture(kind, width, height), to = picture(kind, to_width, to_height);
+	OSStatus status = from != NULL && to != NULL ? VTPixelRotationSessionCreate(NULL, &session) : -1;
+	char verdict[120] = "not looked at";
+
+	if (from != NULL) {
+		fill(from, -1, 0, 0);
+	}
+	if (to != NULL) {
+		CVPixelBufferLockBaseAddress(to, 0);
+		memset(CVPixelBufferGetBaseAddressOfPlane(to, 0), 0xAA, CVPixelBufferGetBytesPerRowOfPlane(to, 0) * to_height);
+		memset(CVPixelBufferGetBaseAddressOfPlane(to, 1), 0xAA, CVPixelBufferGetBytesPerRowOfPlane(to, 1) * (to_height / 2));
+		CVPixelBufferUnlockBaseAddress(to, 0);
+	}
+	if (status == noErr) {
+		status = VTSessionSetProperty(session, kVTPixelRotationPropertyKey_Rotation, kVTRotation_CW90);
+	}
+	if (status == noErr && gpu >= 0 && gpu_key != NULL) {
+		VTSessionSetProperty(session, gpu_key, gpu ? kCFBooleanTrue : kCFBooleanFalse);
+	}
+	const uint64_t began = now_ms();
+
+	if (status == noErr) {
+		status = VTPixelRotationSessionRotateImage(session, from, to);
+	}
+	const uint64_t took = now_ms() - began;
+
+	if (status == noErr) {
+		CVPixelBufferLockBaseAddress(to, kCVPixelBufferLock_ReadOnly);
+		const uint8_t *luma = CVPixelBufferGetBaseAddressOfPlane(to, 0), *chroma = CVPixelBufferGetBaseAddressOfPlane(to, 1);
+		const size_t lrow = CVPixelBufferGetBytesPerRowOfPlane(to, 0), crow = CVPixelBufferGetBytesPerRowOfPlane(to, 1);
+		unsigned worst = 0, worst_chroma = 0, left = 0;
+
+		for (unsigned j = 0; j < 16; j++) {
+			for (unsigned i = 0; i < 16; i++) {
+				const size_t x = (to_width - 1) * i / 15, y = (to_height - 1) * j / 15;
+				const int got = luma[y * lrow + x], want = (int)(255 * y / (to_height - 1));
+				const uint8_t *c = chroma + (y / 2) * crow + (x / 2) * 2;
+				const unsigned off = (unsigned)abs(got - want), off_c = (unsigned)MAX(abs(c[0] - 128), abs(c[1] - 128));
+
+				worst = off > worst ? off : worst;
+				worst_chroma = off_c > worst_chroma ? off_c : worst_chroma;
+				left += got == 0xAA && want != 0xAA;
+			}
+		}
+		snprintf(verdict, sizeof(verdict), "luma worst off by %u, chroma by %u, %u of 256 at the fill", worst, worst_chroma, left);
+		CVPixelBufferUnlockBaseAddress(to, kCVPixelBufferLock_ReadOnly);
+	}
+	printf("vt_test: turned 420f %zux%zu to %zux%zu by 90, GPU %s: %d (%llu ms): %s\n", width, height, to_width, to_height,
+	    gpu < 0 ? "as VideoToolbox likes" : gpu ? "asked for" : "refused", (int)status, (unsigned long long)took, verdict);
+	if (session != NULL) {
+		VTPixelRotationSessionInvalidate(session);
+		CFRelease(session);
+	}
+	if (from != NULL) {
+		CVPixelBufferRelease(from);
+	}
+	if (to != NULL) {
+		CVPixelBufferRelease(to);
+	}
+}
+
 /* And what ImageIO makes of a file: its picture drawn small, a few pixels of it; a generic test file (numbers only). */
 static void
 decode_pixels(const char *path, unsigned number)
@@ -374,6 +447,8 @@ pixels_all(int argc, char **argv)
 		decode_pixels(argv[i], (unsigned)i - 1);
 	}
 	for (int gpu = -1; gpu <= 1; gpu++) {
+		turned_pixels(504, 378, 376, 500, gpu);
+		turned_pixels(1496, 1122, 1126, 1500, gpu);
 		pixels(kCVPixelFormatType_32BGRA, 1125, 2436, 787, 1705, -1, 0, 0, NULL, gpu);
 		pixels(kCVPixelFormatType_32BGRA, 1125, 2436, 1125, 2436, -1, 0, 0, NULL, gpu);
 		pixels(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, 1104, 1160, 1104, 1160, -1, 0, 0, NULL, gpu);

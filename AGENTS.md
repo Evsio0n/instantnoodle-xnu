@@ -24,7 +24,7 @@ also POCO X5 Pro "redwood", and QEMU). This file is how to behave here. Details 
 3. **Never** a bare `./xl enter` for the OnePlus 8: load the profile first (`. common/lib.sh; load_device instantnoodle`, or `common/run.sh instantnoodle`) — otherwise redwood's UEFI hangs the phone. Needs `nix-shell` on the NixOS host.
 4. **Never** `touchscreen=1` on the OnePlus 8. Never `wifi_again=1`/`adsp_again=1`. Never DCS sleep-in (0x10) to the panel. Read `docs/research/hardware-qualcomm.md` before touching any register: wrong accesses CrashDump the phone.
 5. Do not run redwood (POCO X5 Pro) checks unless asked (owner instruction 2026-10-25).
-6. One hardware run at a time: `./xl wait` first (lock `$XDG_RUNTIME_DIR/hackios-phone.run`). Never `pgrep -f`/`pkill -f` a pattern that is in your own command line (exit 144). The phone is shared between working copies.
+6. One hardware run at a time: put every boot through `tools/bootq run` (docs/TESTING.md), the queue all sessions and the owner's page share; underneath, `./xl wait` (lock `$XDG_RUNTIME_DIR/hackios-phone.run`). Never `pgrep -f`/`pkill -f` a pattern that is in your own command line (exit 144). The phone is shared between working copies.
 7. Vendor firmware, keys, MAC addresses, device dumps and Apple files never go into git or into docs. Backups in `../ios-instantnoodle/backup/` are not to be altered.
 8. Recovery: hold Power+VolUp from CrashDump; `xl reboot`/`xl enter`; see `docs/INSTALL.md` and `docs/research/boot-chain-and-recovery.md`. A USB cable left in breaks the stock bootloader after a reset.
 

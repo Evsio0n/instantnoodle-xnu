@@ -5,7 +5,7 @@ Boot-args are given on the kernel command line: `XL_CMDLINE="..." ./xl run`, the
 `PE_parse_boot_argn()`; user space reads `sysctl kern.bootargs`. This page is **generated from the source** (202 kernel
 names via `PE_parse_boot_argn`/`PE_parse_boot_arg_str`, plus the userland ones) and annotated by hand; names marked
 "see the header comment" are diagnostic or tuning knobs whose only documentation is the comment at the top of the named file.
-**The OnePlus 8's own defaults (2026-11-05, pexpert/arm/pe_bootargs.c, kernels from cam-5440d572):** `wifi=1 wifi_bdf_native=1 adsp=1 sound=4 sound_amps=1 haptic=5 cam=5 cam_after=10` are added to the kernel's boot line unless that name is given, so `wifi=0` and the like are off; `kern.bootargs` shows them. board=instantnoodle only.
+**The OnePlus 8's own defaults (2026-11-05, pexpert/arm/pe_bootargs.c, kernels from cam-5440d572):** `wifi=1 wifi_bdf_native=1 adsp=1 sound=4 sound_amps=1 haptic=5 cam=5 cam_after=10`, since 2026-11-05 `mdp=8 edr=1` and since 2026-11-06 `torch=3 bt=1` (in `xnu-src`, RAM kernels) are added to the kernel's boot line unless that name is given, so `wifi=0` and the like are off; `kern.bootargs` shows them. board=instantnoodle only.
 
 **When you add a boot-arg, add it here** (see [../AGENTS.md](../AGENTS.md)). Regenerate the name list with:
 
@@ -49,6 +49,7 @@ Rules of thumb: a bare `./xl enter` or a bad arg can hang a phone; **never pass 
 | `gpu_cycle` | Boot test: N GPU stop/start cycles before anything uses it. |
 | `gpu_dcvs` | GPU speed follows load (default on kona; 0 = 525 MHz). |
 | `gpu_exact` | *diagnostic/tuning knob: see the header comment of this file* |
+| `gpu_top` | 587: the GPU's fourth speed, 587 MHz, above 305, 400 and 525 (the owner's word, 2026-11-06). OnePlus 8, speed bin 0 only; anything else is refused and says so. Off by default, not in a row. Nothing slows the GPU itself with `gpu_dcvs=0`. Run 115324. |
 | `gpu_hot` | DCVS holds 305 MHz from this temperature (default 85.0 C). |
 | `gpu_hwcg` | 0 turns hardware clock gating off. |
 | `gpu_irq` | GPU fences raise an interrupt (GIC 332; default on kona). |
@@ -117,7 +118,7 @@ Rules of thumb: a bare `./xl enter` or a bad arg can hang a phone; **never pass 
 
 | Boot-arg | Meaning |
 |---|---|
-| `bt=1` | Opt-in QCA6390 Bluetooth on instantnoodle; other boards remain unchanged. Native jobs also need `BLUETOOTH=1` when building userland. |
+| `bt=1` | QCA6390 Bluetooth on instantnoodle, **on by default there since 2026-11-06 (`bt=0` off)**; other boards remain unchanged. The chip stays off unless the small image has `fw/htnv20.bin`. Native jobs also need `BLUETOOTH=1` when building userland. |
 | `bt_test=1` | Before client handoff, compare legacy/extended command selection, read capabilities, scan BLE for four seconds, and run classic inquiry. Diagnostic only. |
 | `bt_probe=1` | Log UART/pin/clock state during startup. |
 | `bt_trace=1` | Log HCI commands/events; 2 also logs ACL/SCO headers (`}`: SCO as the pacing really sends it). Logs can contain device identifiers; keep local. |
@@ -163,6 +164,8 @@ See [subsystems/bluetooth.md](subsystems/bluetooth.md) for tested scope and firm
 | `cam` | 1 = a look, reading only (GCC/camcc clocks, every sensor pin, the PM8009, every camera rail on its PMIC); 2 = and each sensor powered up as Android does, its chip ID read, powered down; 3..5 = as 2 (no frame path on this board yet). Verified on the phone (2026-11-04: `cam=1` run 010516; `cam=2` run 044740, three of four sensors answer; run 081247, all four). |
 | `cam_sensor` | `wide` (IMX586), `ultra` (IMX481), `front` (IMX471) or `macro` (GC2375); without it `cam=2` does all four in turn. With `cam=3`, `wide` takes the frames' path of the wide IMX586 (CSIPHY 0, three C-PHY trios; `cam_mode=6` its 2x crop) and `ultra` the ultra-wide IMX481's (CSIPHY 3, four D-PHY lanes, mode 0 4656x3496, its whole field; step 5's 20 MB frame in a piece taken at boot) instead of the front sensor's. Verified on phone: wide steps 2 and 5 (runs 122836, 124047); ultra steps 2 and 5 (runs 141639, 142526). `cam=5` serves whichever the program asks for with `HK_CAMERA_SENSOR` (1 wide, 2 front, 3 ultra-wide: run 142958, camera_test). |
 | `cam_quickmode` | (`cam=5`) 1 (the default) = the wide IMX586's mode 1 <-> 6 (1x <-> 2x) changed in the session: stream off at a frame's end, the mode's table and the exposure in standby, stream on, ~265-315 ms without frames; 0 = a new session each time (2.6-2.7 s). Verified on phone (runs 133840, 134921). |
+| `cam_fast` | Read by userland (`camera_device.c`), a measurement: 1 = auto exposure may not stretch a frame, so the rate holds and the dark stays darker. Off by default. In a test media library only (K38). |
+| `cam_mem` | Read by userland (`camera_device.c`, `inject_media.c`), a measurement: 1 = every 300 frames mediaserverd's memory by VM tag, the phone's free pages and libmalloc's large blocks by who asked; the audio buffers at each node. Off by default. |
 | `cam_focus` | (`cam=5` and `cam=3`) the wide IMX586's lens motor (LC898217XC at 0x72): 2 (the default) = driven (HK_CAMERA_FOCUS, codes 50-930, a move of at most 1/8 a frame, read back, parked to 50 before its power goes, on the way out by hand); 1 = its registers only read; 0 = not touched. Verified on phone (runs 134921, 135326, 140301's logdump). |
 | `cam_after` | seconds after boot before the camera thread starts (default 20). |
 | `cam_scan` | 1 = (with `cam=2`) a sensor that does not answer: its bus listed while it is powered, every address 0x08-0x77 read once (one byte, no register: nothing written). Verified on phone (run 080458: the wide sensor's bus, EEPROM 0x54 and lens motor 0x72/0x73 answering). |
@@ -295,12 +298,23 @@ See [subsystems/bluetooth.md](subsystems/bluetooth.md) for tested scope and firm
 |---|---|
 | `thermal` | 0 off; 2 watch and report without cpufreq. Default on with cpufreq=1. |
 
+### `bsd/dev/instantnoodle_modem.c`
+
+| Boot-arg | Meaning |
+|---|---|
+| `modem` | The OnePlus 8's SDX55. 1 a look, reading only (pins, `pcie_2_gdsc`, the arbiter's channels of its PMIC). 2 and the warm reset and PCIe 2 to the device's boot loader (run 035821), no firmware, no bus master. 3 and its firmware up to, not including, image 8; with `modem_mission=1` on to its mission for 60 s (run 071723). At the end the link goes down and a warm reset stops its firmware (run 073746). **Only in the private tree's kernel for now**, `tools/nf/modem/`. |
+| `modem_gnss` | With `modem=3 modem_mission=1 modem_loc=1`: 1 sends Inject UTC Time, Register Events and Start, 180 s in all, then Stop. Logs counts, signal and uncertainty only, never a position. It also gives the modem MHI's failure-reason buffer and logs the text, cleaned. Run three times: 110304 refused as locked; 111823 and 113829, with Client Type AFW, accepted, then the modem crashed after about 70 s, reason `remotefs_sahara.c:850`. Another try needs the owner's word. Private tree. |
+| `modem_loc` | With `modem=3 modem_mission=1`: 1 asks QMI LOC two questions that start nothing (engine lock, operation mode); run 102633. Private tree. |
+| `modem_mission` | With `modem=3`: 1 sends image 8, so the modem's firmware starts. Off unless given. **With the owner there, and through the supervisor:** a hung kernel leaves the firmware running, and nothing here reads the modem's temperature. |
+| `modem_gap` | With `modem=3`, a test: this offset's page of the boot loader's image has no translation, so the SMMU says whether the device reaches it. BHI then fails. Private tree too. |
+
 ### `bsd/dev/hk_torch.c`
 
 | Boot-arg | Meaning |
 |---|---|
-| `torch` | 1 look, 2 light briefly, 3 for iOS. |
+| `torch` | 1 look, 2 light briefly, 3 for iOS (and the camera's flash). **3 is the OnePlus 8's default; `torch=0` is off.** |
 | `torch_max_s` | Longest continuous light (default 30, max 120). |
+| `torch_flash_ma` | The camera's flash, a channel: default 500, at most 1000 (Android's). |
 | `torch_secs` | Seconds for torch=2. |
 
 ### `bsd/dev/hk_ufs.c`
@@ -360,7 +374,7 @@ See [subsystems/bluetooth.md](subsystems/bluetooth.md) for tested scope and firm
 
 | Boot-arg | Meaning |
 |---|---|
-| `wifi` | 1: bring up the Wi-Fi radio and station (stands for wifi_irq, wifi_ba, wifi_wide). |
+| `wifi` | 1: bring up the Wi-Fi radio and station (stands for wifi_irq, wifi_ba, wifi_wide). **On by default on the OnePlus 8 (`HK_BOARD_DEFAULTS`, pexpert/arm/pe_bootargs.c); `wifi=0` is off.** |
 | `wifi_again` | DANGEROUS: reset the phone twice out of two. |
 | `wifi_ask` | Ask the service its capabilities. |
 | `wifi_dirty` | Leave the DSP running at the end. |
@@ -448,6 +462,15 @@ See [subsystems/bluetooth.md](subsystems/bluetooth.md) for tested scope and firm
 |---|---|
 | `fb_hz` | 60: switch the OnePlus panel back from 90 Hz. |
 | `fb_probe` | 1: dump the OnePlus 8 display pipeline. |
+| `mdp` | OnePlus 8, our own MDP layers (`bsd/dev/instantnoodle_mdp.c`, docs/research/mdp-driver-plan.md). **8 is this board's default (pe_bootargs.c)**; other boards 0. 0: nothing of it runs, the GPU scales as before. 1: read only, the firmware's pipeline decoded. 2: DMA0 as a solid fill over the frame, then everything back. 3: the same, then DMA and VIG pipes fetching from the framebuffers (nothing outside what scanout has proven mapped). 6: the display's stream through a context bank of ours (S2CR changed), frames as today. 7: and the window server's frames straight to the panel, the MDP scaling them: no GPU scale, no copy. 8: and every layer of a swap in its own pipe, the limits published to CoreAnimation. |
+| `edr` | OnePlus 8, CoreBrightness's architecture (MiniAppleARMBacklight.cpp). 0: the old one, `backlight-level`, and CoreAnimation is told 0 nits. **1, this board's default (pe_bootargs.c)**: the new one, by nits, with no ExtrabrightEDR. 2: and ExtrabrightEDR, for HDR. |
+| `ca_nits` | 1: in the window server, each `setNits:` and every 5 s what CoreAnimation takes the SDR white for (userland/src/inject.c). |
+| `mdp_trace` | With `mdp=8`: the first N swaps of more than one layer, with set and cleared bits, kept layers and pixels sampled from memory. Default 0. |
+| `fb_wait` | With the pipes (`mdp=7` and up): how the frame the panel is being sent is kept from being drawn into. A sum, **default 13**: 1 a GPU submission that writes a surface being fetched waits for the push's end (the guard; also what covers a detached surface); 2 SwapWait does not return while the surface drawn into next is being fetched (superseded by 4); 4 SwapWait answers for the swap and options it is asked about, kIOReturnBusy when it would have to wait and may not, so CoreAnimation makes itself a third surface; 8 and it does not answer until the swap before last has started its push, which keeps the frame's start in phase with the pushes. 0: none of it, the old behaviour, with the black triangles. Replaces the short-lived `fb_fetch_wait`. docs/research/mdp-driver-plan.md 9. |
+| `fb_hold_push` | 1: the presenter does not go on until the push has ended, so no swap's surface is drawn into meanwhile. Removes the triangles, costs frames (the owner: 「卡」). For comparison only. Default 0. |
+| `mdp_overlap` | 1: the first 40 submissions that name a surface being fetched are said, to write or to read. `fb_wait` other than 0 turns the counting on anyway, in the 5-second `mdp: swaps named` line. Default 0. |
+| `mdp_shots` | With `mdp=7` and up: at most every N ms, and once after the frames stop, the latest is also scaled into a framebuffer on the CPU, for `xl screenshot` (which reads memory and cannot see the pipes). 0: none. Default 2000 in a run from the computer (`loader_return_after=`), otherwise 0. Each costs the presenter 10 to 25 ms. |
+| `mdp_reads` | With `mdp`: reads never made before, one bit each, default 3: 1 dispcc's MDP clock, 2 the VIG pipes' scaler and CSC, 4 the SID block, 8 VBIF. |
 | `return_dark` | 1: the OnePlus 8 panel goes back to the loader dark -- DCS display off (0x28), as the screen lock sends it, after the last push -- so no still loader screen stays on the OLED between runs. Every kernel built since 2026-11-04 sends display on (0x29) before its first push; under an older kernel the power key twice lights it (or a reset). `run_cam_probe.py` passes it. Verified on phone (run 083542: "back to the loader dark (display off sent)" in the full returned log; the owner confirmed the screen dark in the loader and lit again by the next run, 2026-11-04). |
 | `metal` | 1 Metal driver for test programs; 2 whole system (with metal_profile=1). |
 

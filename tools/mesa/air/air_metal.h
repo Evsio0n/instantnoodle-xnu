@@ -76,6 +76,10 @@ struct rwa_buffer *rwa_buffer_create(struct rwa_device *device, size_t size,
 void *rwa_buffer_map(struct rwa_buffer *buffer);
 size_t rwa_buffer_size(struct rwa_buffer *buffer);
 void rwa_buffer_destroy(struct rwa_buffer *buffer);
+/* Whether work for the GPU that named the buffer is still to finish (reaps first if it looks so). */
+int rwa_buffer_busy(struct rwa_buffer *buffer);
+/* One line of what this library and turnip hold, for the memory's account (K40): its length. */
+int rwa_vk_memory(struct rwa_device *device, char *text, size_t size);
 
 /*
  * AIR in, a compiled pipeline out.
@@ -102,6 +106,26 @@ struct rwa_function_constant {
 	uint64_t bits;
 	uint64_t bits_hi;
 };
+
+/*
+ * FUNCTION STITCHING (K37): a compute pipeline out of a graph of library functions, -newLibraryWithStitchedDescriptor:'s, each function's
+ * module given by its bitcode. Field for field nir_air.h's air_stitch_input and air_stitch_node; kind is air_stitch_input_kind's numbers:
+ * 0 thread position in grid, 1 in threadgroup, 2 a value from buffer `bind` at `offset`, 3 its address, 4 texture, 5 sampler, 6 node `node`'s result.
+ */
+struct rwa_stitch_input {
+   unsigned kind;
+   unsigned bind, offset, node;
+};
+struct rwa_stitch_node {
+   const char *name;
+   const void *bitcode;
+   size_t size;
+   bool early_return;
+   unsigned num_inputs;
+   const struct rwa_stitch_input *inputs;
+};
+struct rwa_compute *rwa_compute_create_stitched(struct rwa_device *device, const char *name, const struct rwa_stitch_node *nodes,
+                                                unsigned node_count, struct rwa_compute_info *info, char *why, size_t why_size);
 
 /* rwa_compute_create with the values MTLFunctionConstantValues gave (rwa_render_shape has the
  * render stages' own): what is not on the list is not defined. */
@@ -247,6 +271,9 @@ struct rwa_texture *rwa_texture_view_create(struct rwa_texture *parent,
  * NULL and a sentence on anything. A screen that imports nothing says so by name, which is
  * what the software screen on a build machine does.
  */
+/* -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: linear rows over the buffer's own memory. The caller keeps the buffer as long as the texture. */
+struct rwa_texture *rwa_texture_over_buffer(struct rwa_buffer *buffer, const struct rwa_texture_shape *shape, size_t offset, unsigned row_bytes,
+                                            char *why, size_t why_size);
 struct rwa_texture *rwa_texture_from_surface(struct rwa_device *device,
 					     const struct rwa_texture_shape *shape,
 					     int surface_id, unsigned offset,
@@ -1563,10 +1590,67 @@ struct rwa_draw {
 	const unsigned *color_slice;
 	unsigned depth_level;
 	unsigned depth_slice;
+
+	/*
+	 * M5g, ONE PASS FOR MANY DRAWS (air_vk.c). Appended, as above, and Gallium reads neither.
+	 *
+	 *   `fresh_pass`      a barrier of the encoder's stands before this draw, so it may not go on
+	 *                     in the pass the draw before it left open
+	 *   `dont_care_mask`  what this draw, the first of its Metal pass, may find undefined:
+	 *                     MTLLoadActionDontCare. Bit i is colour attachment i, RWA_DONT_CARE_DEPTH
+	 *                     and RWA_DONT_CARE_STENCIL the other two. On a tiling GPU the
+	 *                     difference from a keep is the whole picture read into tile memory.
+	 */
+	unsigned fresh_pass;
+	unsigned dont_care_mask;
 };
+
+#define RWA_DONT_CARE_DEPTH   (1u << 8)
+#define RWA_DONT_CARE_STENCIL (1u << 9)
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
+
+/*
+ * M5g, where a frame's time goes: what this process has done so far, counted since it began,
+ * RWA_STAT_COUNT numbers. The Vulkan library only; a library without the symbol has no counts.
+ */
+enum rwa_stat_index {
+	RWA_STAT_DRAWS,          /* draws recorded */
+	RWA_STAT_PASSES,         /* Vulkan passes begun for them */
+	RWA_STAT_BREAK_TARGET,   /* why a draw did not go on in the open pass: other attachments */
+	RWA_STAT_BREAK_CLEAR,    /* a load action to carry out */
+	RWA_STAT_BREAK_LAYOUT,   /* a texture it samples needs a barrier */
+	RWA_STAT_BREAK_SHARED,   /* it writes something other than its attachments, or samples one */
+	RWA_STAT_BREAK_COPY,     /* a misaligned buffer that only the GPU can copy */
+	RWA_STAT_BREAK_BARRIER,  /* a barrier of the encoder's */
+	RWA_STAT_COPIES,         /* misaligned read-only buffers copied for a draw or a dispatch */
+	RWA_STAT_COPY_BYTES,     /* ... the bytes of it */
+	RWA_STAT_SUBMITS,        /* vkQueueSubmit */
+	RWA_STAT_PIPELINES,      /* graphics and compute pipelines made */
+	RWA_STAT_PIPELINE_US,    /* ... the time it took, on whoever was drawing */
+	RWA_STAT_DISPATCHES,     /* dispatches recorded */
+	RWA_STAT_BUFFERS,        /* buffers made, each one its own memory */
+	RWA_STAT_BUFFER_US,      /* ... the time it took */
+	RWA_STAT_SUBMIT_US,      /* the time in vkQueueSubmit */
+	RWA_STAT_APART_FETCH,    /* of the draws that stand apart (ONE PASS FOR MANY DRAWS): it reads its target */
+	RWA_STAT_APART_WRITES,   /* ... it writes a buffer or a stored image */
+	RWA_STAT_APART_SHARES,   /* ... it samples an image it draws into */
+	RWA_STAT_TEXTURES,       /* images made, and the time in that */
+	RWA_STAT_TEXTURE_US,
+	RWA_STAT_TEXTURES_KEPT,  /* textures that took a kept image instead */
+	RWA_STAT_COUNT
+};
+void rwa_stats_read(uint64_t *out, unsigned count);
+
+/*
+ * M5g: a texture the draws about to be recorded sample, moved to the layout that takes (a barrier
+ * here, ahead of the pass, costs nothing; the same barrier met at a draw ends the pass and begins
+ * another over the same attachments). Nothing when it is there already or is one of `color` or
+ * `depth`. The Vulkan library only.
+ */
+int rwa_texture_prepare(struct rwa_texture *texture, struct rwa_texture *const *color,
+			unsigned color_count, struct rwa_texture *depth, char *why, size_t why_size);
 
 #ifdef __cplusplus
 }

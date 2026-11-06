@@ -79,10 +79,10 @@ index 4b83160780c3..d6bb1edb1aae 100644
  
  #
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..083c12a3f741 100644
+index 44274016a4cf..d757eb2ddb56 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,54 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,56 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -96,6 +96,8 @@ index 44274016a4cf..083c12a3f741 100644
 +bsd/dev/instantnoodle_speaker.c	standard
 +bsd/dev/instantnoodle_slider.c	standard
 +bsd/dev/instantnoodle_camera.c	standard
++bsd/dev/instantnoodle_mdp.c	standard
++bsd/dev/instantnoodle_modem.c	standard
 +bsd/dev/instantnoodle_wifi.c	standard
 +bsd/dev/instantnoodle_bt.c	standard
 +bsd/dev/hk_battery.c	standard
@@ -137,7 +139,7 @@ index 44274016a4cf..083c12a3f741 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +203,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +205,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -193,7 +195,7 @@ index 44274016a4cf..083c12a3f741 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +458,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +460,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -201,7 +203,7 @@ index 44274016a4cf..083c12a3f741 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +481,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +483,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -209,7 +211,7 @@ index 44274016a4cf..083c12a3f741 100644
  bsd/kern/kern_event.c			standard
  bsd/kern/kern_control.c			optional networking
  bsd/kern/kern_exec.c			standard
-@@ -594,3 +693,5 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
+@@ -594,3 +695,5 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
  bsd/skywalk/packet/pbufpool.c			optional skywalk
  bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
  bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
@@ -4078,10 +4080,10 @@ index 8b46efb05c86..e161ca426b1a 100644
  kern_work_interval_set_workload_id(mach_port_name_t port_name,
      struct kern_work_interval_workload_id_args *workload_id_args);
 diff --git a/pexpert/arm/pe_bootargs.c b/pexpert/arm/pe_bootargs.c
-index c6b87b081d2f..25659a54afec 100644
+index c6b87b081d2f..a5c98001e0d3 100644
 --- a/pexpert/arm/pe_bootargs.c
 +++ b/pexpert/arm/pe_bootargs.c
-@@ -4,9 +4,109 @@
+@@ -4,9 +4,113 @@
  #include <pexpert/pexpert.h>
  #include <pexpert/boot.h>
  
@@ -4094,9 +4096,13 @@ index c6b87b081d2f..25659a54afec 100644
 + * line may be longer (kern_sysctl.c's copy is as long as this).
 + *
 + * Wi-Fi with the phone's own board data, the audio DSP, iOS's sound through it with the amplifiers allowed, the vibration
-+ * motor, the cameras for iOS. Touch is on by itself (instantnoodle_touch.c). Not here: anything not yet proven.
++ * motor, the cameras for iOS; our own MDP layers (bsd/dev/instantnoodle_mdp.c), and CoreBrightness's new architecture
++ * (MiniAppleARMBacklight.cpp, edr=1), which is what tells CoreAnimation the screen's nits: with none it takes them for 0, boosts
++ * dim content on every frame and refuses the layers (runs 200821, 201040); the flashlight and the camera's flash for iOS (hk_torch.c, torch=3: Control Center's button, run
++ * 005752, flash photographs, runs 010913, 012611); Bluetooth (hk_bt.c, bt=1; with a root that has its firmware, else the chip stays off: run 012611). Touch is on by itself (instantnoodle_touch.c). Not here:
++ * anything not yet proven.
 + */
-+#define HK_BOARD_DEFAULTS "wifi=1 wifi_bdf_native=1 adsp=1 sound=4 sound_amps=1 haptic=5 cam=5 cam_after=10"
++#define HK_BOARD_DEFAULTS "wifi=1 wifi_bdf_native=1 adsp=1 sound=4 sound_amps=1 haptic=5 cam=5 cam_after=10 mdp=8 edr=1 torch=3 bt=1"
 +#define HK_BOARD_LINE     (BOOT_LINE_LENGTH + 128)
 +
 +static char hk_board_line[HK_BOARD_LINE];

@@ -1,8 +1,6 @@
 # Research: our own MDP (DPU) driver for the OnePlus 8 -- findings and staged plan
 
-**Status (2026-11-05): research and design only. Nothing here was run on a phone and no code exists.** Every later phone run
-needs the owner's go-ahead and the phone lock (`./xl wait`). Read [hardware-qualcomm.md](hardware-qualcomm.md) first; the
-present pipeline is in [../subsystems/display.md](../subsystems/display.md).
+**Status (2026-11-05): built and running in RAM on the OnePlus 8; `mdp=8` is the board's default in `xnu-src` (nothing committed or installed).** The window server's frames go straight to the panel through the MDP's scaler, through a context bank of ours, and CoreAnimation's detached layers go through their own pipes. **Section 8 has the results and overrides what sections 0-7 guessed.** Code: `bsd/dev/instantnoodle_mdp.c`; boots: `tools/mdp/boot.sh`. Read [hardware-qualcomm.md](hardware-qualcomm.md) first; the pipeline is in [../subsystems/display.md](../subsystems/display.md).
 
 Tags: **[observed]** seen on this phone (or in its iOS binaries on the host, where said); **[source]** read in public code or
 device trees, listed at the end; **[inferred]** follows from those but was not seen; **[hypothesis]** a guess to be tested.
@@ -29,7 +27,7 @@ device trees, listed at the end; **[inferred]** follows from those but was not s
 
 | Fact | Tag |
 |---|---|
-| The MDP's streams `0x820`/mask `0x402` match SMR4, whose S2CR translates through context bank 4 (at `0x15084000`: 128 global pages, then 4K per bank) | observed |
+| The MDP's streams `0x820`/mask `0x402` match SMR4, whose S2CR translates through context bank 4 (at `0x15084000`: 128 global pages, then 4K per bank). **Since 2026-11-05: match register 6, context 5 (section 8): find it by stream** | observed |
 | Reading CB4's registers or its page tables is a CrashDump; no ATOS. The line is in hardware-qualcomm.md §1; the original log is not in `logs/`, so which of the two reads crashed, and how the tables were found, is not recorded | observed, thin |
 | Reading free banks' registers, writing free SMRs/S2CRs/banks, and running our own stage-1 tables work (Wi-Fi, sound, camera) | observed |
 | A stage-1 bank of ours with 4K tables serves stream `0x800`/`0x840` (IFE) with no fault. Those streams are on the same TBU range as the MDP's first port (`mnoc_hf_0_tbu`, `0x800-0xbff`) | observed + source |
@@ -143,7 +141,7 @@ log is no longer in `logs/`** (no match in the uncompressed files), so step (a) 
 | DMA3 | `0x2b000` | 25 | 13 | same, cursor-capable | read only; writes untested |
 
 Sub-blocks on VIG: scaler at `+0xa00` (`0xa0`), CSC at `+0x1a00` (`0x100`): **never touched here**. The vendor tree calls the
-scaler `qseedv3lite`, and mainline's version `0x30000` takes the same "lite" path. Mainline leaves the LUTs unprogrammed and
+scaler `qseedv3lite`, and mainline's version 3.0 takes the same "lite" path. Mainline leaves the LUTs unprogrammed and
 uses bilinear [source]. Whether the reset coefficients are right for that is [inferred].
 
 **No SSPP on this SoC rotates by 90 degrees**: `rotation_cfg` is NULL in the catalog, and flips are `SRC_OP_MODE` bits 13/14
@@ -208,7 +206,7 @@ from its log, not retried. Add the arg to `docs/BOOT_ARGS.md` when it is built.
 ### (a) `mdp=1`: re-derive the pipeline, read-only (1 boot)
 Decode what `fb_probe=1` only prints:
 - `CTL0` layers for LM0/LM1 plus EXT/EXT2/EXT3, as Android's `sde_rm_cont_splash_res_init()`/`get_staged_sspp` do; the stage per pipe
-  (stage value is stage + 1; VIG0 bits 0-2, VIG1 3-5, VIG2 6-8, VIG3 26-28, DMA0 18-20, DMA1 21-23, DMA2/3 in EXT2).
+  (VIG0 bits 0-2, VIG1 3-5, VIG2 6-8, VIG3 26-28, DMA0 18-20, DMA1 21-23, DMA2/3 in EXT2; what the value means: section 8).
 - `CTL_DSC_ACTIVE`, `CTL_MERGE_3D_ACTIVE`, `LM_OP_MODE`, `LM_OUT_SIZE`, the blend stages.
 - Each pipe's QoS LUTs (`+0x60..0x6c`), `CDP` (`+0x134`), format (`+0x30..0x38`), `OUT_XY`.
 - **The question it must answer:** is the firmware in **source split** (both pipes staged on both mixers, `OUT_XY` in the pair's
@@ -221,7 +219,7 @@ Pass: the derived pipeline equals the expected one; otherwise everything after i
 ### (b) second layer
 
 **`mdp=2`, solid fill, no fetch at all (1 boot).** Set the solid-fill bit in `SRC_FORMAT` and a colour in `SRC_CONSTANT_COLOR`: **the
-pipe reads no memory, so no SMMU risk**. Target: DMA0 in the left half, 256 x 256, stage 1, opaque, for a few seconds over the live UI;
+pipe reads no memory, so no SMMU risk**. Target: DMA0 in the left half, 256 x 256, at CTL value 6 (one above the frame, section 8), opaque, for a few seconds over the live UI;
 flush `CTL_FLUSH_FRAME | bit 11 | bit 6`. Then unstage and flush. Checks: the owner sees the square; the LM0 MISR changes and returns;
 `MDP_INTR` bit 26 (INTF1 underrun) stays clear; PP done keeps arriving.
 
@@ -369,6 +367,122 @@ the before and after. Later, not planned: UBWC between A650 and MDP (`msm_mdss_4
 5. Which VBIF/QoS state do unused xins have? (a)
 6. Why does CA reject surfaces on this port, and which order does it want? (f0, c)
 7. Two or three CA surfaces in flight? `fb_queue` suggests up to three, more than the splash could hold (only matters if (e) is refused).
+
+## 8. Results on the phone
+
+**(a) `mdp=1`, kernel mdp-5fef2e52, run 182621, verified on phone (reads only).** The phone came back to the loader, no panic, no underrun latched after 60 pushes.
+
+- **Answer to section 7's question 2: both.** Each pipe is staged only on its own mixer (VIG0 on LM0, VIG1 on LM1), but the coordinates are the pair's: VIG1's `OUT_XY` x is 540, and LM1 has the right-mixer bit. So a layer's x is in 0..1079, and a layer crossing x = 540 needs one pipe on each mixer. Both LMs are 540 x 2400; border-out is on for both.
+- **Stages.** The firmware stages the base at CTL value 5, not at the bottom. In Linux's numbering the value is `dpu_stage + 1` with `DPU_STAGE_BASE` = 0 and `DPU_STAGE_0` = 1 [source], so value 5 is `DPU_STAGE_3`, with its blend registers at `blendstage_base[3]`, LM + `0x68`. Value 1 would be the base layer, with no blend registers. **Layers above the frame take values 6 and 7, or the extension bit; four values lie below it.** The first three blend stages read opaque (foreground constant, alpha 255 over 0).
+- **Format of the frame:** ARGB8888 as Linux's formats have it (four bytes, BGRA in memory, alpha enabled in the pipe); the stage's constant blend makes it opaque. No scaling, no multirect, no compression.
+- **Every pipe already has the firmware's QoS** (danger, safe and creq LUTs, `QOS_CTRL` 1), used or not, one set for the VIGs and another for the DMAs. So section 4(b)'s "copy VIG0's QoS LUTs" is not needed for a first try, and VBIF was not read.
+- **The MDP clock is 300 MHz** (PLL1 at 600 MHz, divided by 2; `dispcc` read safely). Scaling 1125 x 2436 to 1080 x 2400 needs roughly 540 x 2436 x 90 pixels a second per pipe, under 125 MHz [arithmetic, ignoring blanking and prefill], so **no clock write is expected**.
+- **VIG2's scaler registers read safely**, and it is off (what they say: `mdp=3` below).
+- After the pushes: `SRC0_ADDR` and `YSTRIDE0` read back what `pushFrameLocked()` and the framebuffer wrote, and a push leaves `CTL_FLUSH` at 0.
+- Not seen: the screen (nothing was to change). `xl screenshot` cannot see MDP layers anyway (section 5).
+
+**(b) `mdp=2`, a solid fill with no fetch, kernel mdp-05dbce3e, run 184016, verified on phone by the mixers' checksums (nobody looked at the panel).** DMA0 at CTL value 6 with the frame at 5, 256 x 256 at x 142, y 1000, on LM0.
+
+- **Proof, six pushes of one frame under one hold of the panel's lock (so the window server's next push waits):** the checksums repeat on the same frame; programming the unstaged pipe changes neither mixer; staging changes LM0 and leaves LM1 identical; staged repeats; unstaging gives LM0's original checksum back exactly. So the second layer is in the mixer's output and leaves nothing behind.
+- **MISR works as Linux's `dpu_hw_setup_misr()` does it** (free-running, one frame), and it is the check for what `xl screenshot` cannot see. It proves the picture changed and came back, not the square's colour or place.
+- **A pipe's registers read back what was written at once**, before any flush, and after it (14 registers on DMA0, no difference). So the one write function can trust an immediate read-back there.
+- **The window server's own pushes go on over a staged layer:** 182 pushes in 3 s, all finished, no underrun latched. Their flush needs no extra bits once the layer has latched.
+- **Run 183700 could not decide:** a new frame arrived during the same push as the staging, so both mixers changed. Compare only under the lock.
+- `hk_mdp_restore()` was run at the end of each test; it has not yet been seen on a failure or panic path.
+
+The owner wrote 「我看到了 OK」 right after the supervisor's report on this step. The supervisor reads that as the green square seen on the panel, though it could mean the message: **reported, with that doubt**. Not otherwise confirmed by eye.
+
+**(b) `mdp=3`, the first fetches by new pipes, kernels mdp-450ab32e (run 184629) and mdp-bb263517 (run 185001), verified on phone by checksums, 0 underruns, no SMMU change.** All under one hold of the lock, so every push sends the same frame.
+
+- **A fetch is what memory holds, not stale and not empty.** Source: the rows' unused ends (x 1080..1087 of the front framebuffer, never shown, in the proven range), written by the kernel between pushes. Fetched colour X and Y through DMA0 gave exactly the checksums of solid fills of X and Y; a pattern gave another; one pixel changed gave another; back to X gave X's again. This also proves the channels: `0xAARRGGBB` in memory under unpack `0x03020001` equals `0xAABBGGRR` as a solid fill under `0x03010002`.
+- **VIG2 and VIG3 are exact against the firmware's path.** VIG2 over the frame's own pixels gave the frame's checksums; a pixel along changed LM0 only. VIG2 + VIG3 across x = 540 gave the frame; the right pipe a pixel along changed LM1 only. Each half whole gave the frame, with twice the fetching for that frame.
+- **DMA pipes are not exact against VIG pipes.** On the same bytes, DMA and VIG give different checksums, for the frame's pixels and for a plain colour. The sampled frame's alpha is all 255, and a fetched colour's alpha does not change an opaque DMA layer, so alpha is not the cause. The cause, and whether the difference can be seen, are **not known** [hypothesis: the two paths carry different bit depths into the mixer]. **So a frame or a part of it goes through VIG pipes**, and DMA results must be compared with DMA.
+- **Fetching through new pipes reaches the same memory**, which also says their streams land in the same context bank [inferred: no fault, right pixels, and Android's tree gives one stream mask for all of them].
+- **Load:** both halves whole on VIG2 and VIG3 over the live frames for 3 s, with the window server's 129 pushes and the GPU drawing: 0 underruns, while `MDP_INTR_STATUS` bit 26 is read after every push and cleared if set. VBIF was not read or needed.
+- **Scaler block:** +0 reads `0x3000` on all four VIGs, which fits scaler 3.0 of Linux's catalog (`dpu_vig_sblk_qseed3_3_0`), not the `0x30000` this page first said [inferred]. It is off on all four. Linux reads that offset both as `QSEED3_HW_VERSION` and as `SSPP_VIG_OP_MODE`; only the first reading makes sense here. CSC op reads `0x2` on all four: the source-format bit, enable off, so VIG0's frame is not converted.
+- `mdp=2` alone has not been run since the code was reorganised; `mdp=3` runs the same checks first, and they passed.
+
+**(e) `mdp=6`, the display's own context bank: taken, verified on phone in every boot since run 193149.**
+
+- **The hypervisor accepts a new context in the display's S2CR, and a clean return puts it back** (the next boot finds the old value; the return line was also seen in the log of run 194653). No CrashDump in any of about ten boots.
+- **The display's stream is not at SMR4 / CB4 any more: runs from 2026-11-05 find match register 6, context 5.** The driver finds it by stream (`0x820`, mask `0x402`) and the other drivers' scans now leave out both 4 and whatever the display had (`hk_display_context`). Which context is the unreadable one has moved, so **never read by number**. Why it moved is not known [hypothesis: more streams set up by the boot chain than in October].
+- Our bank: identity map of the display's region with 2 MB blocks, tables at the top of it, walked non-cacheable, plus a 512 MB window of 4K pages at `0x40000000` for surfaces. `ACTLR` as Linux's table for `qcom,sm8250-mdss` reads back `0x103`. A push and a DCS through it came through with `FSR` 0 before anything relied on it; **0 faults in tens of thousands of frames**.
+
+**(d), (d4) `mdp=7`, frames straight from their surfaces, scaled by VIG0 and VIG1: verified on phone by logs, run 193149 on; panel not confirmed by eye yet.**
+
+- 1125 x 2436 BGRA to 1080 x 2400, bilinear, no filter tables, version `0x3000` so QSEED4's preloads. The right pipe starts at source column 562 with initial phase 0.4999; both pipes have 563 columns for 540 shown, and the hardware takes that.
+- `QSEED3_OP_MODE` bit 31 (`blend_cfg`) reads back 0 on this scaler.
+- **0 underruns**, read after every push. **The owner, using the phone on the pipes (runs just before 195236), relayed by the supervisor: 「試過了，很不錯」, and asked about wrong colours, a line at the middle or stutter: 「完全沒有」.** That is the eye's check of colours and the seam, in those general terms; no closer look was made, and there is no checksum for the seam (each mixer's covers one side).
+- The GPU's panel framebuffers are not asked for (selector 200 says not ready), so `eagl.c` stops scaling by itself. A frame the pipes cannot take goes the old way through a framebuffer, by the CPU: a swap with no layer does that on every screen-off.
+
+| Same scene, nobody touching | GPU scale (runs 192908, 194917) | MDP pipes (run 195236) |
+|---|---|---|
+| Home screen moving | 77-81 fps, GPU busy 27-30 %, 3.45-3.73 ms a frame | 76-80 fps, GPU busy 21-25 %, 2.69-3.13 ms a frame |
+| Still, the Clock icon's 30 fps | GPU busy 4 %, 1.3 ms a frame | GPU busy 2 %, 0.65 ms a frame |
+
+The scale pass cost about 0.65-0.75 ms of GPU a frame. Boots where the owner was using the phone read 40-70 % busy: that is what they were doing (116 touches in run 194653), not the pipes. **Count `touch: finger` lines before comparing two boots.**
+
+**Frame times, home screen moving, nobody touching** (`from one frame to the next`, printed to the log with `mdp=`):
+
+| | GPU scale, run 203118 | Pipes, run 203542 (kernel mdp-1de6a002) |
+|---|---|---|
+| Frames a second | 79-81 | 78-82 |
+| Half under, 95 % under | 12 ms, 13-14 ms | 12 ms, 14-15 ms |
+| The longest in 5 s | 38-59 ms | 47-70 ms |
+| Swaps a refresh late, in 5 s | 8-16 | 21-39 |
+| GPU busy | 27-30 % | 22-25 % |
+
+Late swaps are gaps of more than 13.9 ms between the window server's swaps, not pushes. Why there are more is not known; it did not change when `show()` stopped waiting for the push's end (run 202241: 25-37, that wait was removed for run 203542, which also brought the frame-time histogram to the GPU scale's). The longest figures include the shots below.
+
+**The owner's 「現在卡卡的」 (run 201040) was on the Metal compositor**, which they had not used before, in a boot of Maps and Weather. Compared by numbers: the same with `edr=0` (run 200821), 0 underruns, nothing falling back. Two causes [inferred from these numbers]: **the Metal compositor is slow by itself:** moving 49-62 fps with the pipes, 56 without (runs 202548, 202819), Maps and Weather 2-24 fps both ways, GPU wait up to 20 ms. **The pipes do not speed Metal up:** an earlier "62 against 30" on this page compared with an older kernel. And **my copy for `xl screenshot`, then every 300 ms, on the presenter:** now every 2 s, in runs from the computer only.
+
+**(f) `mdp=8`, iOS's layers in their own pipes: verified on phone by logs, runs 194212 and 195543; the picture itself not confirmed by eye.**
+
+- From QuartzCore's code (20F66, host) [observed]: with nothing detached, the composite is layer 0. With a surface detached, the composite is layer 1, on top, with a hole of colour 0 and alpha; the surface is layer 0 (RGB) or 2 (YUV). So the order here is 0, 2, 3, then 1 on top, and the composite blends premultiplied.
+- **A swap names only the layers that change** [observed, run 204521]: with a surface detached, `SWAP_LAYERS_SET` is `0x7` with `SWAP_LAYERS_CLEARED` `0x4` when the detached surface is new, and `0x2` with nothing cleared when only the composite is (about 150 of 240 swaps in Maps). A layer neither set nor cleared stays as it is, and stays in use. **Taking it for gone was the owner's flashing in Maps (runs 201040, 202548): the composite with its hole alone on the panel, black for a frame, every few frames.** Fixed in kernel mdp-070cd902: 44 such frames in run 204134, 0 in run 204521; the owner's eye on the fixed kernel has not been reported. `mdp_trace=N` prints the first N of these swaps with pixels sampled from memory.
+- Published: `IOMFBScalingLimits` (4 and 20 for both kinds), `DisplayPipeStrideRequirements` and `DisplayPipePlaneBaseAlignment` (16). Nothing in the registry was blocking detach before; without the limits CoreAnimation would ask for what the pipes cannot do.
+- **CoreAnimation does detach on the Metal compositor:** Maps' full-screen `CAMetalLayer`, BGRA 1125 x 2436, under the composite: two pipes a mixer, 0 underruns. It needs an app with a surface layer: on the OpenGL compositor nothing on the home screen or in Settings qualified.
+- **"luma boost active" (Display reason 0x22) refused about three of four tries, and the cause was ours: CoreAnimation was told the screen has 0 nits.** QuartzCore's `begin_update` boosts dim content when its SDR nits are under 20 on this product type [host]. **With the backlight as it was (`edr=0`), `[CAWindowServerDisplay nits]` reads 0 for the whole run** (`setNits: 0`, run 200821), so the boost was on at every brightness. CoreBrightness's new architecture (`edr=1`) calls `setNits:` with the real value: 47 at the first brightness, no refusal, 242 of 242 detaches (run 201040). Along the slider the nits follow, 2 to 350 (run 201647). **So `edr=1` is the board's default now.** It was an environment switch for an hour (`caenv=CA_DISABLE_LUMA_BOOST=1`, 99 of 99, run 195543): not needed any more, and not a default. Below 20 nits detaches are refused again, as on a real phone of this type [inferred]: the frame still goes through the pipes, composited.
+- **The dim Photos picture (HEIC's open item) is not this:** its runs had `edr=2`, with the display at 70-100 nits (runs 165643, 170709), so CoreAnimation had its nits. Its white of 187 is the EDR factor of 0.5 with no rise of the backlight behind it; that stays open (KNOWN_ISSUES K33).
+- **Not run on the phone: the NV12 path** (`FORMAT_NV12`, CSC, chroma scaling). No video or preview surface reached the pipes: no video has been played on this system yet, and Camera.app refuses to open on a RAM `/var`. Rec.709 NV12 also needs `CA_DETACH_ANY_PRIMARIES=1`, or an update with an empty dirty shape; it is not among the defaults. Landscape camera buffers would be refused for rotation [inferred].
+- Flips and turns (`SWAP_TRANSFORM`, `+0x114`) are not mapped: such a swap goes the old way, where a YUV layer is not drawn at all.
+
+**What must keep working (section 5), as seen with frames on the pipes:** 90 Hz yes; a DCS through our bank yes; screen off and on yes (runs 194653, 195236); return to the loader dark and the next boot yes; camera, Wi-Fi and sound scans with the fix yes; **HBM** on and off, 3 s, TE unchanged, 0 faults (run 201353); **CoreAnimation's EDR step** with a headroom of 2 forced: the Calendar widget's white 187 where it is 255 without, in the composite as before (run 201353); the brightness slider, 2 to 350 nits (run 201647). **Not exercised:** three failed pushes, a panic (`hk_mdp_restore()` is the same path as the return), system sleep (`syssleep=0` in these boots), HDR content on the pipes.
+
+## 9. Metal on the pipes: what the panel is sent, and who may draw it (2026-11-05/06, Metal session, RAM boots, uncommitted)
+
+**The owner's black triangles were frames being drawn while they were sent.** Observed: with the pipes on and Metal as compositor, a black triangle along a quad's diagonal in animations (the owner's photos, run 213407); absent with `mdp=0` (222000) and with `fb_hold_push=1` (223431). Observed: submissions write the surface a push is fetching: 730 named during a push by the end of 224034; hk-gl has 440 on the same script (freedreno marks everything read and write, so that number is not all writes; it shows no triangle, unexplained). Inferred, not seen: what the panel gets is the frame's opening fill, as far as it has reached memory. By the owner's eye the triangle is gone on every kind of wait below, one look each.
+
+**Why CoreAnimation cycled two surfaces [source: QuartzCore of 20F66, disassembled; the option bits inferred from its callers].** A display has three pages. Before a frame `IOMFBDisplay::can_update_` asks `IOMobileFramebufferSwapWait(the page's swap, 0x80000000)`, not blocking, about the page it will use and the next. First done: it gives that page's buffer back and may draw. Second not done: it marks the frame triple buffered, and `allocate_buffer` makes a third surface. First not done: it does not draw. Busy is `kIOReturnBusy`, which CA compares against. Ours ignored the swap and the options, blocked, and said done, so CA always had two free pages. IOSurfaceIsInUse is not on this path. Answering honestly (`fb_wait` bit 4): three surfaces at once (run 231434, confirmed 232152).
+
+**What is a swap's "done" here:** taken means its push has started (or it has been copied); a later swap taken means its push has ended; for the last one taken, `panelInFlight`. A first version went by `fMdpInUse`, which `mdpFrameGone` clears before it waits for the push: 485 writes caught by the guard in 231434, 0 once fixed (232152). So the guard works as a backstop.
+
+**Pacing matters more than the number of surfaces.** The blocking SwapWait also had a use: it started each frame as the previous push started, a whole push period to draw it in. Non-blocking, CA runs on a clock of its own. Heavy script (`out/rc.jobs.heavy`), share of frame gaps over 18 ms, App Library / Today / page swipes; windows do not line up exactly and App Library takes in the first slide-in:
+| `fb_wait` | run | App Library | Today | swipes | overlap |
+|---|---|---|---|---|---|
+| 0 | 004930 | 14.9% | 2.5% | 2.1% | yes |
+| 13 | 004626 | 20.4% | 3.5% | 2.3% | 0 writes during a push |
+| 13, later libraries | 005452 | 14.9% | 1.9% | 3.2% | 0 |
+| 5 | 003927 (8 real touches) | 26.8% | 4.8% | 9.0% | 0 |
+| 3 | 004231 | 28.2% | 8.4% | 5.1% | 0 |
+Busy answers do not cost frames: 23 of 4301, and 0 of 5011, were for the oldest page, the only ones that stop CA. **Not measured: touch latency with the third surface.** The owner has not judged this default yet (row `metal-all2`). `fb_wait=3` was 普通 by the owner's eye, as were 1 and 5-like rows.
+
+**hk-gl against Metal, heavy script (hk-gl run 010021 with `fb_wait=0`, Metal 005452):** GPU per frame 5.5 against 6.4 ms in App Library, 3.0 against 3.9 on swipes, measured as busy over frames. So not the factor of three an earlier comparison of different scenes suggested. Gaps over 18 ms: 10.8 / 1.7 / 1.9% against 14.9 / 1.9 / 3.2%. The clear difference: frames ready later on Metal (the presenter waits 4.4 against 2.0 ms in App Library, 1.9 against 0.6 on swipes). (An earlier version gave the Maps pinch as a second one, 182 frames on hk-gl against 76: **invalid**, first-run sheets covered the map in those runs. No valid hk-gl comparison of the pinch exists.) Cold shader translation and VideoToolbox's hold of the ring (183-261 ms) are one-off hitches these shares hide; hk-gl has no equal numbers for them. This does not yet explain the owner's 「opengl很快，沒metal這麼卡」.
+
+**Passes:** App Library, 416 commits in 5 s: 142 draws, 91 passes, 40.5 fetching draws a commit. Nearly every blended draw reads its target in the shader, not only `_Idst`, and stands apart: about two passes each. A by-region barrier could remove most of them; the GPU gain is bounded by the row above, about a millisecond a frame, and joining fetches without a barrier broke the blur once (row metal-now).
+
+**Maps' pinch (runs 013944, 014540, 015419, 020307; scripted, no fingers; kernel mdp-11824ed0).** The answer to 「地圖伸縮卡頓，你看看是不是是metal問題」 as far as it goes: yes, in texture making. Everything below is with no network, so the map is a blank grid: 3 draws in one pass a frame. **Nothing here was measured with real tiles.**
+- *Observed:* VectorKit asks for 2 new textures a frame (020307: 425 reused and 7 made over 216 passes): 1125x2436 4x `BGRA8Unorm_sRGB`, 44 MB, and 4x `Depth32Float_Stencil8`, 55 MB, both storage mode 3 (memoryless) and render target only (020936). On Apple's GPU those have no memory. Here they do, and a real one takes 35-76 ms, the kernel's GEM allocation under `msm_bo_init` on Maps' main thread.
+- *The fix tried:* IMAGES KEPT FOR THE NEXT TEXTURE in `air_vk.c`, images reused by shape. 014540, 96 MB, less than one set: 50 made, 2.3 s in a 5 s window. 256 MB: 6-9 made, 0.35-0.48 s a window.
+- *Compositor, frames over 18 ms in the pinch:* 4.8% (020307) and 5.4% (015419), against 47.4% (013944, no pool) and 60.1% (014540). **A weak comparison:** Maps died in 015038 by SIGSEGV, my sampler reading frame pointers of threads still running (none after it stops them first), and the same is inferred for 013944 and 014540 (no `mark done`, no CPU lines); their windows differ. There is no clean baseline. Why a client's allocation would delay the compositor is a hypothesis: serialised kernel GEM work, not looked at.
+- *CPU over 12 s (020307):* Maps' main thread 3224 ms (27%); then 447, 420, 376 (event fetch), 315, 288 ms. No separate render thread: display link, VectorKit, commit and texture making all run on main.
+- *What main waits on (few samples):* of 14 waiting, 12 in the run loop with nothing to do, 2 in `-[CAMetalLayer nextDrawable]` (symbolised), 0 on a GPU fence; fence waits are on worker threads, the completion path. Of 22 running, 3 in `msm_bo_init`.
+- *Maps' rate in motion (run 061838, 2026-11-06; kernel mdp-93fe105e, seeded, six scripted pinches, no network, blank grid):* map frames 142 in 5.07 s and 143 in 5.76 s, 28 and 25 a second, three commits each; compositor 66 and 57; half the gaps under 12 ms, longest 56 and 80; GPU busy 54% and 49%; done 7-8 ms after commit; textures 6 a window, about 51 ms each. Submissions waited for a push 40 times, 275 ms in about 11 s, longest 17 ms. Why near 28 is still not known; the earlier rates below had the script's rests in them.
+- *Not settled (earlier):* Maps' rate in motion. 23-39 passes a second, with the script's rests averaged in, while the compositor does 52-59. There is no per-frame timing, so a cap is neither shown nor ruled out.
+- *Also seen:* its layer has a pipe of its own (447 of 900 frames of two layers, three surfaces of Maps' in the swaps). That is why shots show it black. 99 writes waited for a push in 015419, 562 ms in all; the 40 logged are all Maps', median about 5 ms. Why CA gives such a surface back while it is on its way to the panel is not known.
+- *Lead, not built:* one shared image per shape for memoryless targets, whose contents do not outlive a pass, on a GPU that runs submissions in order. It would remove the remaining allocations and most of the memory. Unproven.
+
+**Limits of a shot.** `mdpShot` copies the held surface on the CPU with no wait for the GPU: a seam across a shot can be that copy racing a later draw (goal-alibs/home-4, a seam the owner did not see on the panel). Of two layers a shot has the composite alone. Touches of the owner's during a scripted boot show as `touch: finger` lines: check for them before reading its shots.
 
 ## Sources
 

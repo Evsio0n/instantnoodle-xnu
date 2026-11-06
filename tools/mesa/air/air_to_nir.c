@@ -220,7 +220,9 @@ static const struct glsl_type *
 param_glsl_type(struct air_ctx *c, const struct air_type *t)
 {
    unsigned bits = air_nir_bit_size(c, t);
-   return glsl_vector_type(bits == 16 ? GLSL_TYPE_FLOAT16 :
+   /* (an i1 is a 1-bit def here: a 32-bit variable for one would be a store of the wrong size, _ci_early_out's return) */
+   return glsl_vector_type(bits == 1 ? GLSL_TYPE_BOOL :
+                           bits == 16 ? GLSL_TYPE_FLOAT16 :
                            bits == 64 ? GLSL_TYPE_UINT64 : GLSL_TYPE_UINT,
                            air_nir_components(t));
 }
@@ -3719,6 +3721,78 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
  * and five of them are compute kernels, which is how the claim went unnoticed
  * -- nothing dispatched a kernel until there was something to dispatch it with.
  */
+/* The call of a function translate_callee has made, with its arguments resolved: what a call in a module and a node of a stitched
+ * graph come to. *result stays NULL for a function that returns nothing. */
+static bool
+emit_callee_call(struct air_ctx *c, const struct air_function *f, nir_function *fn, struct air_val **argv,
+                 const bool *is_param, const bool *offset_param, const char *name, struct air_val **result)
+{
+   const struct air_type *rt = f->fn_type->elem;   /* FUNCTION: the return type */
+   bool has_ret = rt && rt->kind != AIR_TYPE_VOID;
+   bool ret_struct = has_ret && rt->kind == AIR_TYPE_STRUCT;
+
+   nir_variable *tmp = NULL;
+   /* One local per member for a struct return, in the member order
+    * translate_callee made its parameters from; the ones with no parameter stay
+    * NULL and the aggregate's element for them stays NULL too, which is the
+    * same thing an extractvalue of an undef field already reads.
+    */
+   nir_variable **fields = ret_struct ?
+      rzalloc_array(c->mem_ctx, nir_variable *, MAX2(rt->num_members, 1)) : NULL;
+   nir_call_instr *call = nir_call_instr_create(c->nir, fn);
+   unsigned idx = 0;
+   if (ret_struct) {
+      for (unsigned i = 0; i < rt->num_members; i++) {
+         if (!ret_member_is_number(rt->members[i]))
+            continue;
+         fields[i] = nir_local_variable_create(c->b.impl,
+                                               param_glsl_type(c, rt->members[i]),
+                                               "callret");
+         call->params[idx++] =
+            nir_src_for_ssa(&nir_build_deref_var(&c->b, fields[i])->def);
+      }
+   } else if (has_ret) {
+      tmp = nir_local_variable_create(c->b.impl, param_glsl_type(c, rt), "callret");
+      call->params[idx++] = nir_src_for_ssa(&nir_build_deref_var(&c->b, tmp)->def);
+   }
+   /* operand 0 is the callee; the arguments follow it */
+   for (unsigned i = 0; i < f->num_args; i++) {
+      if (!is_param[i])
+         continue;
+      if (argv[i]->kind != AIR_VAL_SSA)
+         return air_error(c, "intrinsic: argument %u of %s is not a value this can pass",
+                          i, name);
+      call->params[idx++] = nir_src_for_ssa(argv[i]->def);
+   }
+   /* M5c: and each computed byte offset, after them, as translate_callee declared them */
+   for (unsigned i = 0; i < f->num_args; i++) {
+      if (offset_param[i])
+         call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
+   }
+   /* ... and each number inside an aggregate */
+   for (unsigned i = 0; i < f->num_args; i++) {
+      if (argv[i]->kind != AIR_VAL_AGG)
+         continue;
+      nir_def **defs = rzalloc_array(c->mem_ctx, nir_def *, ssa_leaves(argv[i], NULL, 0) + 1);
+      unsigned n = ssa_leaves(argv[i], defs, 0);
+      for (unsigned k = 0; k < n; k++)
+         call->params[idx++] = nir_src_for_ssa(defs[k]);
+   }
+   nir_builder_instr_insert(&c->b, &call->instr);
+
+   if (ret_struct) {
+      struct air_val *agg = air_val_agg(c, rt->num_members);
+      for (unsigned i = 0; i < rt->num_members; i++)
+         if (fields[i])
+            agg->elems[i] = air_val_ssa(c, nir_load_var(&c->b, fields[i]));
+      *result = agg;
+   } else if (has_ret) {
+      *result = air_val_ssa(c, nir_load_var(&c->b, tmp));
+   }
+   return true;
+}
+
+
 bool
 air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *name)
 {
@@ -3753,69 +3827,11 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    if (!fn)
       return false;   /* translate_callee has said why */
 
-   const struct air_type *rt = f->fn_type->elem;   /* FUNCTION: the return type */
-   bool has_ret = rt && rt->kind != AIR_TYPE_VOID;
-   bool ret_struct = has_ret && rt->kind == AIR_TYPE_STRUCT;
-
-   nir_variable *tmp = NULL;
-   /* One local per member for a struct return, in the member order
-    * translate_callee made its parameters from; the ones with no parameter stay
-    * NULL and the aggregate's element for them stays NULL too, which is the
-    * same thing an extractvalue of an undef field already reads.
-    */
-   nir_variable **fields = ret_struct ?
-      rzalloc_array(c->mem_ctx, nir_variable *, MAX2(rt->num_members, 1)) : NULL;
-   nir_call_instr *call = nir_call_instr_create(c->nir, fn);
-   unsigned idx = 0;
-   if (ret_struct) {
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!ret_member_is_number(rt->members[i]))
-            continue;
-         fields[i] = nir_local_variable_create(c->b.impl,
-                                               param_glsl_type(c, rt->members[i]),
-                                               "callret");
-         call->params[idx++] =
-            nir_src_for_ssa(&nir_build_deref_var(&c->b, fields[i])->def);
-      }
-   } else if (has_ret) {
-      tmp = nir_local_variable_create(c->b.impl, param_glsl_type(c, rt), "callret");
-      call->params[idx++] = nir_src_for_ssa(&nir_build_deref_var(&c->b, tmp)->def);
-   }
-   /* operand 0 is the callee; the arguments follow it */
-   for (unsigned i = 0; i < f->num_args; i++) {
-      if (!is_param[i])
-         continue;
-      nir_def *a = air_get_ssa(c, in->operands[i + 1]);
-      if (!a)
-         return air_error(c, "intrinsic: argument %u of %s is not a value this can pass",
-                          i, name);
-      call->params[idx++] = nir_src_for_ssa(a);
-   }
-   /* M5c: and each computed byte offset, after them, as translate_callee declared them */
-   for (unsigned i = 0; i < f->num_args; i++) {
-      if (offset_param[i])
-         call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
-   }
-   /* ... and each number inside an aggregate */
-   for (unsigned i = 0; i < f->num_args; i++) {
-      if (argv[i]->kind != AIR_VAL_AGG)
-         continue;
-      nir_def **defs = rzalloc_array(c->mem_ctx, nir_def *, ssa_leaves(argv[i], NULL, 0) + 1);
-      unsigned n = ssa_leaves(argv[i], defs, 0);
-      for (unsigned k = 0; k < n; k++)
-         call->params[idx++] = nir_src_for_ssa(defs[k]);
-   }
-   nir_builder_instr_insert(&c->b, &call->instr);
-
-   if (ret_struct) {
-      struct air_val *agg = air_val_agg(c, rt->num_members);
-      for (unsigned i = 0; i < rt->num_members; i++)
-         if (fields[i])
-            agg->elems[i] = air_val_ssa(c, nir_load_var(&c->b, fields[i]));
-      air_set(c, &in->base, agg);
-   } else if (has_ret) {
-      air_set(c, &in->base, air_val_ssa(c, nir_load_var(&c->b, tmp)));
-   }
+   struct air_val *result = NULL;
+   if (!emit_callee_call(c, f, fn, argv, is_param, offset_param, name, &result))
+      return false;
+   if (result)
+      air_set(c, &in->base, result);
    return true;
 }
 
@@ -4777,6 +4793,9 @@ translate_module(void *mem_ctx, const void *bitcode, size_t size, const char *en
 #define AIR_CACHE_DEFAULT NULL
 #endif
 #define AIR_CACHE_MAGIC 0x41495231u
+#ifdef __APPLE__
+#include <mach-o/loader.h>
+#endif
 
 static const char *
 air_cache_dir(void)
@@ -4807,12 +4826,26 @@ air_cache_path(const uint8_t key[20], const char *suffix, char *path, size_t pat
    return (size_t)snprintf(path, path_size, "%s/%s%s", dir, hex, suffix) < path_size;
 }
 
+/* (SHADERS BUILT BEFORE THE BOOT, the owner: 「开机前能不能build着色器」. /var is new at every RAM boot, so what a harvest boot translated is
+ * kept in the root, read only, beside the cache of this boot: tools/metal/loop/cache_take.py, mk_root.sh's AIRCACHE) */
+#ifdef __APPLE__
+#define AIR_CACHE_SEED "/hackios/share/air-cache"
+#else
+#define AIR_CACHE_SEED NULL
+#endif
+
 void *
 air_cache_read(const char *path, size_t *size)
 {
    int fd = open(path, O_RDONLY);
    struct stat st;
    void *bytes = NULL;
+   if (fd < 0 && AIR_CACHE_SEED) {
+      char seed[320];
+      const char *leaf = strrchr(path, '/');
+      if (leaf && (size_t)snprintf(seed, sizeof(seed), "%s%s", AIR_CACHE_SEED, leaf) < sizeof(seed))
+         fd = open(seed, O_RDONLY);
+   }
    if (fd < 0)
       return NULL;
    if (fstat(fd, &st) == 0 && st.st_size > 0 && (bytes = malloc((size_t)st.st_size)) != NULL) {
@@ -4853,12 +4886,30 @@ air_cache_key(const void *bitcode, size_t size, const char *entry_point, const s
    const uint32_t magic = AIR_CACHE_MAGIC;
    if (!air_cache_dir())
       return false;
-   if (dladdr((const void *)air_cache_key, &self) && self.dli_fname)
-      stat(self.dli_fname, &st);
    _mesa_sha1_init(&sha);
    _mesa_sha1_update(&sha, &magic, sizeof(magic));
-   _mesa_sha1_update(&sha, &st.st_size, sizeof(st.st_size));
-   _mesa_sha1_update(&sha, &st.st_mtime, sizeof(st.st_mtime));
+   /* Which library translated it: its Mach-O UUID, which a new build changes and a copy into another root does not (a file's time did, so
+    * no kept entry would have survived a rebuilt root). A new library misses them all and translates, as a first boot does. */
+   bool named = false;
+#ifdef __APPLE__
+   if (dladdr((const void *)air_cache_key, &self) && self.dli_fbase) {
+      const struct mach_header_64 *h = self.dli_fbase;
+      const struct load_command *lc = (const struct load_command *)(h + 1);
+      for (uint32_t i = 0; i < h->ncmds && !named; i++) {
+         if (lc->cmd == LC_UUID) {
+            _mesa_sha1_update(&sha, ((const struct uuid_command *)lc)->uuid, 16);
+            named = true;
+         }
+         lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+      }
+   }
+#endif
+   if (!named) {
+      if (dladdr((const void *)air_cache_key, &self) && self.dli_fname)
+         stat(self.dli_fname, &st);
+      _mesa_sha1_update(&sha, &st.st_size, sizeof(st.st_size));
+      _mesa_sha1_update(&sha, &st.st_mtime, sizeof(st.st_mtime));
+   }
    _mesa_sha1_update(&sha, entry_point ? entry_point : "", strlen(entry_point ? entry_point : ""));
    if (options) {
       const uint32_t flags = (options->partial_constants ? 1 : 0) | (options->library_wrapper ? 2 : 0);
@@ -4873,6 +4924,13 @@ air_cache_key(const void *bitcode, size_t size, const char *entry_point, const s
    _mesa_sha1_update(&sha, bitcode, size);
    _mesa_sha1_final(&sha, key);
    return true;
+}
+
+/* The key of anything else kept by the same library's rules: a back end's own bytes, named by what they are. */
+bool
+air_cache_key_of(const void *bytes, size_t size, const char *what, uint8_t key[20])
+{
+   return air_cache_key(bytes, size, what, NULL, key);
 }
 
 static void
@@ -5037,6 +5095,430 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       air_cache_store(path, nir, info);
    }
    return nir;
+}
+
+/* What ends a translation, an entry point's and a stitched graph's: the sizes the shader asks for, the callees folded in, and what
+ * the caller keeps copied out of the context that goes now. */
+static nir_shader *
+finish_translation(struct air_ctx *c, void *mem_ctx, void *ctx, int stage, struct air_shader_info *info, const char **error)
+{
+   for (unsigned i = 0; i < c->info->num_resources; i++) {
+      const struct air_resource *r = &c->info->resources[i];
+      if (r->index == ~0u)   /* (A RESOURCE'S INDEX THAT IS A FUNCTION CONSTANT'S): not in this one */
+         continue;
+      switch (r->kind) {
+      case AIR_RESOURCE_CONSTANT_BUFFER:
+         c->nir->info.num_ubos = MAX2(c->nir->info.num_ubos, r->index + 1);
+         break;
+      case AIR_RESOURCE_DEVICE_BUFFER:
+         c->nir->info.num_ssbos = MAX2(c->nir->info.num_ssbos, r->index + 1);
+         break;
+      case AIR_RESOURCE_TEXTURE:
+         c->nir->info.num_textures = MAX2(c->nir->info.num_textures, r->index + 1);
+         BITSET_SET(c->nir->info.textures_used, r->index);
+         break;
+      case AIR_RESOURCE_IMAGE:
+         c->nir->info.num_images = MAX2(c->nir->info.num_images, r->index + 1);
+         BITSET_SET(c->nir->info.images_used, r->index);
+         break;
+      default:
+         break;
+      }
+   }
+
+   c->nir->scratch_size = c->scratch_size;
+   c->nir->info.shared_size = c->shared_size;
+   c->info->threadgroup_bytes = c->shared_size;
+   c->nir->info.io_lowered = false;
+   if (stage == MESA_SHADER_COMPUTE) {
+      /* the threadgroup size is a dispatch argument, not a shader constant */
+      c->nir->info.workgroup_size_variable = true;
+   }
+
+   nir_lower_goto_ifs(c->nir);
+
+   /* Fold in any function of the module the shader called, and then drop the
+    * callees. This has to come after nir_lower_goto_ifs and not before: this
+    * translator emits an unstructured CFG, and nir_inline_functions walks the
+    * control-flow tree, which asserts on one. The pass order inside is the one
+    * nir_functions.c prescribes -- inline, then nir_opt_deref to undo the cast
+    * a pointer parameter leaves behind, then delete everything but the entry
+    * point, which every consumer of this NIR assumes.
+    */
+   if (_mesa_hash_table_num_entries(c->fns)) {
+      NIR_PASS(_, c->nir, nir_inline_functions);
+      NIR_PASS(_, c->nir, nir_opt_deref);
+      nir_remove_non_entrypoints(c->nir);
+      NIR_PASS(_, c->nir, nir_lower_variable_initializers, nir_var_function_temp);
+      NIR_PASS(_, c->nir, nir_split_var_copies);
+      NIR_PASS(_, c->nir, nir_lower_var_copies);
+      NIR_PASS(_, c->nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, c->nir, nir_opt_dce);
+   }
+
+   fold_module_variables(c);
+
+   nir_index_ssa_defs(nir_shader_get_entrypoint(c->nir));
+
+   if (info) {
+      /* The info's arrays live under mem_ctx, not under the scratch context --
+       * and so must every STRING in them, which is the part this used to get
+       * wrong. `air_md_string` returns a NUL-terminated copy allocated as a
+       * child of the metadata node it came from, so every `air.arg_name` and
+       * `air.arg_type_name` in here pointed into the module, which is under
+       * `ctx`, which is freed three lines below. The caller was handed
+       * pointers into freed memory and mostly got away with it, because the
+       * bytes usually survive; what it looks like when they do not is
+       * `--interface` printing `name=on=1` for an attribute whose name is
+       * `texcoord1`, which is how this was found -- vattrcheck.py counted four
+       * attributes in a three-attribute shader because two garbled lines each
+       * carried a stray tab.
+       *
+       * vertex_attributes was not copied at all, which was the same bug with
+       * no bytes left to get away with.
+       */
+      if (info->num_resources) {
+         info->resources = ralloc_memdup(mem_ctx, info->resources,
+                                         info->num_resources * sizeof(*info->resources));
+         for (unsigned i = 0; i < info->num_resources; i++) {
+            info->resources[i].name = ralloc_strdup(mem_ctx, info->resources[i].name);
+            info->resources[i].type_name =
+               ralloc_strdup(mem_ctx, info->resources[i].type_name);
+         }
+      }
+      if (info->num_varyings) {
+         info->varyings = ralloc_memdup(mem_ctx, info->varyings,
+                                        info->num_varyings * sizeof(*info->varyings));
+         for (unsigned i = 0; i < info->num_varyings; i++)
+            info->varyings[i].name = ralloc_strdup(mem_ctx, info->varyings[i].name);
+      }
+      if (info->num_vertex_attributes) {
+         info->vertex_attributes =
+            ralloc_memdup(mem_ctx, info->vertex_attributes,
+                          info->num_vertex_attributes * sizeof(*info->vertex_attributes));
+         for (unsigned i = 0; i < info->num_vertex_attributes; i++) {
+            struct air_vertex_attribute *a = &info->vertex_attributes[i];
+            a->name = ralloc_strdup(mem_ctx, a->name);
+            a->type_name = ralloc_strdup(mem_ctx, a->type_name);
+            a->function_constant = ralloc_strdup(mem_ctx, a->function_constant);
+         }
+      }
+      if (info->num_notes) {
+         info->notes = ralloc_memdup(mem_ctx, info->notes,
+                                     info->num_notes * sizeof(*info->notes));
+         for (unsigned i = 0; i < info->num_notes; i++)
+            info->notes[i] = ralloc_strdup(mem_ctx, info->notes[i]);
+      }
+      info->entry_point = ralloc_strdup(mem_ctx, info->entry_point);
+   }
+   ralloc_free(ctx);
+   if (error)
+      *error = NULL;
+   return c->nir;
+}
+
+/*
+ * FUNCTION STITCHING (K37, nir_air.h). Each node is one call in one `main`, in the graph's order: the functions are ordinary ones, in
+ * modules of their own, and the "ABI" of air.stitching_info is not needed at this level: an argument is a value here, as it is once
+ * Metal has inlined them. So c->m and c->global_plan follow the function being translated, and everything else is the entry
+ * point's. An early return is an `if` around the rest, which is why this main is the one structured impl here.
+ *
+ * A texture says which it is by what its function does with it: this module's air.visible_input says only __metal_texture_2d_t.
+ */
+static bool
+module_calls(const struct air_module *m, const char *prefix)
+{
+   for (unsigned i = 0; i < m->num_functions; i++) {
+      const char *name = m->functions[i]->base.name;
+      if (name && !strncmp(name, prefix, strlen(prefix)))
+         return true;
+   }
+   return false;
+}
+
+static bool
+stitch_resource_seen(struct air_ctx *c, enum air_resource_kind kind, unsigned index)
+{
+   for (unsigned i = 0; i < c->info->num_resources; i++)
+      if (c->info->resources[i].kind == kind && c->info->resources[i].index == index)
+         return true;
+   return false;
+}
+
+/* A value out of a buffer: an array (a matrix, to these functions) is a tree of its elements, as an extractvalue wants it. */
+static struct air_val *
+stitch_load(struct air_ctx *c, struct air_ptr base, const struct air_type *t, unsigned offset, unsigned *end)
+{
+   if (t->kind == AIR_TYPE_ARRAY) {
+      struct air_val *agg = air_val_agg(c, t->count);
+      const unsigned stride = (unsigned)air_type_alloc_size(c->m, t->elem);
+
+      for (unsigned i = 0; i < t->count; i++) {
+         agg->elems[i] = stitch_load(c, base, t->elem, offset + i * stride, end);
+         if (!agg->elems[i])
+            return NULL;
+      }
+      return agg;
+   }
+   if (t->kind != AIR_TYPE_VECTOR && t->kind != AIR_TYPE_FLOAT && t->kind != AIR_TYPE_HALF && t->kind != AIR_TYPE_INT) {
+      air_error(c, "stitching: a value out of a buffer of a type that is none of a number, a vector or an array of them");
+      return NULL;
+   }
+   const unsigned bytes = (unsigned)air_type_alloc_size(c->m, t);
+   *end = MAX2(*end, offset + bytes);
+   base.pointee = t;
+   nir_def *v = air_load_ptr(c, air_ptr_add(c, base, nir_imm_int(&c->b, offset)), t, MAX2(bytes, 1));
+   return v ? air_val_ssa(c, v) : NULL;
+}
+
+static nir_shader *translate_stitched(void *mem_ctx, const char *name, const struct air_stitch_node *nodes, unsigned num_nodes,
+                                      const nir_shader_compiler_options *nir_options, struct air_shader_info *info,
+                                      const char **error);
+
+/* A graph kept as a module's translation is (A TRANSLATION KEPT ON DISK): keyed on what makes it, each node's function and arguments. */
+nir_shader *
+air_stitch_to_nir(void *mem_ctx, const char *name, const struct air_stitch_node *nodes, unsigned num_nodes,
+                  const nir_shader_compiler_options *nir_options, struct air_shader_info *info,
+                  const char **error)
+{
+   struct mesa_sha1 sha;
+   uint8_t part[20], key[20];
+   char path[256];
+   bool cached = info != NULL;
+
+   _mesa_sha1_init(&sha);
+   _mesa_sha1_update(&sha, "stitch", 6);
+   for (unsigned n = 0; n < num_nodes && cached; n++) {
+      const struct air_stitch_node *node = &nodes[n];
+      if (node->name) {
+         cached = air_cache_key(node->bitcode, node->size, node->name, NULL, part);
+         _mesa_sha1_update(&sha, part, sizeof(part));
+      }
+      _mesa_sha1_update(&sha, &node->early_return, sizeof(node->early_return));
+      _mesa_sha1_update(&sha, &node->num_inputs, sizeof(node->num_inputs));
+      if (node->num_inputs)
+         _mesa_sha1_update(&sha, node->inputs, node->num_inputs * sizeof(*node->inputs));
+   }
+   _mesa_sha1_final(&sha, key);
+   cached = cached && air_cache_path(key, "", path, sizeof(path));
+   if (cached) {
+      nir_shader *found = air_cache_load(mem_ctx, path, nir_options, info);
+      if (found)
+         return found;
+   }
+   nir_shader *nir = translate_stitched(mem_ctx, name, nodes, num_nodes, nir_options, info, error);
+   if (cached && nir) {
+      memcpy(info->cache_key, key, sizeof(key));
+      air_cache_store(path, nir, info);
+   }
+   return nir;
+}
+
+/* (a texture or sampler is a bare pointer in some of these functions and in a one-field metal:: struct in others) */
+static struct air_val *
+stitch_handle(struct air_ctx *c, const struct air_type *t, struct air_ptr p)
+{
+   if (t->kind == AIR_TYPE_STRUCT && t->num_members == 1) {
+      struct air_val *agg = air_val_agg(c, 1);
+      agg->elems[0] = air_val_ptr(c, p);
+      return agg;
+   }
+   return air_val_ptr(c, p);
+}
+
+static nir_shader *
+translate_stitched(void *mem_ctx, const char *name, const struct air_stitch_node *nodes, unsigned num_nodes,
+                   const nir_shader_compiler_options *nir_options, struct air_shader_info *info,
+                   const char **error)
+{
+   static const struct air_to_nir_options no_options;
+   void *ctx = ralloc_context(mem_ctx);
+   struct air_shader_info local_info = { 0 };
+   struct air_ctx c = { .mem_ctx = ctx, .options = &no_options, .info = info ? info : &local_info };
+   memset(c.info, 0, sizeof(*c.info));
+
+   c.nir = nir_shader_create(mem_ctx, MESA_SHADER_COMPUTE, nir_options, NULL);
+   c.nir->info.name = ralloc_strdup(c.nir, name);
+   c.nir->info.internal = false;
+   c.fns = _mesa_pointer_hash_table_create(ctx);
+   nir_function *entry = nir_function_create(c.nir, "main");
+   entry->is_entrypoint = true;
+   c.b = nir_builder_at(nir_before_impl(nir_function_impl_create(entry)));
+   c.const_cursor = nir_before_impl(c.b.impl);
+   c.values = _mesa_pointer_hash_table_create(ctx);
+   c.globals = _mesa_pointer_hash_table_create(ctx);
+   c.blocks = _mesa_pointer_hash_table_create(ctx);
+   c.phi_cursors = _mesa_pointer_hash_table_create(ctx);
+   c.phi_regs = _mesa_pointer_hash_table_create(ctx);
+   c.params = rzalloc_array(ctx, struct air_val *, 1);
+   c.outputs = rzalloc_array(ctx, __typeof__(*c.outputs), 1);
+   c.info->stage = MESA_SHADER_COMPUTE;
+   c.info->entry_point = ralloc_strdup(ctx, name);
+
+   /* each module once, however many nodes call into it */
+   const struct air_module **modules = rzalloc_array(ctx, const struct air_module *, MAX2(num_nodes, 1));
+   struct air_global_plan **plans = rzalloc_array(ctx, struct air_global_plan *, MAX2(num_nodes, 1));
+   const struct air_function **functions = rzalloc_array(ctx, const struct air_function *, MAX2(num_nodes, 1));
+   struct air_val **results = rzalloc_array(ctx, struct air_val *, MAX2(num_nodes, 1));
+   unsigned buffer_end[32] = { 0 };
+   bool buffer_used[32] = { false };
+   unsigned ifs = 0;
+
+   for (unsigned n = 0; n < num_nodes && !c.error[0]; n++) {
+      const struct air_stitch_node *node = &nodes[n];
+
+      if (!node->name)
+         continue;
+      for (unsigned k = 0; k < n && !modules[n]; k++) {
+         if (nodes[k].bitcode == node->bitcode) {
+            modules[n] = modules[k];
+            plans[n] = plans[k];
+         }
+      }
+      if (!modules[n]) {
+         const char *read_error = NULL;
+         struct air_module *m = air_module_read(ctx, node->bitcode, node->size, &read_error);
+
+         if (!m) {
+            air_error(&c, "reader: %s: %s", node->name, read_error);
+            break;
+         }
+         modules[n] = m;
+         c.m = m;
+         plan_globals(&c);
+         plans[n] = c.global_plan;
+      }
+      for (unsigned i = 0; i < modules[n]->num_functions && !functions[n]; i++) {
+         const struct air_function *f = modules[n]->functions[i];
+         if (f->base.name && !strcmp(f->base.name, node->name) && !f->is_declaration)
+            functions[n] = f;
+      }
+      if (!functions[n])
+         air_error(&c, "stitching: its module has no function %s", node->name);
+   }
+   c.variables_end = c.scratch_size;
+
+   for (unsigned n = 0; n < num_nodes && !c.error[0]; n++) {
+      const struct air_stitch_node *node = &nodes[n];
+
+      /* An early return on another node's value: a node of a class of its own, on a Mac today. */
+      if (!node->name) {
+         struct air_val *v = node->early_return && node->num_inputs && node->inputs[0].kind == AIR_STITCH_NODE ? results[node->inputs[0].node] : NULL;
+
+         if (!v || v->kind != AIR_VAL_SSA) {
+            air_error(&c, "stitching: an early return on something that is not a function's bool");
+            break;
+         }
+         nir_push_if(&c.b, v->def->bit_size == 1 ? nir_inot(&c.b, v->def) : nir_ieq_imm(&c.b, v->def, 0));
+         ifs++;
+         continue;
+      }
+      const struct air_function *f = functions[n];
+
+      c.m = modules[n];
+      c.global_plan = plans[n];
+      c.fn = f;
+      if (node->num_inputs != f->num_args) {
+         air_error(&c, "stitching: %s takes %u arguments and the graph gives %u", node->name, f->num_args, node->num_inputs);
+         break;
+      }
+      struct air_val **argv = rzalloc_array(ctx, struct air_val *, MAX2(f->num_args, 1));
+      bool *is_param = rzalloc_array(ctx, bool, MAX2(f->num_args, 1));
+      bool *offset_param = rzalloc_array(ctx, bool, MAX2(f->num_args, 1));
+
+      for (unsigned i = 0; i < f->num_args && !c.error[0]; i++) {
+         const struct air_stitch_input *in = &node->inputs[i];
+         const struct air_type *t = f->args[i].type;
+
+         switch (in->kind) {
+         case AIR_STITCH_THREAD_POSITION_IN_GRID:
+         case AIR_STITCH_THREAD_POSITION_IN_THREADGROUP: {
+            nir_def *position = in->kind == AIR_STITCH_THREAD_POSITION_IN_GRID ? load_sysval(&c, AIR_SV_THREAD_POS_GRID)
+                                                                               : load_sysval(&c, AIR_SV_THREAD_POS_TG);
+            argv[i] = air_val_ssa(&c, nir_trim_vector(&c.b, position, air_nir_components(t)));
+            break;
+         }
+         case AIR_STITCH_BUFFER_VALUE:
+         case AIR_STITCH_BUFFER_POINTER: {
+            if (in->bind >= ARRAY_SIZE(buffer_end)) {
+               air_error(&c, "stitching: buffer %u", in->bind);
+               break;
+            }
+            struct air_ptr p = { .class = AIR_PTR_UBO, .binding = in->bind };
+
+            buffer_used[in->bind] = true;
+            if (in->kind == AIR_STITCH_BUFFER_VALUE) {
+               argv[i] = stitch_load(&c, p, t, in->offset, &buffer_end[in->bind]);
+            } else {
+               if (t->kind != AIR_TYPE_POINTER || t->addrspace != 2) {
+                  air_error(&c, "stitching: a buffer's address for argument %u of %s, which is not a constant pointer", i, node->name);
+                  break;
+               }
+               p.pointee = t->elem;
+               buffer_end[in->bind] = MAX2(buffer_end[in->bind], in->offset + 256);
+               argv[i] = air_val_ptr(&c, in->offset ? air_ptr_add(&c, p, nir_imm_int(&c.b, in->offset)) : p);
+            }
+            break;
+         }
+         case AIR_STITCH_TEXTURE: {
+            const bool write = module_calls(c.m, "air.write_texture");
+            const enum air_resource_kind kind = write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE;
+            struct air_ptr p = { .class = AIR_PTR_TEXTURE, .binding = in->bind, .is_image = write };
+
+            if (!stitch_resource_seen(&c, kind, in->bind))
+               add_resource(&c, kind, in->bind, 0, !write, write, ~0u, NULL);
+            argv[i] = stitch_handle(&c, t, p);
+            break;
+         }
+         case AIR_STITCH_SAMPLER: {
+            struct air_ptr p = { .class = AIR_PTR_SAMPLER, .binding = in->bind };
+
+            if (!stitch_resource_seen(&c, AIR_RESOURCE_SAMPLER, in->bind))
+               add_resource(&c, AIR_RESOURCE_SAMPLER, in->bind, 0, true, false, ~0u, NULL);
+            argv[i] = stitch_handle(&c, t, p);
+            break;
+         }
+         case AIR_STITCH_NODE:
+            argv[i] = in->node < n ? results[in->node] : NULL;
+            if (!argv[i])
+               air_error(&c, "stitching: argument %u of %s is a node that gives nothing", i, node->name);
+            break;
+         }
+         if (!argv[i] && !c.error[0])
+            air_error(&c, "stitching: argument %u of %s", i, node->name);
+      }
+      if (c.error[0])
+         break;
+      nir_function *fn = translate_callee(&c, f, argv, is_param, offset_param);
+      if (!fn)
+         break;
+      emit_callee_call(&c, f, fn, argv, is_param, offset_param, node->name, &results[n]);
+      /* An early return that is its own function's call and answer: iOS 16.5's FunctionNodeSPI with isEarlyReturn, as run 044804 read it. */
+      if (node->early_return && !c.error[0]) {
+         if (!results[n] || results[n]->kind != AIR_VAL_SSA) {
+            air_error(&c, "stitching: %s, an early return, gives no bool", node->name);
+            break;
+         }
+         nir_def *d = results[n]->def;
+         nir_push_if(&c.b, d->bit_size == 1 ? nir_inot(&c.b, d) : nir_ieq_imm(&c.b, d, 0));
+         ifs++;
+      }
+   }
+   for (unsigned b = 0; b < ARRAY_SIZE(buffer_used) && !c.error[0]; b++) {
+      if (buffer_used[b])
+         add_resource(&c, AIR_RESOURCE_CONSTANT_BUFFER, b, buffer_end[b], true, false, ~0u, NULL);
+   }
+   while (ifs--)
+      nir_pop_if(&c.b, NULL);
+
+   if (c.error[0]) {
+      if (error)
+         *error = ralloc_strdup(mem_ctx, c.error);
+      ralloc_free(c.nir);
+      ralloc_free(ctx);
+      return NULL;
+   }
+   return finish_translation(&c, mem_ctx, ctx, MESA_SHADER_COMPUTE, info, error);
 }
 
 static nir_shader *
@@ -5222,117 +5704,5 @@ translate_module(void *mem_ctx, const void *bitcode, size_t size, const char *en
     * are the binding numbers, so a shader using [[buffer(14)]] alone still
     * declares fifteen UBOs. ir3 and NIR's own passes read these.
     */
-   for (unsigned i = 0; i < c.info->num_resources; i++) {
-      const struct air_resource *r = &c.info->resources[i];
-      if (r->index == ~0u)   /* (A RESOURCE'S INDEX THAT IS A FUNCTION CONSTANT'S): not in this one */
-         continue;
-      switch (r->kind) {
-      case AIR_RESOURCE_CONSTANT_BUFFER:
-         c.nir->info.num_ubos = MAX2(c.nir->info.num_ubos, r->index + 1);
-         break;
-      case AIR_RESOURCE_DEVICE_BUFFER:
-         c.nir->info.num_ssbos = MAX2(c.nir->info.num_ssbos, r->index + 1);
-         break;
-      case AIR_RESOURCE_TEXTURE:
-         c.nir->info.num_textures = MAX2(c.nir->info.num_textures, r->index + 1);
-         BITSET_SET(c.nir->info.textures_used, r->index);
-         break;
-      case AIR_RESOURCE_IMAGE:
-         c.nir->info.num_images = MAX2(c.nir->info.num_images, r->index + 1);
-         BITSET_SET(c.nir->info.images_used, r->index);
-         break;
-      default:
-         break;
-      }
-   }
-
-   c.nir->scratch_size = c.scratch_size;
-   c.nir->info.shared_size = c.shared_size;
-   c.info->threadgroup_bytes = c.shared_size;
-   c.nir->info.io_lowered = false;
-   if (stage == MESA_SHADER_COMPUTE) {
-      /* the threadgroup size is a dispatch argument, not a shader constant */
-      c.nir->info.workgroup_size_variable = true;
-   }
-
-   nir_lower_goto_ifs(c.nir);
-
-   /* Fold in any function of the module the shader called, and then drop the
-    * callees. This has to come after nir_lower_goto_ifs and not before: this
-    * translator emits an unstructured CFG, and nir_inline_functions walks the
-    * control-flow tree, which asserts on one. The pass order inside is the one
-    * nir_functions.c prescribes -- inline, then nir_opt_deref to undo the cast
-    * a pointer parameter leaves behind, then delete everything but the entry
-    * point, which every consumer of this NIR assumes.
-    */
-   if (_mesa_hash_table_num_entries(c.fns)) {
-      NIR_PASS(_, c.nir, nir_inline_functions);
-      NIR_PASS(_, c.nir, nir_opt_deref);
-      nir_remove_non_entrypoints(c.nir);
-      NIR_PASS(_, c.nir, nir_lower_variable_initializers, nir_var_function_temp);
-      NIR_PASS(_, c.nir, nir_split_var_copies);
-      NIR_PASS(_, c.nir, nir_lower_var_copies);
-      NIR_PASS(_, c.nir, nir_lower_vars_to_ssa);
-      NIR_PASS(_, c.nir, nir_opt_dce);
-   }
-
-   fold_module_variables(&c);
-
-   nir_index_ssa_defs(nir_shader_get_entrypoint(c.nir));
-
-   if (info) {
-      /* The info's arrays live under mem_ctx, not under the scratch context --
-       * and so must every STRING in them, which is the part this used to get
-       * wrong. `air_md_string` returns a NUL-terminated copy allocated as a
-       * child of the metadata node it came from, so every `air.arg_name` and
-       * `air.arg_type_name` in here pointed into the module, which is under
-       * `ctx`, which is freed three lines below. The caller was handed
-       * pointers into freed memory and mostly got away with it, because the
-       * bytes usually survive; what it looks like when they do not is
-       * `--interface` printing `name=on=1` for an attribute whose name is
-       * `texcoord1`, which is how this was found -- vattrcheck.py counted four
-       * attributes in a three-attribute shader because two garbled lines each
-       * carried a stray tab.
-       *
-       * vertex_attributes was not copied at all, which was the same bug with
-       * no bytes left to get away with.
-       */
-      if (info->num_resources) {
-         info->resources = ralloc_memdup(mem_ctx, info->resources,
-                                         info->num_resources * sizeof(*info->resources));
-         for (unsigned i = 0; i < info->num_resources; i++) {
-            info->resources[i].name = ralloc_strdup(mem_ctx, info->resources[i].name);
-            info->resources[i].type_name =
-               ralloc_strdup(mem_ctx, info->resources[i].type_name);
-         }
-      }
-      if (info->num_varyings) {
-         info->varyings = ralloc_memdup(mem_ctx, info->varyings,
-                                        info->num_varyings * sizeof(*info->varyings));
-         for (unsigned i = 0; i < info->num_varyings; i++)
-            info->varyings[i].name = ralloc_strdup(mem_ctx, info->varyings[i].name);
-      }
-      if (info->num_vertex_attributes) {
-         info->vertex_attributes =
-            ralloc_memdup(mem_ctx, info->vertex_attributes,
-                          info->num_vertex_attributes * sizeof(*info->vertex_attributes));
-         for (unsigned i = 0; i < info->num_vertex_attributes; i++) {
-            struct air_vertex_attribute *a = &info->vertex_attributes[i];
-            a->name = ralloc_strdup(mem_ctx, a->name);
-            a->type_name = ralloc_strdup(mem_ctx, a->type_name);
-            a->function_constant = ralloc_strdup(mem_ctx, a->function_constant);
-         }
-      }
-      if (info->num_notes) {
-         info->notes = ralloc_memdup(mem_ctx, info->notes,
-                                     info->num_notes * sizeof(*info->notes));
-         for (unsigned i = 0; i < info->num_notes; i++)
-            info->notes[i] = ralloc_strdup(mem_ctx, info->notes[i]);
-      }
-      info->entry_point = ralloc_strdup(mem_ctx, info->entry_point);
-   }
-   ralloc_free(ctx);
-   if (error)
-      *error = NULL;
-   return c.nir;
+   return finish_translation(&c, mem_ctx, ctx, stage, info, error);
 }

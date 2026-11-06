@@ -3157,6 +3157,12 @@ smmu_claim(void)
 		return false;
 	}
 	smmu_matches_taken = 0;
+	used[4] = true;         /* the display's, as it once was: never read */
+	{
+		extern uint32_t hk_display_context;
+
+		used[hk_display_context] = true;        /* the display's now, whether or not its stream is sent there: reading it is a CrashDump (instantnoodle_mdp.c) */
+	}
 	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
 		uint32_t smr = rd(smmu_global + SMMU_SMR(n)), s2cr = rd(smmu_global + SMMU_S2CR(n));
 

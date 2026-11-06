@@ -62,6 +62,7 @@ are kept when a check fails).
   stood still (under 2 s); and all but two cores were off when the sleep began (`hk_power.c` counts them). That is the proof
   that the sleep that the kernel implements was entered. **It is not the SoC's lowest state** (CX and memory collapsed):
   that is not implemented, see [subsystems/power.md](subsystems/power.md).
+  Lock first (`tools/t`'s `LOCK`: `rwtouch button lock`, `power_test waitdisplay off 5`): a timed wake after a sleep forced with the phone apparently unlocked left the screen dark (run 110920; a lit lock screen is fine, run 112641; K10), and PASS does not look at the screen; `power_test waitdisplay on 8` does.
 - **memory after wake**: `kern.hackios.membench` (all cores writing, about a second) before and after: the vote and the
   restarted cores. Not under 80% of before.
 - **frames after sleep**: the same gestures before and after; not under 90% of the frame rate, not 5 points more late
@@ -151,3 +152,38 @@ The approved low-volume probe is `sound_test bluetooth-tone 180 route`: exact bu
 Use `adsp=1 sound=4 mic=4 sound_amps=0` for built-in backend/mic diagnostics with speakers muted; the earlier tools/t
 Bluetooth boot did not enable those paths. Enable mediaserverd logs. Re-pair after a new RAM boot; capture actual route,
 A2DP start/media traffic and heard output separately. Another agent owns sleep work; honor the shared run lock.
+
+## The MDP's boots
+
+`tools/mdp/boot.sh TAG "ARGS" [SECS] [DONE]`: one RAM-only boot, the kernel from `BUILD_MDP` kept in `out/kernels/` by its SHA, every `mdp:` line merged into `logs/mdp-TAG.txt`. Compare two boots only with no human touches in the windows compared (`touch: finger N down`; `rwtouch` does not make those lines): the owner using the phone during a run reads as 40-70 % GPU busy. `xl screenshot` shows the frame's memory, not the MDP's output (docs/subsystems/display.md); the checks that see the output are the mixers' checksums in `mdp=2` and `mdp=3`, and the eye.
+
+## Reading heat in a log
+Two figures, and a report gives both:
+- **The minute's sample:** `thermal: a minute: ... hottest X at N C, slowed S`, a reading at that moment, not the minute's peak.
+- **The peak:** the state-change lines, `thermal: moderate, hottest X at N C; cores at rows a/b c/d e/f`. A burst can be 30 C above the samples (run 064117: 87.6 C, then 83.7 C a quarter of a second later, with samples of 54-55). A run with no such line has no peak to report beyond its samples.
+- **Throttling:** `slowed S` above 0, or on a state-change line a row below its top (`a` under `b`).
+
+**When to stop (the supervisor, 2026-11-06; the limit is theirs, not a datasheet's):** a minute's sample at 75 C or above, or any throttling (`slowed` above 0, or a state past `moderate` held for more than a moment) stops the work. Brief core peaks are recorded, not a stop.
+
+## The queue for the phone (`tools/bootq`)
+
+The owner's page (`tools/metal/loop/eye.py`, http://127.0.0.1:8765/) shows the same queue, from `tools/bootq status --json`, which reads the queue's files and never asks the phone.
+
+Several sessions and the owner's test page share one phone. `xl`'s lock says only that it is busy now, so waiters raced each other, nobody could see who was next, and a waiter could not be taken back. Every boot goes through the queue:
+
+```bash
+tools/bootq run --who metal --what "heavy script, fb_wait=13" --no-touch --max 150 -- bash tools/metal/loop/goal.sh tag 125
+tools/bootq status
+tools/bootq log
+tools/bootq cancel 12
+```
+
+- **Order:** first come, first served, with `--owner` tickets ahead of every waiting session ticket. A running ticket is never stopped by another session. `cancel` only takes back a ticket that is still waiting.
+- **The owner's click:** `--owner --preempt` is for the test page alone. It stops a session's run with `xl stop`, as the owner's click always did. No script may use it. The page (`tools/metal/loop/eye.py`) boots a row this way, stops its own previous run first, and says 排隊中 while its ticket waits (one click tested, run 054940: phone in 0 s, home at 69 s; stopping a session's run through it has not been exercised).
+- **Boots outside the queue** hold `xl`'s lock. The queue waits for them and `status` says "in use outside the queue", so a session that has not moved over cannot collide, but it can still jump ahead.
+- **A kernel nobody is watching:** if `xl` dies after starting a kernel, its lock is free but the kernel runs on, and the loader refuses every upload. The queue asks the loader (`getvar result`) before it gives anyone the phone. It waits, says so, and tells the ticket that left it there. Whoever started that kernel keeps its log and runs `xl stop`.
+- **`tools/bootq cool on|off`:** for a warm phone. After each run, session tickets wait half of what it took, at most 5 minutes. The owner's do not.
+- **What counts as a boot:** a command that exits 0 and leaves no new `logs/*-run.log*` did not boot, and `run` exits 75. Scripts must take the run's name from `bootq: #N ended, rc R, run NAME` and never from "the newest log", which is how a Metal log was once read as an hk-gl result.
+- **`--no-touch`** says a finger spoils the run; `status` shows it, so tell the owner to keep off. **`--max`** is only a note: past it `status` says OVERDUE and nothing is stopped.
+- **Exit codes:** the command's own, 75 no run log, 124 `--wait` passed, 125 cancelled while waiting. Inside a ticket (`BOOTQ_TICKET` set), `run` just runs the command, so a script and what it calls can both use it.
+- The state is in `/tmp/hackios-bootq`, outside every working copy, as `xl`'s locks are. A ticket whose process died is dropped. `tools/bootq_test.py` tests all of this against a pretend phone (verified on this Mac; no phone is touched).

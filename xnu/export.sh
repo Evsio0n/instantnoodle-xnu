@@ -10,7 +10,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SRC=${1:-${XNU_SRC:-$HERE/../xnu-src/xnu-8796.121.2}}
 BASE=c54f35ca767986246321eb901baf8f5ff7923f6a           # tag xnu-8796.121.2
 # never part of the work: build output and what editors, patch and python leave behind
-JUNK='^BUILD/|(^|/)__pycache__/|\.(orig|rej|pyc|o|swp)$|\.bak[0-9]*$|~$|(^|/)\.DS_Store$'
+JUNK='^BUILD[^/]*/|(^|/)__pycache__/|\.(orig|rej|pyc|o|swp)$|\.bak[0-9]*$|~$|(^|/)\.DS_Store$'
 # and Apple's HFS+ sources, which xnu/hfs-stage.sh fetches as apply.sh fetches XNU (the glue beside them stays)
 JUNK="$JUNK|^bsd/hk_hfs/(core|hfs_encodings)/|^bsd/hk_hfs/TargetConditionals\.h\$"
 
@@ -28,7 +28,7 @@ mkdir "$HERE/files.new"
 while IFS= read -r f; do
 	[ -f "$f" ] || [ -L "$f" ] || continue      # added in a commit, deleted since
 	mkdir -p "$HERE/files.new/$(dirname "$f")"
-	cp -P --preserve=mode "$f" "$HERE/files.new/$f"
+	cp -RPp "$f" "$HERE/files.new/$f"
 done < "$HERE/files.list"
 rm -rf "$HERE/files" "$HERE/files.list"
 mv "$HERE/files.new" "$HERE/files"

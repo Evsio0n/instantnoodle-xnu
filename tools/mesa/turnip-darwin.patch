@@ -304,7 +304,7 @@
 +}
 --- a/src/freedreno/vulkan/tu_hackios_exports.txt
 +++ b/src/freedreno/vulkan/tu_hackios_exports.txt
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,73 @@
 +# What libvulkan_freedreno.dylib exports on Darwin, and nothing else: ld64's
 +# -exported_symbols_list (meson.build). Mach-O names, so each has its leading underscore.
 +#
@@ -364,12 +364,17 @@
 +_rwa_texture_create
 +_rwa_texture_destroy
 +_rwa_texture_from_surface
++_rwa_texture_over_buffer
 +_rwa_texture_read
 +_rwa_texture_view_create
 +_rwa_compute_create_constants
++_rwa_compute_create_stitched
 +_rwa_module_function_constants
 +_rwa_texture_write
 +#
 +# Not part of air_metal.h: air_vk.c's counts of command buffers, fences, buffers and
 +# images in use, for a test to print (userland/src/metal_drv_test.m).
 +_rwa_vk_counts
++# And what a process has done so far, for hkmetal.m's lines with the file metal_stats (M5g).
++_rwa_stats_read
++_rwa_texture_prepare

@@ -44,11 +44,22 @@
  * them, a read that fails or a write that does not read back, and the light goes off and stays off
  * for the rest of the run. At the run's end (and on a panic's way out) it goes off.
  *
+ * The camera's flash (OnePlus 8; torch=3, ioctl HK_TORCH_FLASH on /dev/hk-torch, camera_device.c): the same two LEDs through the same
+ * registers at more current, for one photograph. Android's flash_0 and flash_1 have 1000 mA each (at most 1500), duration-ms 1280; the
+ * current's code is the torch's formula, and SAFETY_TMR gets [7] on and [6:0] the time in 10 ms steps less one (leds-qpnp-flash-v2.c's
+ * get_safety_timer_code; Linux's leds-qcom-flash.c has the same fields for this module), so that the module itself ends the flash whatever
+ * becomes of this thread. Limits: torch_flash_ma a channel (default 500, never above Android's 1000), at most 1280 ms, three seconds'
+ * rest from one's end to the next's start, none below 15 % of charge or 3600 mV or when those are not known, none while the flashlight is
+ * on. The flags are looked at all the while, as for the light, and a droop of the supply is among them. A flash that is refused is said
+ * and the photograph goes on without it. Android also has its CPU and charger limits told (MITIGATION_SW) when it computes that the
+ * current is more than the battery can give: not written here, this current being half of Android's and the charge's floor being high [inferred].
+ *
  * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter version 5: a system's write
  * channel for a peripheral is 0x10000 bytes of "chnls" per channel), Xiaomi's leds-qti-flash.c,
  * drivers/thermal/qcom/qcom-spmi-temp-alarm.c.
  */
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -59,6 +70,7 @@
 #include <sys/instantnoodle.h>
 #include <sys/hk_audio.h>
 #include <sys/hk_input.h>
+#include <sys/ioccom.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 
@@ -586,6 +598,24 @@ dark(void)
 	return ok;
 }
 
+/* The camera's flash on: as light(), with the module's own timer. */
+static bool
+flash_on(uint32_t ma, uint32_t ms)
+{
+	uint32_t code = TORCH_CODE(ma);
+	bool ok = configure() && put_bits(hw.ires, hw.ires_mask, 0x00);
+
+	for (unsigned n = 0; n < 8 && ok; n++) {
+		ok = !(hw.channels >> n & 1) || (put_bits((uint8_t)(hw.itarget + n), 0x7f, (uint8_t)code) &&
+		    put((uint8_t)(hw.safety + n), (uint8_t)(0x80 | (ms / 10 - 1))));
+	}
+	if (!ok || !put(hw.module_en, 0x80) || !put_bits(hw.en_led, hw.channels, hw.channels)) {
+		return false;
+	}
+	lit = true;
+	return true;
+}
+
 /* ---- torch=3: the light for iOS --------------------------------------------------------------------- */
 
 static volatile uint32_t wanted;                /* the level asked for last, 0 to 1000 */
@@ -604,7 +634,38 @@ torch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		}
 		wanted = value > 1000 ? 1000 : value;
 		asked++;
+		thread_wakeup((event_t)&asked);
 	}
+	return 0;
+}
+
+/* the camera's flash: `ma' a channel for at most `ms' (ms 0: off now, the picture has been taken); served by serve() */
+struct hk_torch_flash {
+	uint32_t ma, ms;
+};
+#define HK_TORCH_FLASH          _IOW('h', 1, struct hk_torch_flash)
+#define FLASH_DEFAULT_MA        500
+#define FLASH_MOST_MA           1000            /* Android's */
+#define FLASH_MOST_MS           1280            /* Android's */
+#define FLASH_REST_MS           3000
+#define FLASH_LEAST_PERCENT     15
+#define FLASH_LEAST_MV          3600
+
+static volatile uint32_t flash_ma, flash_ms, flash_asked;
+
+static int
+torch_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flag, __unused struct proc *p)
+{
+	struct hk_torch_flash *f = (struct hk_torch_flash *)(void *)data;
+
+	if (command != HK_TORCH_FLASH) {
+		return ENOTTY;
+	}
+	flash_ma = f->ma;
+	flash_ms = f->ms;
+	flash_asked++;
+	asked++;
+	thread_wakeup((event_t)&asked);
 	return 0;
 }
 
@@ -627,7 +688,7 @@ torch_open(__unused dev_t dev, __unused int flags, __unused int type, __unused s
 
 static const struct cdevsw torch_cdevsw = {
 	.d_open = torch_open, .d_close = torch_open, .d_read = torch_read, .d_write = torch_write,
-	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_ioctl = torch_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 
@@ -638,6 +699,101 @@ now_ms(void)
 
 	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
 	return ns / NSEC_PER_MSEC;
+}
+
+/* the camera's flash: what is asked and what is lit, once a turn of serve(). False: no more of anything. */
+static uint32_t flash_lit_ms, flash_most_ma = FLASH_DEFAULT_MA, flashes;
+static uint64_t flash_since, flash_ended;
+static bool flash_flags_said;
+
+static bool
+flash_off(const char *why)
+{
+	uint64_t on_for = now_ms() - flash_since;
+
+	flash_lit_ms = 0;
+	flash_ended = now_ms();
+	shown = 0;
+	if (!dark()) {
+		return false;
+	}
+	note("flash off after %llu ms: %s", on_for, why);
+	return true;
+}
+
+static bool
+flash_step(uint32_t torch_level)
+{
+	static uint32_t taken;
+	uint32_t ask = flash_asked;
+	uint64_t now = now_ms();
+	const char *why;
+
+	if (ask != taken) {
+		uint32_t ma = flash_ma, ms = flash_ms;
+
+		taken = ask;
+		ma = ma > flash_most_ma ? flash_most_ma : ma;
+		ms = ms > FLASH_MOST_MS ? FLASH_MOST_MS : ms;
+		if (ms == 0) {
+			if (flash_lit_ms != 0 && !flash_off("the camera has its picture")) {
+				return false;
+			}
+		} else if (flash_lit_ms != 0) {
+			/* (lit already: the first ask's time stands) */
+		} else if (!instantnoodle_board() || torch_level != 0 || ma < 100 || ms < 10 || (flashes != 0 && now - flash_ended < FLASH_REST_MS) ||
+		    hk_battery_percent() < FLASH_LEAST_PERCENT || hk_battery_voltage_mv() < FLASH_LEAST_MV) {
+			note("a flash of %u mA for %u ms refused: the flashlight at %u, %llu ms since the last, the battery %d %%, %d mV", ma, ms,
+			    torch_level, flashes != 0 ? now - flash_ended : 0, hk_battery_percent(), hk_battery_voltage_mv());
+		} else if ((why = trouble()) != NULL) {
+			note("no flash: %s", why);
+		} else if (!flash_on(ma, ms)) {
+			return false;
+		} else {
+			flashes++;
+			shown = ma;             /* (what a read of the device says: not 0 while anything is lit) */
+			flash_lit_ms = ms;
+			flash_since = now;
+			flash_flags_said = false;
+			note("FLASH ON at %u mA a channel for at most %u ms (the battery %d C, %d %%, %d mV)", ma, ms, hk_battery_temperature(),
+			    hk_battery_percent(), hk_battery_voltage_mv());
+		}
+	}
+	if (flash_lit_ms != 0) {
+		if (now - flash_since >= flash_lit_ms) {
+			return flash_off("its time is up");
+		}
+		if ((why = trouble()) != NULL) {
+			note("flash OFF: %s", why);
+			(void)flash_off("trouble");
+			give_up("trouble while the flash was lit");
+			return false;
+		}
+		if (!flash_flags_said && now - flash_since >= 50) {
+			uint8_t rt = 0, s1 = 0, s2 = 0;
+
+			flash_flags_said = true;
+			(void)get(&flash, FLASH_INT_RT_STS, &rt);
+			(void)get(&flash, hw.status1, &s1);
+			(void)get(&flash, hw.status2, &s2);
+			note("flash, 50 ms on: interrupt status %#x (%s), channels %#x, temperature and supply %#x", rt,
+			    (rt & 0x10) ? "ramped up" : "NOT ramped up", s1, s2);
+		}
+	}
+	return true;
+}
+
+/* nothing lit: until iOS asks again (a default-on driver wakes nobody for nothing) */
+static void
+rest(uint32_t seen)
+{
+	wait_result_t result = assert_wait((event_t)&asked, THREAD_UNINT);
+
+	if (asked != seen) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+	} else if (result == THREAD_WAITING) {
+		(void)thread_block(THREAD_CONTINUE_NULL);
+	}
 }
 
 static void
@@ -652,9 +808,12 @@ serve(void)
 		say("torch: /dev/hk-torch cannot be made\n");
 		return;
 	}
+	PE_parse_boot_argn("torch_flash_ma", &flash_most_ma, sizeof(flash_most_ma));
+	flash_most_ma = flash_most_ma > FLASH_MOST_MA ? FLASH_MOST_MA : flash_most_ma;
 	say("torch: THE LIGHT IS IOS'S (/dev/hk-torch) from here on, until the run ends: at most %u mA a channel (channels %#x), "
-	    "at most %u s at a time\n", hw.torch_ma, hw.channels, max_secs);
+	    "at most %u s at a time; a flash for a photograph at most %u mA, %u ms\n", hw.torch_ma, hw.channels, max_secs, flash_most_ma, FLASH_MOST_MS);
 	while (!broken) {
+		uint32_t seen = asked;
 		uint32_t want = wanted;
 		uint64_t now = now_ms();
 
@@ -663,6 +822,12 @@ serve(void)
 		}
 		if (waiting_for_off) {
 			want = 0;
+		}
+		if (!flash_step(applied)) {
+			break;
+		}
+		if (flash_lit_ms != 0) {
+			want = applied;         /* (the flashlight waits for the flash's end) */
 		}
 		if (want != applied) {
 			if (want == 0 ? dark() : light(want)) {
@@ -703,7 +868,11 @@ serve(void)
 				break;
 			}
 		}
-		wait_ms(20);
+		if (applied == 0 && flash_lit_ms == 0) {
+			rest(seen);
+		} else {
+			wait_ms(flash_lit_ms != 0 ? 5 : 20);
+		}
 	}
 	if (lit) {
 		(void)dark();
@@ -815,6 +984,31 @@ hk_torch_init(void)
 	level = level > 3 ? 3 : level;
 	if (kernel_thread_start(torch_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
+	}
+}
+
+/*
+ * Before the system sleeps: the light off, by the thread that keeps it. The torch has no timer of the module's and its limits are kept by that
+ * thread, which stops with the system: a flashlight left on would stay on for the whole of the sleep. iOS asks anew if it wants it back.
+ */
+void
+hk_torch_sleep(void)
+{
+	if (level < 3 || flash.write == 0) {
+		return;
+	}
+	wanted = 0;
+	flash_ms = 0;
+	flash_asked++;
+	asked++;
+	thread_wakeup((event_t)&asked);
+	for (int i = 0; i < 40 && lit && !broken; i++) {
+		delay_for_interval(5, NSEC_PER_MSEC);
+	}
+	if (lit) {
+		/* (that thread is stuck or has given up: here, with every write read back; the module has no timer of its own for the torch) */
+		broken = false;
+		say("torch: going to sleep with the light on: %s\n", dark() ? "switched off here" : "IT COULD NOT BE SWITCHED OFF");
 	}
 }
 

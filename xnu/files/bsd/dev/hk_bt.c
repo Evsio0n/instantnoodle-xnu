@@ -1587,8 +1587,20 @@ static void
 start_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint32_t probe = 0;
+	uint64_t size = 0;
 	thread_t thread;
 
+	/*
+	 * On by default on this board, and a root built without BLUETOOTH=1 has no firmware for the chip and nobody to talk to it: no power then. (The small image
+	 * may not be attached yet this early: asked for up to 20 s.)
+	 */
+	for (int i = 0; hk_image_file("fw", "htnv20.bin", &size, NULL) == NULL; i++) {
+		if (i == 40) {
+			say("bt: no fw/htnv20.bin in the small image: the chip stays off\n");
+			thread_terminate(current_thread());
+		}
+		delay_for_interval(500, NSEC_PER_MSEC);
+	}
 	PE_parse_boot_argn("bt_probe", &probe, sizeof(probe));
 	if (probe) {
 		instantnoodle_bt_probe();

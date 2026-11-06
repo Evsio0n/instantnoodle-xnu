@@ -24,15 +24,16 @@ What has been **seen working on the phone itself** (the kernel's log of a run sa
 | Speakers (TFA9874), iOS sounds, volume keys | works, heard 2026-10-24 | `adsp=1 sound=4 sound_amps=1 sound_below=96`, `fw-audio` | [audio.md](../subsystems/audio.md) |
 | Main microphone (digital DMIC) | works (claps) | `mic=4` path via `Codec` device | audio.md |
 | Haptics (AW8697) | works | `haptic=5`, `fw-haptic` | input-peripherals.md |
-| Flashlight | works | `torch=3` | input-peripherals.md |
+| Flashlight, Control Center's button | works, owner-confirmed 2026-11-06 (「闪光灯和蓝牙OK了」), on by default (RAM kernels, not installed) | `torch=3` in the defaults | input-peripherals.md |
+| Camera's flash (On and Auto) | works, owner-confirmed 2026-11-06 (「闪光灯和蓝牙OK了」); 500 mA a channel (RAM, not installed) | as the flashlight, `camera_device.c` | input-peripherals.md |
 | Adreno 650 for CoreAnimation | works | `gpu=1`, `fw-gpu`, `GL=1` images | [gpu.md](../subsystems/gpu.md) |
-| Wi-Fi (QCA6390) | works in RAM runs (WPA2, WPA2/TKIP mixed, WPA3 SAE) | `wifi=1`, `fw-wifi` | [wifi.md](../subsystems/wifi.md) |
+| Wi-Fi (QCA6390) | works in RAM runs (WPA2, WPA2/TKIP mixed, WPA3 SAE) | on by default (`wifi=0` off), `fw-wifi` | [wifi.md](../subsystems/wifi.md) |
 | System sleep, wake by key/timer/cable | works (6 of 7 cores off); not the SoC's lowest state | `syssleep` default on | power.md |
 | GPU block collapse in sleep, brightness command path | works / command path verified | `gpu_sleep` default | gpu.md, display.md |
 | Boot from flash, boot menu, boot guard, `/private/var` on HFS+ | works (installed 2026-10-24) | `common/flash/install-xl.sh` | [storage.md](../subsystems/storage.md), INSTALL.md |
 | Custom boot logo | works | `userland/mkbootlogo.py` | research/ios-userland.md §7 |
 | Metal driver | experimental, off by default | `metal=1`/`2` | gpu.md |
-| Bluetooth (QCA6390) | partial: native BLE discovery and initial GATT transfer verified; pairing/reconnection unfinished | `bt=1`, `BLUETOOTH=1`, `fw-bt` | [bluetooth.md](../subsystems/bluetooth.md) |
+| Bluetooth (QCA6390) | buds, A2DP, HFP and BLE verified 2026-10-26/27; on today's kernel, on by default in RAM with Wi-Fi, camera and DSP on: controller up, iOS powered on, 449 LE reports in 4 s (run 012611); **owner-confirmed on the combined build 2026-11-06 (「闪光灯和蓝牙OK了」; what was tried with it not relayed).** Not separately checked: traffic beside Wi-Fi | `bt=1` in the defaults, `BLUETOOTH=1`, `fw-bt` | [bluetooth.md](../subsystems/bluetooth.md) |
 | Cameras | all four sensors answer with their chip IDs (`cam=2`, run 081247); **Camera.app works: the Back Camera the wide IMX586 (C-PHY, run 124917), the Front Camera the IMX471** (`cam=5`, RAM runs 104112/105351, verified on phone: preview, tap to focus, a HEIC photo, Photo/Video/Portrait modes), the preview made by the GPU (`camera_gpu.c`, run 112756, no throttling); no path for the other three yet, no IMX471 tuning | `cam=N`, `cam_scan`, `cam_pll2`, `cam_step`, `cam_gain`, `fw-camera` | [input-peripherals.md](../subsystems/input-peripherals.md#cameras-oneplus-8-instantnoodle_camerac-cam12-all-four-chip-ids-verified-on-phone-2026-11-04) |
 | Not done | headphones/USB-C audio, sensors, cellular, location, fast charging (Warp), SoC low-power states, auto-brightness | | [../TODO.md](../TODO.md), [../KNOWN_ISSUES.md](../KNOWN_ISSUES.md) |
 
@@ -52,7 +53,7 @@ tools/mk-mesa.sh                                                   # Mesa, once 
 GL=1 REST=1 FLASHBOOT=1 CRYPTEXES=flash userland/build.sh          # root.apfs + flashboot.apfs
 . common/lib.sh && load_device instantnoodle                       # the profile, before xl enter
 ./xl enter && ./xl ramdisk userland/flashboot.apfs
-XL_SECS=900 XL_CMDLINE="cpus=8 cpufreq=1 bootcpu=7 ufs=2 root_apfs=ufs_darwin haptic=5 torch=3 gpu=1" ./xl run
+XL_SECS=900 XL_CMDLINE="cpus=8 cpufreq=1 bootcpu=7 ufs=2 root_apfs=ufs_darwin haptic=5 gpu=1" ./xl run
 ```
 
 Audio firmware: `adsp.*` from the modem partition's `image/` and `/vendor/firmware/tfa98xx.cnt` into `fw-audio`. Wi-Fi firmware: the
@@ -65,8 +66,8 @@ mkdir -p fw-wifi && cp /lib/firmware/ath11k/QCA6390/hw2.0/{amss.bin,m3.bin} fw-w
 printf '%s\n%s\n' 'network name' 'passphrase' > fw-wifi/network   # optional: joined at the start
 ```
 
-(The profile's `BOOTARGS` are used by `common/run.sh`: `cpus=8 cpufreq=1 bootcpu=7 haptic=5 torch=3 gpu=1 adsp=1 sound=4 sound_amps=1
-sound_below=96 slider_cal=... sb_clock=24`; add `wifi=1`.)
+(The profile's `BOOTARGS` are used by `common/run.sh`: `cpus=8 cpufreq=1 bootcpu=7 haptic=5 gpu=1 adsp=1 sound=4 sound_amps=1
+sound_below=96 slider_cal=... sb_clock=24`. Wi-Fi, the flashlight and Bluetooth need no argument here: the kernel adds them, `HK_BOARD_DEFAULTS` in pexpert/arm/pe_bootargs.c.)
 
 ## Things specific to this phone
 

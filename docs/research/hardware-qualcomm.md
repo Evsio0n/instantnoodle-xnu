@@ -15,9 +15,9 @@ Related: [../architecture.md](../architecture.md), [boot-chain-and-recovery.md](
 
 | Trigger | Result | Where found |
 |---|---|---|
-| Reading apps-SMMU **context bank 4** registers or its page tables (the display's MDP stream) | CrashDump. Only global SMMU registers (SCR0, IDR, SMR, S2CR) are safe; **SMMU ATOS is not supported** (the hypervisor hides it), so a mapping can only be found by trying | display work, 2026-10-23 [observed] |
+| Reading apps-SMMU **context bank 4** registers or its page tables (the display's MDP stream) | CrashDump. Only global SMMU registers (SCR0, IDR, SMR, S2CR) are safe; **SMMU ATOS is not supported** (the hypervisor hides it), so a mapping can only be found by trying | display work, 2026-10-23 [observed]. **The display's context has since moved (match register 6, context 5, 2026-11-05 [observed]): find it by stream `0x820`, never by number.** Writing its S2CR to a bank of ours is accepted and harmless, and reversible (research/mdp-driver-plan.md 8) |
 | TrustZone `PAS_SHUTDOWN(13)` of the GPU zap shader before any `PAS_INIT_IMAGE` in that boot | CrashDump (cold `gpu=1`). Hand TZ the image header first (`step_zap_load`, commit `3e84e9c`) | [observed] |
-| `touchscreen=1` on the OnePlus 8 (redwood's Goodix driver touches GPIO 68) | NoC error at `0x0f144000` CrashDump (2026-10-23) | [observed] |
+| `touchscreen=1` on the OnePlus 8 (redwood's Goodix driver touches GPIO 68) | NoC error at `0x0f144000` CrashDump (2026-10-23) | [observed]. On SM8250 gpio68 is in the NORTH tile; `0x0f144000` is its offset in the WEST tile, where redwood's one-tile base lands: a register that is not there [inferred]. **A pin read in the wrong tile is the same crash:** take the tile from Linux's `pinctrl-sm8250.c` |
 | Reading a PCIe 0 register before its GDSC and clocks are on (QCA6390) | NoC error, CrashDump | [observed] |
 | Reading an LPASS clock register from the application processor | external abort ends the kernel (the audio DSP owns that block) | [observed] |
 | Voting the VA core clock `0x30b` or writing the VA GFMux `0x33a0000` (it reads 0 = TX MCLK) | NoC CrashDump at the TX macro `0x3220500` | microphone work [observed] |
@@ -47,8 +47,8 @@ Used identically for the Wi-Fi DSP (WPSS) on redwood and the audio DSP (ADSP) on
 
 ## 3. SMMU and DMA
 - The apps SMMU gives each device a stream. Known streams: audio DSP `0x1801` (mask 0xf: stream's low 4 bits in address bits
-  32..35), QCA6390 `0x1c01` mask 0 (not `0x1c00` mask 1), GPU CB0 (per-program TTBR0 via `CP_SMMU_TABLE_UPDATE`), MDP SMR4 /
-  context bank 4 (hands off). Match registers and contexts are found free and taken by Wi-Fi and audio start under a shared lock
+  32..35), QCA6390 `0x1c01` mask 0 (not `0x1c00` mask 1), GPU CB0 (per-program TTBR0 via `CP_SMMU_TABLE_UPDATE`), MDP stream `0x820`/`0x402` (SMR4 /
+  context bank 4 in October, SMR6 / 5 now: hands off that bank; since `mdp=6` its S2CR points at a bank of ours while a kernel runs). Match registers and contexts are found free and taken by Wi-Fi and audio start under a shared lock
   (`hk_smmu_lock`).
 - The hypervisor accepts the MP aperture `0x1b` (SCM) for the GPU.
 - PCI coherent DMA memory aligned to a power of two at least its size, or the QCA6390 firmware crashes.

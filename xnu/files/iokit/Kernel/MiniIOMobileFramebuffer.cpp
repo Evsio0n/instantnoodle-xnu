@@ -44,6 +44,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include <IOKit/IOBufferMemoryDescriptor.h>
 
 #include "MiniIOSurface.h"
+#include "../../bsd/dev/instantnoodle_mdp.h"   /* (our own pipes and mixers: nothing there runs unless boot-arg mdp is given) */
 
 extern "C" void hk_tl(const char * format, ...) __printflike(1, 2);
 /* the panel's scan (bsd/dev/hk_display.c; sys/hk_display.h, which iokit/ does not see) */
@@ -91,6 +92,7 @@ enum {
 #define SWAP_ENABLED(layer)     (0xa4 + 4 * (layer))
 #define SWAP_DEST(layer)        (0xc4 + 16 * (layer))   /* x, y, width, height on the display */
 #define SWAP_LAYERS_SET         0x104                   /* bit per layer given in this swap */
+#define SWAP_TRANSFORM(layer)   (0x114 + 4 * (layer))   /* flips and turns, as CoreAnimation asks; 0 none (kern_SwapSetLayer) */
 #define SWAP_LAYERS_CLEARED     0x108
 #define SWAP_LAYERS             4
 
@@ -98,6 +100,8 @@ enum {
 #define kFBNotifyTypes          8
 #define kFBRefreshHz            60                      /* unless boot-arg fb_hz says otherwise */
 
+#define MDP_SHOT_AFTER_MS       150                     /* frames stopped for so long: the last of them for xl screenshot (mdpShot()) */
+#define MDP_GONE_AFTER_MS       25                      /* no frame for so long after a push: its surfaces back (mdpFrameGone()) */
 #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
 #define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
 #define SWAP_GPU_MS             500                     /* discard a frame whose GPU fence does not complete */
@@ -193,6 +197,56 @@ swapQueue(void)
  * touch takes to show (tools/latency.py; the touch's own lines: bsd/dev/hk_input.c).
  */
 static TUNABLE(uint32_t, gTouchLat, "touch_lat", 0);
+/*
+ * Two questions about the owner's black triangle, which shows with the pipes on and not with mdp=0 (the photos of run 213407; every row of the
+ * eye test with the pipes has it, detach or not). Is what a push fetches being drawn meanwhile?
+ *
+ * Boot-arg mdp_overlap=1: a submission of the GPU's that names a surface while a push is fetching it says so, one line, the first 40; and each five seconds
+ * how many different surfaces the swaps went through, and how often one came back as soon as it could. What a submission does with a surface, write
+ * or read, the kernel cannot tell.
+ *
+ * Boot-arg fb_hold_push=1: the presenter does not go on until the push has ended, so the window server's SwapWait comes back after it, not when it starts. No
+ * frame can be drawn into a surface it may take for free while that surface goes to the panel. It costs frames, which is not what it is for.
+ */
+static TUNABLE(uint32_t, gMdpOverlap, "mdp_overlap", 0);
+/*
+ * FETCHED WHILE DRAWN. Metal's window server cycles two surfaces (run 224034), and SwapWait lets it go on once the swap before last has been taken (waitCopied()),
+ * which on the pipes is when that swap's push STARTS. So it begins frame n+2 in the surface push n is still sending to the panel: 717 writes in 1802 swaps, no
+ * reads (run 224835). Inferred, not seen: what the panel got is the frame's opening whole-screen fill, a quad of two triangles, as far as it had reached memory. Seen: the
+ * owner's photos of run 213407; gone with the pipes off (222000) and with every swap held to the push's end (223431). Linux holds a buffer longer:
+ * msm_atomic_commit_tail() lets go of the old state only after wait_flush (CTL start or pp_tx_done: dpu_encoder_phys_cmd_wait_for_commit_done), and the next kickoff waits for pp_tx_done first; SDE signals the release fence at
+ * pp_tx_done (sde_encoder_phys_cmd.c, lineage-20). Ours counted a push's start.
+ *
+ * Boot-arg fb_wait, the sum of (default 13; 0 is the old behaviour, no wait):
+ *   1  a submission that WRITES a surface being fetched waits for the push's end. Also what guards a detached surface, whose drawing no SwapWait of the window
+ *      server's paces. Everything else goes on: holding every swap cost frames (fb_hold_push: 「卡」)
+ *   2  the window server's SwapWait does not come back while the surface it will draw into next is being fetched
+ *   4  SwapWait answers for the swap it is asked about (swapFinished()), instead of 2 and of waitCopied()
+ *   8  ... and does not answer until the push of the swap before last has started, as waitCopied(): the window server has no clock from this driver, so that is what puts the start of
+ *      its frame where a whole push is left to draw it in. Without it its own clock drifts past the pushes (18-26 ms gaps, 7-11% of the frames of run 003927, which had no lack of surfaces)
+ *
+ * WHY TWO SURFACES. CoreAnimation is not limited to two [source: QuartzCore of 20F66, disassembled; what the options mean is inferred from its callers]. A display
+ * has three pages (IOMFBDisplay::Page, count 3 unless page flipping is disabled). Before a frame IOMFBDisplay::can_update_() asks IOMobileFramebufferSwapWait(swap of
+ * the page, 0x80000000), not blocking, about the page it will use and the one after: if the first is done it gives that page's buffer back and may draw, and if the
+ * second is not, it says the frame is triple buffered; allocate_buffer() then finds no buffer free and makes a third surface. If the first is not done either it does
+ * not draw. Ours took no notice of the swap or the options, blocked, and said done, so both pages were always free, which is the two surfaces of run 224034. Waiting
+ * in there left the frame nowhere to go: 7.8 ms a SwapWait, the owner's 「普通」 against metal-fix's 「順」 (runs 230102, 230329).
+ */
+static TUNABLE(uint32_t, gWait, "fb_wait", 13);
+#define WAIT_FETCH              1u
+#define WAIT_SWAP               2u
+#define WAIT_ANSWER             4u
+#define WAIT_PACED              8u
+#define SWAP_WAIT_SHOWN         0x00000001u     /* (options of SwapWait) its push has started, not: its surfaces are free */
+#define SWAP_WAIT_NO_BLOCK      0x80000000u     /* kIOReturnBusy instead of waiting */
+static unsigned gFetchWaits, gSwapWaits, gSwapAsked, gSwapBusy, gSwapBusyFirst;
+static uint64_t gFetchWaited, gSwapWaited;
+#define FETCH_WAIT_MS           25      /* for a push that has stopped answering: the frame goes ahead as it did before this */
+static TUNABLE(uint32_t, gHoldPush, "fb_hold_push", 0);
+static unsigned gOverlaps, gOverlapReads, gOverlapSaid;
+static uint64_t gPushBegan;
+#define OVERLAP_LINES           40
+
 
 static inline uint64_t
 micros(uint64_t absolute)
@@ -503,6 +557,7 @@ pushInterrupt(void * context __unused, uint32_t intid)
 static void
 pushStop(void)
 {
+	hk_mdp_restore();
 	displayWrite(MDP_INTR_EN, displayReg(gDPU, MDP_INTR_EN) & ~MDP_INTR_PP0_DONE);
 	displayWrite(INTF1_TEAR_INTR_EN, displayReg(gDPU, INTF1_TEAR_INTR_EN) & ~TEAR_RD_PTR);
 	gTeTime = 0;
@@ -889,12 +944,14 @@ static void
 pushFrameLocked(uint32_t swap, uint64_t buffer)
 {
 	__asm__ volatile ("dsb sy" ::: "memory");
-	if (gDouble) {
-		displayWrite(VIG0_SRC0_ADDR, (uint32_t) buffer);
-		displayWrite(VIG1_SRC0_ADDR, (uint32_t) buffer);
+	if (!hk_mdp_on_pipes()) {       /* (else the pipes have been told by hk_mdp_commit(), and no framebuffer holds the frame) */
+		if (gDouble) {
+			displayWrite(VIG0_SRC0_ADDR, (uint32_t) buffer);
+			displayWrite(VIG1_SRC0_ADDR, (uint32_t) buffer);
+		}
+		loader_screen[1] = gStride[0] != 0 ? gPanelRowBytes : vinfo.v_rowbytes;
+		loader_screen[0] = buffer;
 	}
-	loader_screen[1] = gStride[0] != 0 ? gPanelRowBytes : vinfo.v_rowbytes;
-	loader_screen[0] = buffer;
 	gPushId = swap;
 	if (gPanelOff) {
 		gPushed = 0;
@@ -904,7 +961,7 @@ pushFrameLocked(uint32_t swap, uint64_t buffer)
 	__atomic_store_n(&gPushDone, 0, __ATOMIC_RELEASE);
 	gPushed = mach_absolute_time();
 	displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
-	displayWrite(CTL0_FLUSH, CTL_FLUSH_FRAME);
+	displayWrite(CTL0_FLUSH, CTL_FLUSH_FRAME | hk_mdp_flush_bits());
 	displayWrite(CTL0_START, 1);
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
@@ -919,6 +976,52 @@ pushFrame(uint32_t swap, uint64_t buffer)
 	}
 	pushFrameLocked(swap, buffer);
 	IOLockUnlock(gPanelLock);
+	hk_mdp_after_push();
+}
+
+/*
+ * bsd/dev/instantnoodle_mdp.c's way in: `work`, under the panel's lock, with nothing in flight and the panel lit. A change of the
+ * layers shows only with a push (in command mode the panel keeps its own RAM); `work` sends them with hk_display_push_locked().
+ * While it holds the lock the window server's next push waits, so the frame stays the same for as long as `work` lasts. Thread
+ * context. false: the panel is dark or pushes have stopped; `work` did not run.
+ */
+extern "C" bool
+hk_display_locked(void (*work)(void *), void * context)
+{
+	bool ran = false;
+
+	if (gPanelLock == NULL) {
+		return false;
+	}
+	IOLockLock(gPanelLock);
+	if (gPushing && !gPanelOff) {
+		if (gPushed != 0) {
+			pushWait();
+		}
+		work(context);
+		ran = true;
+	}
+	IOLockUnlock(gPanelLock);
+	return ran;
+}
+
+/* The frame the panel shows, sent again, and its end waited for. In hk_display_locked()'s work. */
+extern "C" bool
+hk_display_push_locked(void)
+{
+	bool done;
+
+	pushFrameLocked(gPushId, loader_screen[0] != 0 ? loader_screen[0] : vinfo.v_physaddr);
+	done = pushWait();
+	if (__atomic_load_n(&gPushIrqLive, __ATOMIC_ACQUIRE)) {
+		/* (the presenter may be in its own pushWait(), outside the lock, and its end clears gPushed: the done time decides) */
+		for (unsigned i = 0; i < PUSH_TIMEOUT_MS * 10 && __atomic_load_n(&gPushDone, __ATOMIC_ACQUIRE) == 0; i++) {
+			IODelay(100);
+		}
+		done = __atomic_load_n(&gPushDone, __ATOMIC_ACQUIRE) != 0;
+		gPushed = 0;
+	}
+	return done;
 }
 
 /* (bsd/dev/hk_power.c: the screen's state, for the memory's bandwidth, the keys and the system's sleep) */
@@ -1365,6 +1468,30 @@ public:
 	IOReturn panelAcquire(task_t task, uint64_t * out);
 	IOReturn panelReady(task_t task, uint32_t index, uint32_t sid);
 	int panelFor(const uint8_t * swap, MiniIOSurface * surface);
+	/*
+	 * mdp=7 and up: the swap's surfaces straight to the panel through the MDP's pipes, no copy and no GPU scale
+	 * (bsd/dev/instantnoodle_mdp.c): what mdpPrepare() found, and the surfaces of the frame last sent, held for as long as the
+	 * pipes point at them.
+	 */
+	uint32_t        fStatDirect;
+	struct hk_mdp_layer fMdpLayers[HK_MDP_LAYERS];
+	unsigned        fMdpCount;
+	MiniIOSurface * fMdpHeld[SWAP_LAYERS];
+	bool            fMdpUsed[SWAP_LAYERS];  /* ... counted as in use by the display (MiniIOSurfaceDisplayUse) */
+	bool            fMdpKeep[SWAP_LAYERS];  /* this swap says nothing of the layer: as it was */
+	int32_t         fMdpSrc[SWAP_LAYERS][4], fMdpDst[SWAP_LAYERS][4];
+	uint32_t        fMdpFrames, fMdpLayered, fMdpLastCount;
+	bool            fMdpTried;
+	int32_t         fMdpShotSrc[4], fMdpShotDst[4]; /* the frame last sent, for mdpShot() */
+	unsigned        fMdpShotLayer;
+	bool            fMdpShotPending;
+	uint64_t        fMdpShotLast;
+	bool            fMdpInUse;              /* fMdpHeld's surfaces are in use by a push: mdpFrameGone() gives them back */
+	bool mdpPrepare(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void mdpPush(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void mdpFrameGone(void);
+	void mdpLetGo(unsigned layer);
+	void mdpShot(void);
 	int panelSpare(void);
 	void panelSent(int index);
 
@@ -1376,6 +1503,14 @@ public:
 	void presenter(void);
 	void dequeueSwap(void);
 	void waitCopied(void);
+	bool swapFinished(uint32_t id, uint32_t options);
+	IOReturn waitSwap(uint32_t id, uint32_t options);
+	uint32_t        fIdQueued, fIdTaken;    /* (fSwapLock) the last swap handed over; the last the presenter has done with */
+	uint32_t        fIdPushed;              /* the last swap the pipes took (fMdpInUse goes before its push has ended: mdpFrameGone() waits for that) */
+	uint32_t        fDrawnLast, fDrawnBefore;       /* the surface the window server's swaps draw into, this one and the one before: the one it will draw into next */
+	uint32_t        fOverlapSurfaces[24];   /* (mdp_overlap) the surfaces the swaps of these five seconds named */
+	uint32_t        fOverlapSeen[24];       /* ... how many times each */
+	unsigned        fOverlapCount;
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
@@ -1458,6 +1593,29 @@ IOMobileFramebuffer::publishModes(void)
 
 	setProperty("TimingElements", timings);
 	setProperty("ColorElements", colors);
+	if (hk_mdp_level() >= 8 && instantnoodle()) {
+		/*
+		 * What the pipes can take, for CoreAnimation to give them layers of its own (IOMFBDisplay::detach_layer; every key is optional
+		 * and its defaults would ask for what they cannot do). Scale is destination / source on each axis: at least 1 / fraction, at
+		 * most max: Linux's catalog for this SoC, 4 down and 20 up. Addresses and rows: nothing about linear fetch needs CoreAnimation's
+		 * default of 64 (bsd/dev/instantnoodle_mdp.c fetches any).
+		 */
+		OSDictionary * limits = OSDictionary::withCapacity(4), * rows = OSDictionary::withCapacity(2), * bases = OSDictionary::withCapacity(1);
+
+		setNumber(limits, "RGBLayer_MinScaleFraction", 4);
+		setNumber(limits, "RGBLayer_MaxScale", 20);
+		setNumber(limits, "YUVLayer_MinScaleFraction", 4);
+		setNumber(limits, "YUVLayer_MaxScale", 20);
+		setProperty("IOMFBScalingLimits", limits);
+		setNumber(rows, "StrideLinearHorizontal", 16);
+		setNumber(rows, "StrideLinearVertical", 1);
+		setProperty("DisplayPipeStrideRequirements", rows);
+		setNumber(bases, "PlaneBaseAlignmentLinear", 16);
+		setProperty("DisplayPipePlaneBaseAlignment", bases);
+		OSSafeReleaseNULL(limits);
+		OSSafeReleaseNULL(rows);
+		OSSafeReleaseNULL(bases);
+	}
 	/*
 	 * The window server's frame period for the built-in panel comes from here, not from the timings
 	 * (QuartzCore windowserver-apple-display.cpp; without it, 1/60 s whatever SyncRate says): the
@@ -1529,6 +1687,9 @@ IOMobileFramebuffer::start(IOService * provider)
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
 	probeDisplay();
+	if (instantnoodle() && hk_mdp_level() != 0 && mapDisplay()) {
+		hk_mdp_start(gDPU);
+	}
 	uint32_t hz;
 	if (instantnoodle() && gPush != 0 && !PE_parse_boot_argn("fb_hz", &hz, sizeof(hz))) {
 		gPanelHz = 90;                  /* (fb_hz=60: the firmware's rate) */
@@ -1985,7 +2146,7 @@ IOMobileFramebuffer::reportFrameTimes(void)
 		}
 	}
 	if (total != 0) {
-		IOLog("MiniIOMobileFramebuffer: from one frame to the next: %u times under 10 ms, %u under 18, %u under 26, %u under 35, "
+		(hk_mdp_level() != 0 ? displayLog : (void (*)(const char *, ...))IOLog)("MiniIOMobileFramebuffer: from one frame to the next: %u times under 10 ms, %u under 18, %u under 26, %u under 35, "
 		    "%u longer (the longest %u ms); half under %u ms, 95 in 100 under %u ms; %u pauses\n", within[0], within[1],
 		    within[2], within[3], within[4], fFrameLongest, half, most, fFramePauses);
 	}
@@ -2033,8 +2194,18 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	}
 	fSwapsWaiting++;
 	fSwapsQueued++;
+	fIdQueued = swapWord(swap, SWAP_ID);
 	fAlternating = swapWord(swap, SWAP_SURFACE(0)) != fLastSurface && swapWord(swap, SWAP_SURFACE(1)) == 0 &&
 	    swapWord(swap, SWAP_SURFACE(2)) == 0 && swapWord(swap, SWAP_SURFACE(3)) == 0;
+	/* (its composite is in layer 1 when a surface is detached, in layer 0 when not: IOMFBDisplay::detach_layer) */
+	{
+		const uint32_t composite = swapWord(swap, SWAP_SURFACE(1)) != 0 ? swapWord(swap, SWAP_SURFACE(1)) : swapWord(swap, SWAP_SURFACE(0));
+
+		if (composite != 0 && composite != fDrawnLast) {
+			fDrawnBefore = fDrawnLast;
+			fDrawnLast = composite;
+		}
+	}
 	fLastSurface = swapWord(swap, SWAP_SURFACE(0));
 	if (fLastSurface != 0 && fLastSurface != fShownSurfaces[0]) {
 		memmove(&fShownSurfaces[1], &fShownSurfaces[0], sizeof(fShownSurfaces) - sizeof(fShownSurfaces[0]));
@@ -2059,7 +2230,24 @@ IOMobileFramebuffer::presenter(void)
 	for (;;) {
 		IOLockLock(fSwapLock);
 		while (fSwapsWaiting == 0) {
-			IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
+			if (fMdpInUse || fMdpShotPending) {
+				AbsoluteTime deadline;
+
+				clock_interval_to_deadline(fMdpInUse ? MDP_GONE_AFTER_MS : MDP_SHOT_AFTER_MS, kMillisecondScale, &deadline);
+				if (IOLockSleepDeadline(fSwapLock, fSwap, deadline, THREAD_UNINT) == THREAD_TIMED_OUT && fSwapsWaiting == 0) {
+					/* (no frame after it: the surfaces back, and the last of the frames for xl screenshot) */
+					bool shot = !fMdpInUse && fMdpShotPending;
+
+					IOLockUnlock(fSwapLock);
+					mdpFrameGone();
+					if (shot) {
+						mdpShot();
+					}
+					IOLockLock(fSwapLock);
+				}
+			} else {
+				IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
+			}
 		}
 		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
 		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
@@ -2073,6 +2261,7 @@ IOMobileFramebuffer::presenter(void)
 		}
 		IOLockLock(fSwapLock);
 		fSwapsCopied++;
+		fIdTaken = swapWord(swap, SWAP_ID);
 		IOLockWakeup(fSwapLock, &fSwapsCopied, false);
 		IOLockUnlock(fSwapLock);
 		MiniIOSurfaceClearKept();               /* (the next frame is some milliseconds away) */
@@ -2087,19 +2276,102 @@ IOMobileFramebuffer::presenter(void)
  * with one surface, or more layers than one, every swap so far. SWAP_GPU_MS at most: a GPU that stopped
  * answering must not stop the window server.
  */
+static bool panelInFlight(int index, int sent);
+
 void
 IOMobileFramebuffer::waitCopied(void)
 {
 	AbsoluteTime deadline;
+	uint32_t next;
 
 	clock_interval_to_deadline(SWAP_GPU_MS, kMillisecondScale, &deadline);
 	IOLockLock(fSwapLock);
-	for (uint64_t target = fSwapsQueued - (fAlternating ? 1 : 0); fSwapsCopied < target;) {
+	for (uint64_t target = fSwapsQueued - (fAlternating && !gHoldPush ? 1 : 0); fSwapsCopied < target;) {
 		if (IOLockSleepDeadline(fSwapLock, &fSwapsCopied, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
 			break;
 		}
 	}
+	next = fDrawnBefore;
 	IOLockUnlock(fSwapLock);
+	/* (FETCHED WHILE DRAWN) */
+	if ((gWait & WAIT_SWAP) && next != 0) {
+		MiniIOSurface * surface = MiniIOSurfaceCopy(next);
+
+		if (surface != NULL) {
+			if (surface->fetching != 0 && panelInFlight(0, 0)) {
+				const uint64_t began = mach_absolute_time();
+				uint64_t ns = 0;
+
+				while (surface->fetching != 0 && panelInFlight(0, 0) && ns < FETCH_WAIT_MS * NSEC_PER_MSEC) {
+					IOSleep(1);
+					absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+				}
+				gSwapWaits++;
+				gSwapWaited += ns / NSEC_PER_USEC;
+			}
+			MiniIOSurfaceDrop(surface);
+		}
+	}
+}
+
+/*
+ * (fSwapLock) Has this swap got as far as asked? Taken means its push has started, or it has been copied; a later one taken means its push has ended. A number later
+ * than any handed over was begun and given up.
+ */
+bool
+IOMobileFramebuffer::swapFinished(uint32_t id, uint32_t options)
+{
+	if ((int32_t) (id - fIdTaken) > 0) {
+		return (int32_t) (id - fIdQueued) > 0;
+	}
+	return (options & SWAP_WAIT_SHOWN) != 0 || id != fIdTaken || id != fIdPushed || !panelInFlight(0, 0);
+}
+
+/* IOMobileFramebufferSwapWait, answering for the swap: WHY TWO SURFACES. Swap 0 is the last. SWAP_GPU_MS at most, as waitCopied(). */
+IOReturn
+IOMobileFramebuffer::waitSwap(uint32_t id, uint32_t options)
+{
+	const uint64_t began = mach_absolute_time();
+	AbsoluteTime deadline;
+	bool done;
+
+	clock_interval_to_deadline(SWAP_GPU_MS, kMillisecondScale, &deadline);
+	IOLockLock(fSwapLock);
+	if (id == 0) {
+		id = fIdQueued;
+	}
+	gSwapAsked++;
+	if (gWait & WAIT_PACED) {
+		for (uint64_t target = fSwapsQueued - 1; fSwapsCopied < target;) {
+			if (IOLockSleepDeadline(fSwapLock, &fSwapsCopied, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
+				break;
+			}
+		}
+	}
+	while (!(done = swapFinished(id, options)) && !(options & SWAP_WAIT_NO_BLOCK) && mach_absolute_time() < deadline) {
+		if ((int32_t) (id - fIdTaken) > 0) {
+			IOLockSleepDeadline(fSwapLock, &fSwapsCopied, deadline, THREAD_UNINT);
+		} else {
+			IOLockUnlock(fSwapLock);        /* (only the end of its push is left) */
+			IOSleep(1);
+			IOLockLock(fSwapLock);
+		}
+	}
+	IOLockUnlock(fSwapLock);
+	if (!done && (options & SWAP_WAIT_NO_BLOCK)) {
+		gSwapBusy++;
+		/* (the page before the page before: it is this one being busy that stops a frame, WHY TWO SURFACES) */
+		gSwapBusyFirst += (int32_t) (fIdQueued - id) >= 2;
+		return kIOReturnBusy;
+	}
+	if (!(options & SWAP_WAIT_NO_BLOCK)) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+		gSwapWaits++;
+		gSwapWaited += ns / NSEC_PER_USEC;
+	}
+	return done ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
 enum { kPanelFree, kPanelDrawing, kPanelReady };
@@ -2115,6 +2387,56 @@ panelInFlight(int index, int sent)
 	       (__atomic_load_n(&gPushIrqLive, __ATOMIC_ACQUIRE) || !(displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE));
 }
 
+/* FETCHED WHILE DRAWN: a submission will write this surface. Not under the GPU's lock: everybody else's work goes on. */
+extern "C" void hk_fb_will_write(MiniIOSurface * surface);
+
+void
+hk_fb_will_write(MiniIOSurface * surface)
+{
+	if (surface->fetching == 0 || !(gWait & WAIT_FETCH) || !panelInFlight(0, 0)) {
+		return;
+	}
+	const uint64_t began = mach_absolute_time();
+	const uint32_t swap = surface->fetching;
+	uint64_t ns = 0;
+
+	while (surface->fetching != 0 && panelInFlight(0, 0) && ns < FETCH_WAIT_MS * NSEC_PER_MSEC) {
+		IOSleep(1);
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	}
+	gFetchWaits++;
+	gFetchWaited += ns / NSEC_PER_USEC;
+	if ((gWait & WAIT_ANSWER) && gFetchWaits <= OVERLAP_LINES) {
+		char name[32] = "";
+
+		proc_selfname(name, sizeof(name));
+		displayLog("mdp: a submission of %s writes surface %u, waited %llu us for the push of swap %u\n", name, surface->sid, ns / NSEC_PER_USEC, swap);
+	}
+}
+
+/* (mdp_overlap) A submission of fence-to-be names this surface. */
+extern "C" void hk_fb_named(MiniIOSurface * surface, bool writes);
+
+void
+hk_fb_named(MiniIOSurface * surface, bool writes)
+{
+	if (surface->fetching == 0 || !(gMdpOverlap || gWait) || !panelInFlight(0, 0)) {
+		return;
+	}
+	uint64_t ns;
+	char name[32] = "";
+
+	gOverlaps += writes;
+	gOverlapReads += !writes;
+	if (gOverlapSaid < OVERLAP_LINES) {
+		gOverlapSaid++;
+		absolutetime_to_nanoseconds(mach_absolute_time() - gPushBegan, &ns);
+		proc_selfname(name, sizeof(name));
+		displayLog("mdp: overlap: surface %u named by a submission of %s, %s, while swap %u's push fetches it, %llu us after the push began\n", surface->sid, name,
+		    writes ? "to write" : "to read", surface->fetching, ns / NSEC_PER_USEC);
+	}
+}
+
 /*
  * The window server's GPU is about to scale a frame: a framebuffer for it, neither waiting to be pushed nor
  * being pushed (a command-mode panel has the frame in its own memory once the push is done, so that is
@@ -2127,8 +2449,8 @@ IOMobileFramebuffer::panelAcquire(task_t task, uint64_t * out)
 	AbsoluteTime deadline, slice;
 	int index = -1;
 
-	if (fPanel[0] == NULL || !gDouble) {
-		return kIOReturnNotReady;
+	if (fPanel[0] == NULL || !gDouble || (hk_mdp_level() >= 7 && hk_mdp_smmu_is_up() && gRecSeconds == 0)) {
+		return kIOReturnNotReady;       /* (nothing to scale for the panel: the pipes do it, mdpPush()) */
 	}
 	clock_interval_to_deadline(PANEL_WAIT_MS, kMillisecondScale, &deadline);
 	IOLockLock(fSwapLock);
@@ -2327,6 +2649,379 @@ IOMobileFramebuffer::dequeueSwap(void)
 	IOLockUnlock(fSwapLock);
 }
 
+/*
+ * The display's own context bank (mdp=6 and up), once, between pushes: if a push and a DCS through it (the DSI's command DMA reads
+ * through the same stream) do not come through clean, the stream goes back to the firmware's context and all stays as it was.
+ */
+static void
+mdpSmmuUp(void * context __unused)
+{
+	static const uint8_t kOn[] = { 0x05, 0, 1, 0x29, 0 };
+	bool pushed;
+	uint32_t after_push, after_dcs;
+	unsigned sent;
+
+	if (!hk_mdp_smmu_up()) {
+		displayLog("display: frames stay as they are: the display's own context bank was not taken\n");
+		return;
+	}
+	pushed = hk_display_push_locked();
+	after_push = hk_mdp_smmu_fsr();
+	sent = dsiReady() ? dsiSequence(kOn) : 0;
+	after_dcs = hk_mdp_smmu_fsr();
+	displayLog("display: through our context bank: a push %s (fsr %#x), a DCS %s (fsr %#x)\n", pushed ? "done" : "NOT done", after_push, sent ? "sent" : "NOT sent",
+	    after_dcs);
+	if (!pushed || after_push != 0 || after_dcs != 0 || sent == 0) {
+		hk_mdp_smmu_down();
+		hk_display_push_locked();
+	}
+}
+
+/* Where a surface's pixel memory is for the pipes: mapped when first seen, until it goes (MiniIOSurface::free()). 0: it cannot be. */
+static uint32_t
+mdpMap(MiniIOSurface * s)
+{
+	uint64_t size = round_page_64(s->info.allocSize);
+	uint32_t pages = (uint32_t) (size / 4096), address;
+
+	if (s->mdpAddress != 0) {
+		return s->mdpAddress;
+	}
+	/* (a program's own memory, not in whole pages; a panel buffer is not a frame's surface) */
+	if (s->client != NULL || s->scanout != NULL || s->memory == NULL || pages == 0 || (address = hk_mdp_range(pages)) == 0) {
+		return 0;
+	}
+	for (uint64_t offset = 0; offset < size; offset += 4096) {
+		IOByteCount length = 0;
+		addr64_t phys = s->memory->getPhysicalSegment(PAGE_SIZE + offset, &length, kIOMemoryMapperNone);
+
+		if (phys == 0) {
+			hk_mdp_range_free(address, pages);
+			return 0;
+		}
+		hk_mdp_range_page(address + (uint32_t) offset, phys);
+	}
+	hk_mdp_range_ready();
+	s->mdpPages = pages;
+	s->mdpAddress = address;
+	return address;
+}
+
+extern "C" void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
+extern "C" uint64_t hk_gpu_busy_ticks(void);
+
+/*
+ * Can the pipes take this swap as it is? Nothing is written here. CoreAnimation (20F66, IOMFBDisplay::detach_layer, seen in its code): with
+ * nothing detached, its composite in layer 0; with a detached surface, the composite in layer 1, with a hole of colour 0 and alpha,
+ * the surface in layer 0 (RGB) or 2 (YUV). So layer 1 is on top, whatever else there is.
+ */
+/*
+ * xl screenshot reads a framebuffer, and with the pipes no framebuffer holds the frame. So at most every mdp_shots milliseconds, and once
+ * after the frames stop, the latest is also scaled into one on the CPU: 0 none; by default only in a run from the computer (loader_return_after=).
+ * What it shows is the frame's memory, not the panel: of several layers only the composite, with its hole. The presenter does it, and it
+ * takes it 10 to 25 ms: every 300 ms that was a frame late three times a second, which the owner saw ("卡卡的", run 201040). So seldom.
+ */
+static TUNABLE(uint32_t, gMdpShots, "mdp_shots", ~0u);
+#define MDP_SHOT_RUN_MS         2000
+
+static uint32_t
+mdpShotMs(void)
+{
+	static uint32_t ms = ~0u;
+	uint32_t ignored;
+
+	if (ms == ~0u) {
+		ms = gMdpShots != ~0u ? gMdpShots : PE_parse_boot_argn("loader_return_after", &ignored, sizeof(ignored)) ? MDP_SHOT_RUN_MS : 0;
+	}
+	return ms;
+}
+
+static TUNABLE(uint32_t, gMdpTrace, "mdp_trace", 0);    /* the first so many swaps of more than one layer, or just after one, in the log */
+
+extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+
+/* A pixel of a surface, percent across and down, as it is in memory */
+static uint32_t
+mdpSample(MiniIOSurface * s, uint32_t across, uint32_t down)
+{
+	if (s == NULL || s->info.planeCount != 0) {
+		return 0;
+	}
+	vm_offset_t at = (vm_offset_t) s->pixels() + (size_t) (s->info.height * down / 100) * s->info.bytesPerRow + (size_t) (s->info.width * across / 100) * 4;
+
+	FlushPoC_DcacheRegion(at & ~(vm_offset_t) 63, 64);
+	return *(volatile uint32_t *) at;
+}
+
+static bool
+mdpNot(uint32_t swap, const char * why)
+{
+	static uint32_t said;
+
+	if (said < 32) {
+		said++;
+		displayLog("mdp: swap %u not through the pipes: %s\n", swap, why);
+	}
+	return false;
+}
+
+bool
+IOMobileFramebuffer::mdpPrepare(const uint8_t * swap, MiniIOSurface ** surfaces)
+{
+	static const uint8_t kOrder[SWAP_LAYERS] = { 0, 2, 3, 1 };
+	uint32_t id = swapWord(swap, SWAP_ID), set = swapWord(swap, SWAP_LAYERS_SET), cleared = swapWord(swap, SWAP_LAYERS_CLEARED);
+
+	fMdpCount = 0;
+	bzero(fMdpKeep, sizeof(fMdpKeep));
+	if (hk_mdp_level() < 7 || !hk_mdp_smmu_is_up() || !gDouble || !gPushing || gRecSeconds != 0) {
+		return false;
+	}
+	for (unsigned n = 0; n < SWAP_LAYERS; n++) {
+		unsigned layer = kOrder[n];
+		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+		MiniIOSurface * s = surfaces[layer];
+		int32_t src[4], dst[4];
+
+		if (sid == 0) {
+			/*
+			 * A swap gives only the layers that change: one neither set nor cleared stays as it is. CoreAnimation does that with a
+			 * detached surface whenever only its composite has changed. Taken for no layer, the composite with its hole was
+			 * alone on the panel: black, for a frame, every few (the owner's flashes in Maps, run 202548).
+			 */
+			if (((set | cleared) & (1u << layer)) != 0 || fMdpHeld[layer] == NULL) {
+				continue;
+			}
+			fMdpKeep[layer] = true;
+			s = fMdpHeld[layer];
+		}
+		if (s == NULL) {
+			return mdpNot(id, "a surface that is gone");
+		}
+		if (fMdpCount == HK_MDP_LAYERS || (hk_mdp_level() < 8 && fMdpCount == 1)) {
+			return mdpNot(id, "more layers than pipes");
+		}
+		if (s->shared()->tiled || s->planes[0].compression != 0) {
+			return mdpNot(id, "a tiled or compressed surface");
+		}
+		if (!fMdpKeep[layer] && swapWord(swap, SWAP_TRANSFORM(layer)) != 0) {
+			return mdpNot(id, "a flip or a turn");
+		}
+		memcpy(src, fMdpKeep[layer] ? (const void *) fMdpSrc[layer] : (const void *) (swap + SWAP_SOURCE(layer)), sizeof(src));
+		memcpy(dst, fMdpKeep[layer] ? (const void *) fMdpDst[layer] : (const void *) (swap + SWAP_DEST(layer)), sizeof(dst));
+		if (src[2] <= 0 || src[3] <= 0) {
+			src[0] = src[1] = 0;
+			src[2] = (int32_t) s->info.width;
+			src[3] = (int32_t) s->info.height;
+		}
+		if (dst[2] <= 0 || dst[3] <= 0) {
+			dst[0] = dst[1] = 0;
+			dst[2] = (int32_t) fWidth;
+			dst[3] = (int32_t) fHeight;
+		}
+		if (src[0] < 0 || src[1] < 0 || (uint32_t) (src[0] + src[2]) > s->info.width || (uint32_t) (src[1] + src[3]) > s->info.height ||
+		    dst[0] < 0 || dst[1] < 0 || (uint32_t) (dst[0] + dst[2]) > fWidth || (uint32_t) (dst[1] + dst[3]) > fHeight) {
+			return mdpNot(id, "a rectangle beyond its surface or the display");
+		}
+
+		struct hk_mdp_layer * l = &fMdpLayers[fMdpCount];
+		uint32_t px0 = (uint32_t) ((uint64_t) dst[0] * fPanelWidth / fWidth), py0 = (uint32_t) ((uint64_t) dst[1] * fPanelHeight / fHeight);
+		uint32_t px1 = (uint32_t) ((uint64_t) (dst[0] + dst[2]) * fPanelWidth / fWidth), py1 = (uint32_t) ((uint64_t) (dst[1] + dst[3]) * fPanelHeight / fHeight);
+		uint32_t address = mdpMap(s);
+
+		if (address == 0) {
+			return mdpNot(id, s->client != NULL ? "a surface around a program's own memory" : "no room for the surface in the window");
+		}
+		l->format = s->info.pixelFormat;
+		l->sx = (uint32_t) src[0];
+		l->sy = (uint32_t) src[1];
+		l->sw = (uint32_t) src[2];
+		l->sh = (uint32_t) src[3];
+		l->dx = px0;
+		l->dy = py0;
+		l->dw = px1 - px0;
+		l->dh = py1 - py0;
+		l->address[0] = address + s->info.offset;
+		l->stride[0] = s->info.bytesPerRow;
+		l->address[1] = 0;
+		l->stride[1] = 0;
+		if (s->info.planeCount >= 2) {
+			l->address[0] = address + s->info.offset + s->planes[0].offset;
+			l->stride[0] = s->planes[0].bytesPerRow;
+			l->address[1] = address + s->info.offset + s->planes[1].offset;
+			l->stride[1] = s->planes[1].bytesPerRow;
+		}
+		fMdpCount++;
+	}
+	if (fMdpCount == 0) {
+		return mdpNot(id, "no layer");
+	}
+	if (!hk_mdp_can_take(fMdpLayers, fMdpCount)) {
+		char why[96];
+
+		snprintf(why, sizeof(why), "not what the pipes do: %u layers, the first %#x %ux%u to %ux%u", fMdpCount, fMdpLayers[0].format, fMdpLayers[0].sw,
+		    fMdpLayers[0].sh, fMdpLayers[0].dw, fMdpLayers[0].dh);
+		return mdpNot(id, why);
+	}
+	if (fMdpCount >= 2 || fMdpLastCount >= 2) {
+		static uint32_t told;
+
+		if (told < gMdpTrace) {
+			told++;
+			/* (what is really in memory at the middle and near the bottom: the composite should be clear over a surface under it) */
+			displayLog("mdp: swap %u: %u layers, set %#x cleared %#x, kept %u%u%u: 0:%u 1:%u 2:%u; 0 middle %#x low %#x; 1 middle %#x low %#x; %u,%u %ux%u\n", id, fMdpCount, set, cleared,
+			    fMdpKeep[0], fMdpKeep[1], fMdpKeep[2], swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)), swapWord(swap, SWAP_SURFACE(2)),
+			    mdpSample(fMdpKeep[0] ? fMdpHeld[0] : surfaces[0], 50, 50), mdpSample(fMdpKeep[0] ? fMdpHeld[0] : surfaces[0], 50, 90),
+			    mdpSample(fMdpKeep[1] ? fMdpHeld[1] : surfaces[1], 50, 50), mdpSample(fMdpKeep[1] ? fMdpHeld[1] : surfaces[1], 50, 90),
+			    fMdpLayers[0].dx, fMdpLayers[0].dy, fMdpLayers[0].dw, fMdpLayers[0].dh);
+		}
+	}
+	fMdpLastCount = fMdpCount;
+	/* what the processor wrote (no GPU work names it, or a decoder's frame) is not in memory until it is cleaned: sys_dcache_flush() is a no-op here */
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		MiniIOSurface * s = surfaces[layer];
+
+		if (s != NULL && (s->drawn == 0 || s->info.planeCount >= 2)) {
+			CleanPoC_DcacheRegion((vm_offset_t) s->pixels(), s->info.allocSize - s->info.offset);
+		}
+	}
+	return true;
+}
+
+/* A layer's surface given back: nothing will fetch it any more. */
+void
+IOMobileFramebuffer::mdpLetGo(unsigned layer)
+{
+	if (fMdpHeld[layer] != NULL && fMdpUsed[layer]) {
+		fMdpUsed[layer] = false;
+		MiniIOSurfaceDisplayUse(fMdpHeld[layer], -1);
+	}
+}
+
+/*
+ * The frame last sent has gone to the panel. A single layer is the window server's to draw into again (held, though: the pipes still point at it),
+ * the next swap replaces it whole. Of several, each stays in use until a swap replaces it: a later swap sends the frame again with it, whoever
+ * draws it (mdpPrepare()). The presenter, before the next frame or when none has come for a moment.
+ */
+void
+IOMobileFramebuffer::mdpFrameGone(void)
+{
+	if (!fMdpInUse) {
+		return;
+	}
+	fMdpInUse = false;
+	if (!pushWait() && pushGiveUp()) {
+		displayLog("display: %u pushed frames in a row did not finish in %u ms; the boot framebuffer and autorefresh back\n", PUSH_FAILURES,
+		    PUSH_TIMEOUT_MS);
+		pushStop();
+	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		if (fMdpHeld[layer] != NULL) {
+			fMdpHeld[layer]->fetching = 0;
+		}
+	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS && fMdpCount <= 1; layer++) {
+		mdpLetGo(layer);
+	}
+	hk_mdp_after_push();
+	hk_mdp_smmu_fsr();
+}
+
+/*
+ * The frame in fMdpLayers to the panel. As with a framebuffer the presenter goes on once the push has started, so that the window server's
+ * SwapWait (waitCopied()) comes back as early. The surfaces stay in use at least until the push has ended, or the window server could draw into what
+ * is being fetched.
+ */
+void
+IOMobileFramebuffer::mdpPush(const uint8_t * swap, MiniIOSurface ** surfaces)
+{
+	bool taken;
+
+	mdpFrameGone();
+	if (!gPushing) {
+		return;
+	}
+	IOLockLock(gPanelLock);
+	if (!gPanelOff && gPushed != 0) {
+		pushWait();
+	}
+	/* (nothing is being fetched here: what this frame replaces or takes away goes) */
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		if (!fMdpKeep[layer] && fMdpHeld[layer] != NULL) {
+			mdpLetGo(layer);
+			MiniIOSurfaceDrop(fMdpHeld[layer]);
+			fMdpHeld[layer] = NULL;
+		}
+	}
+	taken = hk_mdp_commit(fMdpLayers, fMdpCount);
+	if (taken) {
+		pushFrameLocked(swapWord(swap, SWAP_ID), 0);
+	}
+	IOLockUnlock(gPanelLock);
+	if (!taken) {
+		displayLog("display: swap %u: the pipes did not take it; not shown\n", swapWord(swap, SWAP_ID));
+		return;
+	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		if (surfaces[layer] != NULL) {
+			fMdpHeld[layer] = MiniIOSurfaceCopy(swapWord(swap, SWAP_SURFACE(layer)));
+			if (fMdpHeld[layer] != NULL) {
+				MiniIOSurfaceDisplayUse(fMdpHeld[layer], 1);
+				fMdpUsed[layer] = true;
+			}
+			memcpy(fMdpSrc[layer], swap + SWAP_SOURCE(layer), sizeof(fMdpSrc[layer]));
+			memcpy(fMdpDst[layer], swap + SWAP_DEST(layer), sizeof(fMdpDst[layer]));
+		} else if (fMdpKeep[layer] && fMdpHeld[layer] != NULL && !fMdpUsed[layer]) {
+			/* (a single layer given back, then kept by this swap: fetched again) */
+			MiniIOSurfaceDisplayUse(fMdpHeld[layer], 1);
+			fMdpUsed[layer] = true;
+		}
+	}
+	if (gMdpOverlap || gWait) {
+		gPushBegan = mach_absolute_time();
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			if (fMdpHeld[layer] != NULL) {
+				fMdpHeld[layer]->fetching = swapWord(swap, SWAP_ID) | 1;
+			}
+		}
+	}
+	fMdpInUse = true;
+	fIdPushed = swapWord(swap, SWAP_ID);
+	fMdpFrames++;
+	fMdpLayered += fMdpCount > 1;
+	if (fMdpFrames == 1 || fMdpFrames % 900 == 0) {
+		hk_mdp_say_stats(fMdpFrames, fMdpLayered);
+	}
+	if (mdpShotMs() != 0) {
+		uint64_t now = mach_absolute_time(), ns;
+
+		fMdpShotLayer = fMdpHeld[1] != NULL ? 1 : fMdpHeld[0] != NULL ? 0 : 2;
+		memcpy(fMdpShotSrc, fMdpSrc[fMdpShotLayer], sizeof(fMdpShotSrc));
+		memcpy(fMdpShotDst, fMdpDst[fMdpShotLayer], sizeof(fMdpShotDst));
+		absolutetime_to_nanoseconds(now - fMdpShotLast, &ns);
+		if (ns / NSEC_PER_MSEC >= mdpShotMs()) {
+			mdpShot();
+		} else {
+			fMdpShotPending = true;
+		}
+	}
+}
+
+void
+IOMobileFramebuffer::mdpShot(void)
+{
+	MiniIOSurface * s = fMdpHeld[fMdpShotLayer];
+
+	fMdpShotPending = false;
+	fMdpShotLast = mach_absolute_time();
+	if (s != NULL && s->info.bytesPerElement == 4 && s->info.planeCount == 0 && hk_mdp_on_pipes()) {
+		fBase = fBuffer[1];
+		drawLayer(s, fMdpShotSrc, fMdpShotDst);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		loader_screen[1] = gPanelRowBytes;
+		loader_screen[0] = fBufferPhys[1];
+	}
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
@@ -2337,6 +3032,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	MiniIOSurface * recorded = NULL;
 	bool report;
 	int panel;                              /* fb_gpu: the framebuffer the GPU has drawn this frame into; -1: none */
+	bool direct;                            /* through the MDP's pipes, as the surfaces are (mdp=7 and up) */
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
@@ -2348,6 +3044,19 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	if (gTouchLat) {
 		hk_tl("tl: d %u began %llu ready %llu\n", swapWord(swap, SWAP_ID), micros(began), micros(mach_absolute_time()));
+	}
+	for (unsigned layer = 0; (gMdpOverlap || gWait) && layer < SWAP_LAYERS; layer++) {
+		const uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+		unsigned at = 0;
+
+		while (sid != 0 && at < fOverlapCount && fOverlapSurfaces[at] != sid) {
+			at++;
+		}
+		if (sid != 0 && at < 24) {
+			fOverlapSurfaces[at] = sid;
+			fOverlapSeen[at]++;
+			fOverlapCount = at == fOverlapCount ? at + 1 : fOverlapCount;
+		}
 	}
 	/* the GPU work each surface was waited for: new work naming it during the copy is a race (see waitCopied()) */
 	uint32_t fences[SWAP_LAYERS];
@@ -2421,8 +3130,25 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (!gPushing && fBuffer[0] != NULL && fBase != fBuffer[0]) {
 		fBase = fBuffer[0];             /* (given back: pushStop()) */
 	}
-	panel = gDouble && fPanel[0] != NULL ? panelFor(swap, surfaces[0]) : -1;
-	if (gDouble && fPanel[0] != NULL && panel < 0) {
+	if (gDouble && hk_mdp_level() >= 6 && !fMdpTried) {
+		fMdpTried = true;
+		hk_display_locked(mdpSmmuUp, NULL);
+	}
+	direct = mdpPrepare(swap, surfaces);
+	if (!direct && hk_mdp_on_pipes()) {
+		mdpFrameGone();
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			mdpLetGo(layer);
+		}
+		IOLockLock(gPanelLock);
+		if (!gPanelOff && gPushed != 0) {
+			pushWait();
+		}
+		hk_mdp_leave_pipes(gPanelRowBytes);
+		IOLockUnlock(gPanelLock);
+	}
+	panel = !direct && gDouble && fPanel[0] != NULL ? panelFor(swap, surfaces[0]) : -1;
+	if (!direct && gDouble && fPanel[0] != NULL && panel < 0) {
 		/* copied here, then: into one the window server does not hold, out of the panel's way */
 		int spare = panelSpare();
 
@@ -2569,7 +3295,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				fGraphics = true;
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
-			if (panel < 0) {
+			if (panel < 0 && !direct) {
 				drawLayer(s, src, dst);
 			}
 			if (layer == 0) {
@@ -2583,7 +3309,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), surfaces[layer]->drawn, fences[layer]);
 		}
 	}
-	if (gDouble && !pushWait() && pushGiveUp()) {
+	if (direct) {
+		mdpPush(swap, surfaces);
+		if (gHoldPush) {
+			mdpFrameGone();
+		}
+	} else if (gDouble && !pushWait() && pushGiveUp()) {
 		displayLog("display: %u pushed frames in a row did not finish in %u ms; the boot framebuffer and autorefresh back\n",
 		    PUSH_FAILURES, PUSH_TIMEOUT_MS);
 		pushStop();
@@ -2619,6 +3350,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	/* every five seconds in which something was drawn: how many frames, and what each cost here */
 	fStatFrames++;
 	fStatPanel += panel >= 0;
+	fStatDirect += direct;
 	fStatDrawing += mach_absolute_time() - began;
 	if (fStatSince == 0) {
 		fStatSince = began;
@@ -2637,6 +3369,25 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate, fStatPanel);
+		if (gMdpOverlap || gWait) {
+			char list[160];
+			int used = 0;
+
+			list[0] = 0;
+			for (unsigned i = 0; i < fOverlapCount && used + 16 < (int) sizeof(list); i++) {
+				used += snprintf(list + used, sizeof(list) - used, " %u:%u", fOverlapSurfaces[i], fOverlapSeen[i]);
+				fOverlapSeen[i] = 0;
+			}
+			displayLog("mdp: swaps named %u surfaces, id:times%s; so far named during a push %u to write, %u to read; %u writes waited for a push, %llu us in all; %u SwapWaits, %llu us; asked %u, busy %u, %u of them the oldest page\n", fOverlapCount,
+			    list, gOverlaps, gOverlapReads, gFetchWaits, gFetchWaited, gSwapWaits, gSwapWaited, gSwapAsked, gSwapBusy, gSwapBusyFirst);
+			fOverlapCount = 0;
+		}
+		if (hk_mdp_level() != 0) {
+			/* (with mdp=: what the GPU did in that time; not meaningful with gpu_dcvs, whose reader takes the same count) */
+			displayLog("mdp: GPU busy %llu %% of the last %llu ms, %u frames, %u of them through the pipes, %u scaled by the GPU\n",
+			    hk_gpu_busy_ticks() * 100 / (19200ull * (nanos / NSEC_PER_MSEC)), nanos / NSEC_PER_MSEC, fStatFrames, fStatDirect, fStatPanel);
+			fStatDirect = 0;
+		}
 		fStatSwapsLate = 0;
 		fStatPanel = 0;
 		if (fStatScanWaits != 0) {
@@ -3031,14 +3782,19 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	case kFBMethodSwapWait:                         /* the swaps so far copied out of their surfaces */
 	{
 		uint64_t began = mach_absolute_time();
+		IOReturn answer = kIOReturnSuccess;
 
-		fOwner->waitCopied();
+		if (gWait & WAIT_ANSWER) {
+			answer = fOwner->waitSwap(args->scalarInputCount > 0 ? (uint32_t) in[0] : 0, args->scalarInputCount > 1 ? (uint32_t) in[1] : 0);
+		} else {
+			fOwner->waitCopied();
+		}
 		if (gTouchLat) {
 			hk_tl("tl: w %llu %#llx %#llx at %llu waited %llu\n", args->scalarInputCount > 0 ? in[0] : 0,
 			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(began),
 			    micros(mach_absolute_time() - began));
 		}
-		return kIOReturnSuccess;
+		return answer;
 	}
 	case kFBMethodRequestPowerChange:               /* in: 0 the display off, 1 on */
 		if (args->scalarInputCount >= 1) {

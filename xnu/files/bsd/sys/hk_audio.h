@@ -57,6 +57,8 @@ void hk_haptic_quiesce(void);      /* its chip back into reset: at the run's end
 void hk_haptic_pretend(uint32_t peak); /* a test's stand-in for iOS's waveform: as if a write of this loudness came */
 void hk_torch_init(void);          /* boot-arg torch=N: the phone's flashlight (bsd/dev/hk_torch.c) */
 void hk_torch_quiesce(void);       /* the light off: at the run's end and on a panic's way out */
+void hk_torch_sleep(void);         /* the light off before the system sleeps: its limits are kept by a thread that stops with it */
+void hk_modem_init(void);          /* boot-arg modem=N: the OnePlus 8's SDX55 (bsd/dev/instantnoodle_modem.c) */
 void hk_camera_init(void);         /* boot-arg cam=N: the phone's cameras (bsd/dev/hk_camera.c) */
 void hk_camera_quiesce(void);      /* whatever of them was switched on, off: at the run's end and on a panic's way out */
 

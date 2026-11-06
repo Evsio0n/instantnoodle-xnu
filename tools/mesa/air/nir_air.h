@@ -340,6 +340,7 @@ struct air_shader_info {
 
 /* (A TRANSLATION KEPT ON DISK) a file of the cache, for the back end's own things kept by the same key. */
 bool air_cache_path(const uint8_t key[20], const char *suffix, char *path, size_t path_size);
+bool air_cache_key_of(const void *bytes, size_t size, const char *what, uint8_t key[20]);
 void *air_cache_read(const char *path, size_t *size);
 void air_cache_write(const char *path, const void *bytes, size_t size);
 
@@ -391,6 +392,39 @@ struct air_to_nir_options {
  * so the corpus report can count them. *info, when non-NULL, describes what
  * the shader expects to be bound (allocated under mem_ctx).
  */
+/*
+ * FUNCTION STITCHING (K37): a compute kernel made at run time out of library functions, MTLFunctionStitchingGraph's nodes in
+ * their order. What CoreImage on Metal is made of. Each function is an air.visible module of its own, and an argument is what
+ * the graph says it is; air_stitch_to_nir takes each one's type from the function it goes to.
+ */
+enum air_stitch_input_kind {
+   AIR_STITCH_THREAD_POSITION_IN_GRID,
+   AIR_STITCH_THREAD_POSITION_IN_THREADGROUP,
+   AIR_STITCH_BUFFER_VALUE,      /* of the argument's type, loaded from buffer `bind` at `offset` */
+   AIR_STITCH_BUFFER_POINTER,    /* the address of that */
+   AIR_STITCH_TEXTURE,
+   AIR_STITCH_SAMPLER,
+   AIR_STITCH_NODE,              /* what node `node`, an earlier one, returned */
+};
+
+struct air_stitch_input {
+   enum air_stitch_input_kind kind;
+   unsigned bind, offset, node;
+};
+
+struct air_stitch_node {
+   const char *name;             /* the function; NULL for an early return on another node's value */
+   const void *bitcode;          /* the function's module */
+   size_t size;
+   bool early_return;            /* the rest runs unless this function's answer, or with no name inputs[0], a node's, is true */
+   unsigned num_inputs;
+   const struct air_stitch_input *inputs;
+};
+
+nir_shader *air_stitch_to_nir(void *mem_ctx, const char *name, const struct air_stitch_node *nodes, unsigned num_nodes,
+                              const nir_shader_compiler_options *nir_options, struct air_shader_info *info,
+                              const char **error);
+
 nir_shader *air_to_nir(void *mem_ctx, const void *bitcode, size_t size,
                        const char *entry_point,
                        const struct air_to_nir_options *options,

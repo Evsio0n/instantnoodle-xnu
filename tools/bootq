@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""bootq: the queue for the one phone, shared by every session and the owner's page (docs/TESTING.md).
+
+  tools/bootq run --who NAME --what "WHY" [options] -- COMMAND...
+  tools/bootq status [--json]      who has the phone, who is next, what ran last
+  tools/bootq cancel ID            take a ticket that is still waiting out of the queue
+  tools/bootq log [N]              the last N tickets that ended
+  tools/bootq cool on|off          rests between runs, for a warm phone
+
+xl's lock ($PHONE.run) says only that the phone is busy now: whoever polls `xl wait` next gets it, nobody can see
+who else is waiting, and a waiter cannot be taken back. This is the layer above it. A ticket waits its turn in the
+order it came, the owner's first, until no ticket is running and xl's lock is free (a boot started without bootq
+holds that lock, and is shown as such). COMMAND then runs in a shell in the workspace, and what it does is its own:
+this never starts, stops or looks at the phone, except that --preempt, for the owner's click alone, runs `xl stop`.
+
+What it reports is what happened. A COMMAND that left no new logs/*-run.log* did not boot, whatever it printed, and
+exits 75, so that a script cannot take the previous run's log for its own. The run's name is printed and kept.
+
+--no-touch says the run is scripted and a finger spoils it; status says so. --max SECS is how long it should take;
+past that status says overdue and nothing is stopped. Inside a ticket (BOOTQ_TICKET set) run just runs COMMAND, so
+that a script and what it calls can both use this.
+
+Exit: COMMAND's own; 75 no run log appeared; 76 the kernel hung; 124 --wait SECS passed in the queue; 125 cancelled while waiting.
+A run whose log says cold recovery is required holds every session's ticket until `bootq cool off`.
+"""
+import argparse, fcntl, glob, json, os, signal, subprocess, sys, tempfile, time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# (outside every working copy, as xl's locks are: there is one phone)
+TMP = os.environ.get('XDG_RUNTIME_DIR') or '/tmp'
+PHONE = os.environ.get('BOOTQ_PHONE') or os.path.join(TMP, 'hackios-phone')
+DIR = os.environ.get('BOOTQ_DIR') or os.path.join(TMP, 'hackios-bootq')
+LOGS = os.environ.get('BOOTQ_LOGS') or os.path.join(ROOT, 'logs')
+HISTORY = 'history.jsonl'
+OWNER, NORMAL = 0, 1
+
+
+class Queue:
+    """The tickets, under one lock: a file per ticket, and the ended ones in history.jsonl."""
+
+    def __enter__(self):
+        os.makedirs(DIR, exist_ok=True)
+        self.lock = open(os.path.join(DIR, '.lock'), 'w')
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self.lock.close()
+
+    def tickets(self):
+        found = []
+        for path in glob.glob(os.path.join(DIR, 'ticket-*.json')):
+            with open(path) as f:
+                t = json.load(f)
+            if not alive(t['pid']):  # killed with its ticket held: it must not block everyone after it
+                os.remove(path)
+                self.ended(dict(t, state='died', ended=time.time()))
+                continue
+            found.append(t)
+        return sorted(found, key=lambda t: (t['priority'], t['id']))
+
+    def save(self, t):
+        path = os.path.join(DIR, 'ticket-%d.json' % t['id'])
+        with tempfile.NamedTemporaryFile('w', dir=DIR, delete=False) as f:
+            json.dump(t, f)
+        os.replace(f.name, path)
+
+    def new_id(self):
+        path = os.path.join(DIR, 'next')
+        try:
+            with open(path) as f:
+                n = int(f.read())
+        except (OSError, ValueError):
+            n = 1
+        with open(path, 'w') as f:
+            f.write(str(n + 1))
+        return n
+
+    def ended(self, t):
+        with open(os.path.join(DIR, HISTORY), 'a') as f:
+            f.write(json.dumps(t) + '\n')
+
+    def finish(self, t, **fields):
+        try:
+            os.remove(os.path.join(DIR, 'ticket-%d.json' % t['id']))
+        except OSError:
+            pass
+        self.ended(dict(t, ended=time.time(), **fields))
+
+
+def cooling():
+    """Seconds of rest left after the last ticket, when `bootq cool on` asked for rests. A session's ticket waits them out."""
+    try:
+        with open(os.path.join(DIR, 'cool_until')) as f:
+            return max(0, float(f.read()) - time.time())
+    except (OSError, ValueError):
+        return 0
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def phone_free():
+    """Whether xl's run lock is free, asked the way xl asks. Created if absent, as xl does."""
+    with open(PHONE + '.run', 'a') as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        fcntl.flock(f, fcntl.LOCK_UN)
+    return True
+
+
+def kernel_running():
+    """Whether the loader says a kernel is running. xl's lock cannot say: an xl that died after starting one has let
+    go of it, and the kernel runs on, unwatched, refusing every upload (2026-11-06). No answer counts as no: the phone
+    may be in Android or away, and then the command will say so itself."""
+    line = os.environ.get('BOOTQ_GETVAR')  # (the test's pretend phone)
+    if os.environ.get('BOOTQ_DIR') and not line:
+        return False  # (a queue of its own is a test: it never asks the real phone)
+    if line:
+        return 'result: running' in subprocess.run(['bash', '-c', line], capture_output=True, text=True, check=False).stdout
+    try:
+        with open(PHONE + '.lock', 'a') as f:
+            for _ in range(10):
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    time.sleep(0.5)
+            else:
+                return False
+            r = subprocess.run(['fastboot', 'getvar', 'result'], capture_output=True, text=True, timeout=6, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # (fastboot prints what it gets on stderr)
+    return 'result: running' in r.stdout + r.stderr
+
+
+def phone_who():
+    try:
+        with open(PHONE + '.who') as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+def run_logs():
+    # a run's name is its time of day; the .live copies and an archive are the same run. So an older day's log can hold a new
+    # run's name (run 093614): with each name, when its log or its live log last changed
+    logs = {}
+    for path in glob.glob(os.path.join(LOGS, '*-run.log*')):
+        name, _, rest = os.path.basename(path).partition('-run.log')
+        when = 0
+        if rest in ('', '.live'):
+            try:
+                when = os.path.getmtime(path)
+            except OSError:
+                pass
+        logs[name] = max(logs.get(name, 0), when)
+    return logs
+
+
+def xl_stop():
+    # (BOOTQ_STOP: the test's pretend phone)
+    line = os.environ.get('BOOTQ_STOP') or '. common/lib.sh >/dev/null 2>&1; load_device instantnoodle >/dev/null 2>&1; XL_FORCE=1 ./xl stop'
+    subprocess.run(['bash', '-c', line], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
+
+
+def run_says(runs, words):
+    # (a run log and its live log: what the kernel's and the loader's last words were)
+    for name in runs:
+        for rest in ('-run.log', '-run.log.live'):
+            try:
+                with open(os.path.join(LOGS, name + rest), 'rb') as f:
+                    f.seek(0, os.SEEK_END)
+                    f.seek(max(0, f.tell() - (2 << 20)))
+                    if words in f.read():
+                        return True
+            except OSError:
+                pass
+    return False
+
+
+def describe(t):
+    extra = ' [no touching]' if t.get('no_touch') else ''
+    owner = ' [owner]' if t['priority'] == OWNER else ''
+    return '#%d %s%s: %s%s' % (t['id'], t['who'], owner, t['what'], extra)
+
+
+def cmd_run(a):
+    command = ' '.join(a.command[1:] if a.command[:1] == ['--'] else a.command)
+    if not command:
+        sys.exit('bootq: nothing to run')
+    if os.environ.get('BOOTQ_TICKET'):
+        os.execvp('bash', ['bash', '-c', command])
+
+    with Queue() as q:
+        t = {'id': q.new_id(), 'who': a.who, 'what': a.what, 'priority': OWNER if a.owner else NORMAL, 'state': 'waiting',
+             'pid': os.getpid(), 'queued': time.time(), 'no_touch': a.no_touch, 'max': a.max, 'command': command}
+        q.save(t)
+    print('bootq: %s queued' % describe(t), flush=True)
+
+    leave = {'cancelled': False}
+    signal.signal(signal.SIGTERM, lambda *_: leave.update(cancelled=True))
+    signal.signal(signal.SIGINT, lambda *_: leave.update(cancelled=True))
+    said = None
+    started = time.time()
+    while True:
+        if leave['cancelled']:
+            with Queue() as q:
+                q.finish(t, state='cancelled')
+            print('bootq: #%d cancelled while waiting; it never reached the phone' % t['id'], flush=True)
+            return 125
+        if a.wait and time.time() - started > a.wait:
+            with Queue() as q:
+                q.finish(t, state='gave up')
+            print('bootq: #%d gave up after %d s in the queue' % (t['id'], a.wait), flush=True)
+            return 124
+        with Queue() as q:
+            tickets = q.tickets()
+            running = [o for o in tickets if o['state'] == 'running']
+            waiting = [o for o in tickets if o['state'] == 'waiting']
+            first = bool(waiting) and waiting[0]['id'] == t['id']
+            stopping = []
+            if first and running and a.preempt and a.owner:
+                # (again every 15 s: a stop that reaches the loader before its kernel is up does nothing, run 100040)
+                stopping = [o for o in running if o['priority'] != OWNER and time.time() - float(o.get('preempted') or 0) > 15]
+                for o in stopping:
+                    q.save(dict(o, preempted=time.time()))
+            # (only the head asks xl's lock: a probe holds it for an instant, and xl's own `flock -n` could meet that)
+            rest = cooling() if a.owner is False else 0
+            ready = first and not running and not rest and phone_free()
+        for o in stopping:
+            print('bootq: stopping %s for the owner' % describe(o), flush=True)
+            xl_stop()
+        orphan = ready and kernel_running()
+        if ready and not orphan:
+            with Queue() as q:
+                # (nobody else can have gone ahead: it takes being first, and this is first until it leaves)
+                t = dict(t, state='running', began=time.time())
+                q.save(t)
+            break
+        ahead = running + waiting[:[o['id'] for o in waiting].index(t['id'])] if t['id'] in [o['id'] for o in waiting] else running
+        if orphan:
+            now = 'a kernel is running that nobody is watching: whoever started it ends it, with xl stop'
+        elif first and not running and rest:
+            now = 'the phone is cooling down'
+        else:
+            now = 'behind ' + ', '.join(describe(o) for o in ahead) if ahead else 'the phone is in use outside the queue: ' + (phone_who() or 'unknown')
+        if now != said:
+            print('bootq: #%d waits, %s' % (t['id'], now), flush=True)
+            said = now
+        time.sleep(1)
+
+    print('bootq: #%d has the phone after %d s' % (t['id'], t['began'] - t['queued']), flush=True)
+    before = run_logs()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    env = dict(os.environ, BOOTQ_TICKET=str(t['id']))
+    child = subprocess.Popen(['bash', '-c', command], cwd=ROOT, env=env,
+                             preexec_fn=lambda: (signal.signal(signal.SIGTERM, signal.SIG_DFL), signal.signal(signal.SIGINT, signal.SIG_DFL)))
+    rc = child.wait()
+    after = run_logs()
+    runs = sorted(n for n in after if n not in before or after[n] > before[n])
+    if rc == 0 and not runs and not a.no_boot_ok:
+        rc = 75
+    hung = run_says(runs, b'THE KERNEL HUNG')
+    if rc == 0 and hung:
+        rc = 76
+    held = run_says(runs, b'cold recovery required')
+    left = phone_free() and kernel_running()
+    spent = time.time() - t['began']
+    if os.path.exists(os.path.join(DIR, 'cool')) and runs:
+        # half of what it ran, at most 5 minutes
+        with open(os.path.join(DIR, 'cool_until'), 'w') as f:
+            f.write(str(time.time() + min(300, spent * float(os.environ.get('BOOTQ_COOL_SHARE') or 0.5))))
+    if held:
+        # the next kernel could meet a chip that still owns its memory (run 105300): sessions wait until `bootq cool off`
+        with open(os.path.join(DIR, 'cool_until'), 'w') as f:
+            f.write(str(time.time() + 7 * 86400))
+    with Queue() as q:
+        q.finish(t, state='ended', rc=rc, runs=runs, left_running=left)
+    if hung:
+        print('bootq: #%d: THE KERNEL HUNG in run %s' % (t['id'], ' '.join(runs)), flush=True)
+    if held:
+        print('bootq: #%d: its log says cold recovery is required: no session ticket starts until the owner has reset the phone '
+              'and `bootq cool off` has been run' % t['id'], flush=True)
+    if left:
+        print('bootq: #%d ended but a kernel is still running, with nobody watching it. It is yours: keep its log, then xl stop. '
+              'The queue waits for it.' % t['id'], flush=True)
+    if runs:
+        print('bootq: #%d ended, rc %d, run %s' % (t['id'], rc, ' '.join(runs)), flush=True)
+    elif rc == 75:
+        print('bootq: #%d: its command said 0 but no new run log appeared: it did not boot' % t['id'], flush=True)
+    else:
+        print('bootq: #%d ended, rc %d, no run log' % (t['id'], rc), flush=True)
+    return rc
+
+
+def cmd_status(a):
+    with Queue() as q:
+        tickets = q.tickets()
+        free = phone_free()
+    running = [t for t in tickets if t['state'] == 'running']
+    waiting = [t for t in tickets if t['state'] == 'waiting']
+    if a.json:
+        print(json.dumps({'running': running, 'waiting': waiting, 'phone_free': free, 'phone_who': phone_who(), 'cooling': cooling()}))
+        return 0
+    now = time.time()
+    if running:
+        for t in running:
+            spent = int(now - t['began'])
+            late = ' OVERDUE (expected %d s)' % t['max'] if t.get('max') and spent > t['max'] else ''
+            print('phone: %s, for %d s%s' % (describe(t), spent, late))
+    elif not free:
+        print('phone: in use outside the queue: %s' % (phone_who() or 'unknown'))
+    elif kernel_running():
+        print('phone: a kernel is running that nobody is watching: whoever started it ends it, with xl stop')
+    elif cooling():
+        print('phone: cooling down for %d s more' % cooling())
+    else:
+        print('phone: free')
+    for i, t in enumerate(waiting):
+        print('next %d: %s, waiting %d s' % (i + 1, describe(t), now - t['queued']))
+    return 0
+
+
+def cmd_cancel(a):
+    with Queue() as q:
+        for t in q.tickets():
+            if t['id'] == a.id:
+                if t['state'] != 'waiting':
+                    print('bootq: #%d is running, so this leaves it alone: only its owner or `xl stop` ends a run' % a.id)
+                    return 1
+                os.kill(t['pid'], signal.SIGTERM)
+                print('bootq: #%d (%s) is being taken out of the queue' % (a.id, t['who']))
+                return 0
+    print('bootq: no ticket #%d' % a.id)
+    return 1
+
+
+def cmd_cool(a):
+    os.makedirs(DIR, exist_ok=True)
+    path = os.path.join(DIR, 'cool')
+    if a.state == 'on':
+        open(path, 'w').close()
+    else:
+        if os.path.exists(path):
+            os.remove(path)
+        with open(os.path.join(DIR, 'cool_until'), 'w') as f:
+            f.write('0')
+    print('bootq: rests after each run are %s' % a.state)
+    return 0
+
+
+def cmd_log(a):
+    try:
+        with open(os.path.join(DIR, HISTORY)) as f:
+            lines = f.readlines()[-a.n:]
+    except OSError:
+        return 0
+    for line in lines:
+        t = json.loads(line)
+        when = time.strftime('%H:%M:%S', time.localtime(t.get('ended', 0)))
+        print('%s %s: %s, rc %s, run %s' % (when, describe(t), t['state'], t.get('rc', '-'), ' '.join(t.get('runs', [])) or '-'))
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog='bootq', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest='verb', required=True)
+    r = sub.add_parser('run')
+    r.add_argument('--who', required=True, help='the session, or owner')
+    r.add_argument('--what', required=True, help='why, in a few words')
+    r.add_argument('--owner', action='store_true', help="the owner's own: ahead of every session's waiting ticket")
+    r.add_argument('--preempt', action='store_true', help="with --owner, the owner's click: stops a session's run with xl stop")
+    r.add_argument('--no-touch', action='store_true', help='scripted: a finger spoils it')
+    r.add_argument('--no-boot-ok', action='store_true', help='this command need not boot the phone')
+    r.add_argument('--max', type=int, default=0, help='how many seconds it should take; nothing is stopped past it')
+    r.add_argument('--wait', type=int, default=0, help='give up after so long in the queue')
+    r.add_argument('command', nargs=argparse.REMAINDER)
+    r.set_defaults(fn=cmd_run)
+    s = sub.add_parser('status')
+    s.add_argument('--json', action='store_true')
+    s.set_defaults(fn=cmd_status)
+    c = sub.add_parser('cancel')
+    c.add_argument('id', type=int)
+    c.set_defaults(fn=cmd_cancel)
+    k = sub.add_parser('cool', help='rests between runs, for a warm phone: half of what each run took, at most 5 minutes')
+    k.add_argument('state', choices=['on', 'off'])
+    k.set_defaults(fn=cmd_cool)
+    l = sub.add_parser('log')
+    l.add_argument('n', type=int, nargs='?', default=10)
+    l.set_defaults(fn=cmd_log)
+    a = p.parse_args()
+    sys.exit(a.fn(a))
+
+
+if __name__ == '__main__':
+    main()

@@ -3932,6 +3932,12 @@ radio_space_find(void)
 		return false;
 	}
 	radio_space.match = ~0u;
+	used[4] = true;         /* the display's, as it once was: never read */
+	{
+		extern uint32_t hk_display_context;
+
+		used[hk_display_context] = true;        /* the display's now, whether or not its stream is sent there: reading it is a CrashDump (instantnoodle_mdp.c) */
+	}
 	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
 		uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n)), s2cr = rd(apps_smmu.base + SMMU_S2CR(n));
 

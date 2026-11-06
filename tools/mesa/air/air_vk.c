@@ -819,6 +819,10 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <time.h>
+#include <unistd.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -854,6 +858,8 @@ void rwa_vk_counts(unsigned counts[4]);
 #include "nir.h"
 #include "nir_builder.h"
 #include "nir_air.h"
+#include "nir_serialize.h"
+#include "util/blob.h"
 #include "util/bitscan.h"           /* sample counts are bits (MULTISAMPLE) */
 #include "util/format/u_format.h"   /* rwa_depth_read decodes with Mesa's own unpackers */
 #include "util/half_float.h"
@@ -925,7 +931,9 @@ const struct nir_shader_compiler_options *tu_hackios_nir_options(VkDevice device
    X(CreateComputePipelines) X(CreatePipelineCache) X(GetPipelineCacheData)         \
    X(DestroyPipelineCache) X(CmdDispatch)                                          \
    X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed)                  \
-   X(CmdSetBlendConstants) X(CmdBlitImage)
+   X(CmdSetBlendConstants) X(CmdBlitImage)                                          \
+   X(CreateQueryPool) X(DestroyQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) \
+   X(GetQueryPoolResults)
 
 #define RWA_VK_DECLARE(name) PFN_vk##name name;
 
@@ -963,9 +971,17 @@ struct rwa_use {
 };
 
 /* An upload command buffer, out of device->upload_pool, kept for use again. */
+/* M5g: the IOSurfaces a recording or an upload uses, for the kernel (hk_drm.c, WHICH SURFACES A
+ * SUBMISSION NAMES) */
+struct rwa_surfaces {
+   int *id;
+   unsigned count, room;
+};
+
 struct rwa_ucmd {
    struct rwa_ucmd *next;
    VkCommandBuffer cmd;
+   struct rwa_surfaces surfaces, written;
 };
 
 /* What a destroy left behind: the object, and the work it waits for (when_done). */
@@ -997,6 +1013,7 @@ struct rwa_fence {
    struct rwa_fence *next;
    struct rwa_fence *all;
    VkCommandBuffer cmd;
+   struct rwa_surfaces surfaces, written;   /* written: those it draws or stores into, which the panel must not be fetching */
    VkFence fence;
    struct rwa_upload *uploads;
    /* M4-1, under the device's lock. Who holds this pair: the recording side from
@@ -1027,6 +1044,9 @@ struct rwa_fence {
    unsigned full_set_count;
 };
 
+#define RWA_TIMES_PASSES 80
+#define RWA_TIMES_EVERY  30
+
 struct rwa_device {
    VkInstance instance;
    VkPhysicalDevice physical;
@@ -1041,6 +1061,26 @@ struct rwa_device {
 
    /* the limits RESOURCES is decided by, read once (and printed once a process) */
    VkDeviceSize ubo_align, ssbo_align, max_ubo_range;
+   /* [M5g: the pass the current recording has left open, ONE PASS FOR MANY DRAWS] */
+   struct {
+      bool open;
+      unsigned color_count, w, h;
+      VkImageView color[8], zs;
+   } pass;
+   bool join_passes;              /* the file nomerge is not there */
+   bool name_surfaces;            /* the file allnames is not there */
+   bool fetch_joins;              /* the file fetchjoin: a framebuffer fetch may share a pass, the bug, for comparing */
+   /* [M5g: PASS TIMES, with the file pass_times] */
+   struct {
+      bool armed, waiting;
+      unsigned seen, used, passes;
+      float period;
+      VkQueryPool pool;
+      struct {
+         unsigned w, h, draws, begin, end;
+         const char *format, *function;
+      } pass[RWA_TIMES_PASSES];
+   } times;
    unsigned max_push;
    /* M5c: the buffers that hold an encoder's records (ARGUMENT BUFFERS), under argbuf_lock */
    struct rwa_buffer *encoded;
@@ -1214,6 +1254,8 @@ struct rwa_buffer {
    struct rwa_argbuf_encoding *encodings;
    struct rwa_buffer *next_encoded;
    bool listed;
+   /* M5g: the GPU has been told to write it, so what the processor sees may be behind */
+   bool gpu_writes;
 };
 
 /* What a colour MTLPixelFormat is in Vulkan's terms, and only where both name the same
@@ -1247,10 +1289,22 @@ struct rwa_att_view {
    VkImageView view;
 };
 
+struct rwa_image_key {
+   VkImageCreateFlags flags;
+   VkImageType type;
+   VkFormat format;
+   uint32_t width, height, depth, levels, layers;
+   VkSampleCountFlagBits samples;
+   VkImageUsageFlags usage;
+};
+
 struct rwa_texture {
    struct rwa_device *device;
    VkImage image;
    VkDeviceMemory memory;
+   bool memory_borrowed;          /* M5g: a buffer's (rwa_texture_over_buffer), which frees it */
+   bool kept;                     /* M5g: its image goes to IMAGES KEPT FOR THE NEXT TEXTURE when it is let go of */
+   struct rwa_image_key image_key;
    /* M5b: which texture owns the image, itself for one that was made. A view
     * (rwa_texture_view_create) has `image` copied and no memory, and everything about the image
     * as a whole is read through this: its layout, its record of use, whether it may be
@@ -1642,6 +1696,177 @@ raw_destroy(struct rwa_device *device, struct rwa_raw *raw)
    memset(raw, 0, sizeof(*raw));
 }
 
+/* M5g, where a frame's time goes (air_metal.h) */
+static uint64_t rwa_stat[RWA_STAT_COUNT];
+#define RWA_COUNT(which, n) p_atomic_add(&rwa_stat[which], (uint64_t)(n))
+
+void
+rwa_stats_read(uint64_t *out, unsigned count)
+{
+   for (unsigned i = 0; i < count && i < RWA_STAT_COUNT; i++)
+      out[i] = p_atomic_read(&rwa_stat[i]);
+}
+
+static uint64_t
+rwa_now_us(void)
+{
+   struct timespec t;
+   clock_gettime(CLOCK_MONOTONIC, &t);
+   return (uint64_t)t.tv_sec * 1000000 + (uint64_t)t.tv_nsec / 1000;
+}
+
+/*
+ * ONE PASS FOR MANY DRAWS (M5g). Until this, each Metal draw was a Vulkan pass of its own: a wide
+ * barrier, a barrier on every image, vkCmdBeginRendering over the whole attachment, one draw,
+ * vkCmdEndRendering. That was right for M3b's handful of draws a frame, and it is what the
+ * compositor has been paying for at a hundred draws and Maps at thousands: a pass in system memory
+ * ends with its colour cache flushed and a wait for idle, turnip's choice between system and tile
+ * memory runs for each, and the recording of each is on the thread that committed.
+ *
+ * So a draw leaves its pass open, and the next one goes on in it when nothing between them would
+ * have needed the end of a pass:
+ *
+ *   the same attachments, by view, which is what Metal's encoder has;
+ *   no load action, which only the first draw of a Metal pass carries;
+ *   every texture it samples already in SHADER_READ_ONLY_OPTIMAL. A write to an image always takes
+ *     it out of that layout, so being there means every write has had its barrier; and what
+ *     another process or the processor wrote before this recording began is covered by the wide
+ *     barrier at the start of this pass;
+ *   no stored image, written buffer or sampled attachment, in this draw or the one before: those
+ *     are the draws whose order needs a barrier, and they stay a pass each, as they were;
+ *   no framebuffer fetch: the same, and the hard way to find it out. The read goes to memory, what
+ *     the draws before it in the pass wrote is still in the colour cache, and the rasterization
+ *     order that makes a fetch coherent flushes only between primitives of the draw that fetches.
+ *     So the first triangle of its quad read what was there before the pass and the second one the
+ *     right thing, which is half of a blur black along the quad's diagonal, in the owner's photos of
+ *     run 213407 (every boot since 210414, whose draws first shared a pass);
+ *   no copy on the GPU, which Vulkan does not allow in a pass;
+ *   no barrier of the encoder's (rwa_draw.fresh_pass).
+ *
+ * Anything else that records ends the pass first: every way into a recording but this one goes
+ * through record_begin, and every way out through record_submit. The barriers of -memoryBarrier
+ * were no-ops because every draw had them; they are not now, and -hkNoteBarrier says so.
+ */
+static void
+times_stamp(struct rwa_device *device, struct rwa_fence *s, unsigned *query)
+{
+   *query = device->times.used < 2 * RWA_TIMES_PASSES + 2 ? device->times.used : UINT_MAX;
+   if (*query != UINT_MAX) {
+      device->vk.CmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, device->times.pool,
+                                   *query);
+      device->times.used++;
+   }
+}
+
+static void
+pass_end(struct rwa_device *device, struct rwa_fence *s)
+{
+   if (device->pass.open) {
+      device->CmdEndRendering(s->cmd);
+      device->pass.open = false;
+      if (device->times.armed && device->times.passes)
+         times_stamp(device, s, &device->times.pass[device->times.passes - 1].end);
+   }
+}
+
+/* A line for the log from any process: an application's stdout goes nowhere. */
+static void
+rwa_console(const char *format, ...)
+{
+   static int fd = -2;
+   char line[600];
+   va_list ap;
+
+   if (fd == -2)
+      fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+   va_start(ap, format);
+   const int n = vsnprintf(line, sizeof(line), format, ap);
+   va_end(ap);
+   if (fd >= 0 && n > 0)
+      (void)!write(fd, line, MIN2((size_t)n, sizeof(line) - 1));
+}
+
+/*
+ * PASS TIMES (M5g). With the file pass_times, one recording in RWA_TIMES_EVERY has a timestamp before
+ * and after each pass, and what they say is printed when the GPU has written them: where one frame's
+ * GPU time went, pass by pass, with the size, the format, the draws and the first draw's function.
+ * Each stamp waits for the work before it, so a traced frame is a little slower than its neighbours.
+ */
+static void
+times_report(struct rwa_device *device)
+{
+   uint64_t stamps[2 * RWA_TIMES_PASSES + 2];
+
+   if (!device->times.waiting ||
+       device->vk.GetQueryPoolResults(device->dev, device->times.pool, 0, device->times.used,
+                                      sizeof(stamps), stamps, sizeof(stamps[0]),
+                                      VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+      return;
+   device->times.waiting = false;
+
+   const double us = device->times.period / 1000.0;
+   const unsigned last = device->times.used - 1;
+   double in_passes = 0;
+   char who[64];
+
+   snprintf(who, sizeof(who), "air_vk[%s %d]", getprogname(), getpid());
+   for (unsigned i = 0; i < device->times.passes; i++) {
+      const unsigned b = device->times.pass[i].begin, e = device->times.pass[i].end;
+      if (b != UINT_MAX && e != UINT_MAX && b < device->times.used && e < device->times.used)
+         in_passes += (double)(stamps[e] - stamps[b]) * us;
+   }
+   rwa_console("%s: a frame: %.0f us from first to last, %.0f us in %u passes\n", who,
+               (double)(stamps[last] - stamps[0]) * us, in_passes, device->times.passes);
+   double small = 0;
+   unsigned small_count = 0;
+   for (unsigned i = 0; i < device->times.passes; i++) {
+      const unsigned b = device->times.pass[i].begin, e = device->times.pass[i].end;
+      if (b == UINT_MAX || e == UINT_MAX || b >= device->times.used || e >= device->times.used)
+         continue;
+      const double t = (double)(stamps[e] - stamps[b]) * us;
+      if (t < 150.0) {
+         small += t;
+         small_count++;
+         continue;
+      }
+      rwa_console("%s: pass %u: %ux%u %s, %u draws, %s: %.0f us\n", who, i, device->times.pass[i].w,
+                  device->times.pass[i].h, device->times.pass[i].format,
+                  device->times.pass[i].draws, device->times.pass[i].function, t);
+   }
+   rwa_console("%s: and %u passes under 150 us, %.0f us in all\n", who, small_count, small);
+}
+
+/* A recording has begun: is it the one to trace? */
+static void
+times_begin(struct rwa_device *device, struct rwa_fence *s)
+{
+   static int file = -1;
+
+   if (file < 0)
+      file = access("/hackios/share/probes/pass_times", F_OK) == 0;
+   if (!file)
+      return;
+   if (!device->times.pool) {
+      const VkQueryPoolCreateInfo qi = {
+         .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+         .queryType = VK_QUERY_TYPE_TIMESTAMP,
+         .queryCount = 2 * RWA_TIMES_PASSES + 2,
+      };
+      if (device->vk.CreateQueryPool(device->dev, &qi, NULL, &device->times.pool) != VK_SUCCESS) {
+         file = 0;
+         return;
+      }
+   }
+   times_report(device);
+   if (device->times.waiting || ++device->times.seen % RWA_TIMES_EVERY != 0)
+      return;
+   device->vk.CmdResetQueryPool(s->cmd, device->times.pool, 0, 2 * RWA_TIMES_PASSES + 2);
+   device->times.used = device->times.passes = 0;
+   device->times.armed = true;
+   unsigned first;
+   times_stamp(device, s, &first);
+}
+
 /* Every write recorded so far made visible to every access recorded after it, whatever
  * the stages: the wide barrier RESOURCES, SYNCHRONISATION speaks of. Cheap at M3b's
  * handful of commands a frame, and never the narrow one that is sometimes right.
@@ -1870,9 +2095,39 @@ bind_descriptors(struct rwa_device *device, struct rwa_fence *cmd, VkPipelineBin
    return true;
 }
 
-/* A pair, new or reused, begun for recording. NULL and a sentence. */
+void hk_drm_name_surfaces(const int *first, unsigned first_count, const int *second,
+                          unsigned second_count);
+void hk_drm_written_surfaces(const int *first, unsigned first_count, const int *second,
+                             unsigned second_count);
+
+static void
+surfaces_add(struct rwa_surfaces *list, int id)
+{
+   if (list->count > list->room)
+      return;
+   for (unsigned i = 0; i < list->count; i++)
+      if (list->id[i] == id)
+         return;
+   if (list->count == list->room) {
+      const unsigned room = MAX2(list->room * 2, 32);
+      int *grown = realloc(list->id, room * sizeof(*grown));
+      if (!grown) {
+         /* out of memory, and what cannot be listed must not be left out: more than the table
+          * holds is every surface (hk_drm_name_surfaces) */
+         list->count = UINT_MAX / 2;
+         return;
+      }
+      list->id = grown;
+      list->room = room;
+   }
+   if (list->count < list->room)
+      list->id[list->count++] = id;
+}
+
+/* A pair, new or reused, begun for recording. NULL and a sentence. [M5g: a pass left open stays
+ * open; only a draw may ask for this, and every other caller has record_begin, below.] */
 static struct rwa_fence *
-record_begin(struct rwa_device *device, char *why, size_t why_size)
+record_go_on(struct rwa_device *device, char *why, size_t why_size)
 {
    if (device->current) {
       /* [M4-1, the cost part: a recording stopped at an event's wait goes on from whichever thread
@@ -1940,9 +2195,22 @@ record_begin(struct rwa_device *device, char *why, size_t why_size)
    }
    pthread_mutex_lock(&device->lock);
    s->recording = ++device->recordings;
+   s->surfaces.count = 0;
+   s->written.count = 0;
    device->current = s;
    device->recorder = pthread_self();
    pthread_mutex_unlock(&device->lock);
+   times_begin(device, s);
+   return s;
+}
+
+static struct rwa_fence *
+record_begin(struct rwa_device *device, char *why, size_t why_size)
+{
+   struct rwa_fence *s = record_go_on(device, why, why_size);
+
+   if (s)
+      pass_end(device, s);
    return s;
 }
 
@@ -2062,6 +2330,8 @@ upload_begin(struct rwa_device *device, char *why, size_t why_size)
    VkResult r;
    if (u) {
       device->vk.ResetCommandBuffer(u->cmd, 0);
+      u->surfaces.count = 0;
+      u->written.count = 0;
    } else {
       u = calloc(1, sizeof(*u));
       if (!u) {
@@ -2151,7 +2421,18 @@ submit_locked(struct rwa_device *device, struct rwa_fence *s, struct rwa_fence *
          .commandBufferCount = n,
          .pCommandBuffers = cmds,
       };
+      RWA_COUNT(RWA_STAT_SUBMITS, 1);
+      if (device->name_surfaces) {
+         hk_drm_name_surfaces(u ? u->surfaces.id : NULL, u ? u->surfaces.count : 0,
+                              s->recording ? s->surfaces.id : NULL,
+                              s->recording ? s->surfaces.count : 0);
+         hk_drm_written_surfaces(u ? u->written.id : NULL, u ? u->written.count : 0,
+                                 s->recording ? s->written.id : NULL,
+                                 s->recording ? s->written.count : 0);
+      }
+      const uint64_t submit_began = rwa_now_us();
       r = device->vk.QueueSubmit(device->queue, 1, &si, s->fence);
+      RWA_COUNT(RWA_STAT_SUBMIT_US, rwa_now_us() - submit_began);
    }
    if (r != VK_SUCCESS) {
       /* Never submitted, so its fence never signals and the pair cannot be reused; it
@@ -2210,6 +2491,13 @@ record_submit(struct rwa_device *device, struct rwa_fence **out, char *why, size
    *out = NULL;
    if (!s)
       return 0;
+   pass_end(device, s);
+   if (device->times.armed) {
+      unsigned last;
+      times_stamp(device, s, &last);
+      device->times.armed = false;
+      device->times.waiting = true;
+   }
    /* [M4-1, the cost part: upload_lock from before `current` goes, UPLOADS says why.] */
    pthread_mutex_lock(&device->upload_lock);
    pthread_mutex_lock(&device->lock);
@@ -2668,7 +2956,7 @@ staging_done(struct rwa_device *device, struct rwa_staging *st)
  */
 static bool
 upload_alloc(struct rwa_device *device, struct rwa_fence *s, VkDeviceSize size,
-             VkBuffer *buffer, VkDeviceSize *offset, char *why, size_t why_size)
+             VkBuffer *buffer, VkDeviceSize *offset, void **map, char *why, size_t why_size)
 {
    VkDeviceSize align = MAX3(device->ubo_align, device->ssbo_align, 16);
    for (struct rwa_upload *u = s->uploads; u; u = u->next) {
@@ -2677,6 +2965,7 @@ upload_alloc(struct rwa_device *device, struct rwa_fence *s, VkDeviceSize size,
          u->used = at + size;
          *buffer = u->raw.buffer;
          *offset = at;
+         *map = (uint8_t *)u->raw.map + at;
          return true;
       }
    }
@@ -2696,6 +2985,7 @@ upload_alloc(struct rwa_device *device, struct rwa_fence *s, VkDeviceSize size,
    s->uploads = u;
    *buffer = u->raw.buffer;
    *offset = 0;
+   *map = u->raw.map;
    return true;
 }
 
@@ -2783,6 +3073,31 @@ rwa_device_open(char *why, size_t why_size)
    pthread_mutex_init(&device->lock, NULL);
    pthread_mutex_init(&device->argbuf_lock, NULL);
    pthread_mutex_init(&device->upload_lock, NULL);
+   /* [M5g: the two switches of ONE PASS FOR MANY DRAWS's measurements: the file nomerge is a Vulkan
+    * pass a draw as before, and the file tu_debug's words go to turnip (sysmem, gmem, ...)] */
+   device->join_passes = access("/hackios/share/probes/nomerge", F_OK) != 0;
+   device->name_surfaces = access("/hackios/share/probes/allnames", F_OK) != 0;
+   device->fetch_joins = access("/hackios/share/probes/fetchjoin", F_OK) == 0;
+   {
+      FILE *f = fopen("/hackios/share/probes/tu_debug", "r");
+      char words[96];
+
+      /*
+       * System memory for every pass, unless that file says otherwise. Turnip's own choice takes tile memory
+       * for a pass of more than 5 draws, and CoreAnimation's frames are several passes over the whole screen
+       * with the picture so far to keep: each loaded into tile memory and stored again. The same scene with
+       * and without (runs 212454, 213407): the second full-screen pass of a frame 2.3-3.6 ms against 0.17 ms,
+       * whole frames 11-12 ms against 7.5 ms.
+       */
+      setenv("TU_DEBUG", "sysmem", 0);
+      if (f) {
+         if (fgets(words, sizeof(words), f)) {
+            words[strcspn(words, "\r\n")] = 0;
+            setenv("TU_DEBUG", words, 1);
+         }
+         fclose(f);
+      }
+   }
 
    /* NIR's type system, which the frontend builds types in. The instance holds a
     * reference of its own (vk_instance.c), so this one is for the frontend's sake and
@@ -2868,6 +3183,7 @@ rwa_device_open(char *why, size_t why_size)
    device->ubo_align = MAX2(props->limits.minUniformBufferOffsetAlignment, 1);
    device->ssbo_align = MAX2(props->limits.minStorageBufferOffsetAlignment, 1);
    device->max_ubo_range = props->limits.maxUniformBufferRange;
+   device->times.period = props->limits.timestampPeriod;
    device->max_push = pushp.maxPushDescriptors;
    device->max_anisotropy = props->limits.maxSamplerAnisotropy;
    device->max_3d = props->limits.maxImageDimension3D;
@@ -3371,6 +3687,8 @@ fail:
    return NULL;
 }
 
+static void images_kept_free(struct rwa_device *device);
+
 void
 rwa_device_close(struct rwa_device *device)
 {
@@ -3407,6 +3725,7 @@ rwa_device_close(struct rwa_device *device)
    printf("air_vk: still in use: %u command buffers, %u fences, %u buffers, %u images\n",
           n[RWA_LIVE_CMD], n[RWA_LIVE_FENCE], n[RWA_LIVE_BUFFER], n[RWA_LIVE_IMAGE]);
    int32_t out = p_atomic_read(&device->pairs_out);
+   images_kept_free(device);
    int32_t children = p_atomic_read(&device->children);
    if (children || out > 0) {
       /* A buffer, texture, sampler or pipeline of this device is still alive, or a fence
@@ -3445,6 +3764,12 @@ rwa_device_close(struct rwa_device *device)
       device->vk.DestroyFence(device->dev, s->fence, NULL);
       if (s->cmd)
          device->vk.FreeCommandBuffers(device->dev, device->pool, 1, &s->cmd);
+      if (s->ucmd) {
+         free(s->ucmd->surfaces.id);
+         free(s->ucmd->written.id);
+      }
+      free(s->surfaces.id);
+      free(s->written.id);
       free(s->ucmd);              /* (its command buffer goes with the upload pool, below) */
       sets_reset(device, s);
       free(s->full_sets);
@@ -3496,6 +3821,7 @@ rwa_buffer_create(struct rwa_device *device, size_t size, char *why, size_t why_
    }
    buffer->device = device;
    buffer->size = size;
+   const uint64_t buffer_began = rwa_now_us();
 
    /* Every use at once, for air_metal.c's reason: Metal has one buffer object, and what
     * the bytes are -- vertices, indices, a `constant` block, a `device` array, the source
@@ -3509,6 +3835,8 @@ rwa_buffer_create(struct rwa_device *device, size_t size, char *why, size_t why_
       free(buffer);
       return NULL;
    }
+   RWA_COUNT(RWA_STAT_BUFFERS, 1);
+   RWA_COUNT(RWA_STAT_BUFFER_US, rwa_now_us() - buffer_began);
    p_atomic_inc(&device->children);
    p_atomic_inc(&rwa_live[RWA_LIVE_BUFFER]);
    return buffer;
@@ -3549,6 +3877,25 @@ rwa_buffer_destroy(struct rwa_buffer *buffer)
    argbuf_scrub(device, buffer, NULL, NULL);
    argbuf_forget_all(buffer);
    when_done(device, buffer->use, buffer_free, buffer);
+}
+
+/* [K35, buffers kept for the next one (hkmetal.m): given again only when this says no.] Whether the work
+ * that last named the buffer is still to finish: what when_done goes by before it frees one. */
+int
+rwa_buffer_busy(struct rwa_buffer *buffer)
+{
+   struct rwa_device *device = buffer->device;
+
+   pthread_mutex_lock(&device->lock);
+   bool busy = use_busy_locked(device, buffer->use);
+   pthread_mutex_unlock(&device->lock);
+   if (busy) {
+      reap(device);               /* it may be done by now, and nobody has looked */
+      pthread_mutex_lock(&device->lock);
+      busy = use_busy_locked(device, buffer->use);
+      pthread_mutex_unlock(&device->lock);
+   }
+   return busy;
 }
 
 /* Where [offset, offset + size) of a buffer lies inside it, or a sentence. */
@@ -4031,9 +4378,111 @@ say_sample_counts(struct rwa_device *device)
  * means "allocate", which is rwa_texture_create's whole difference from
  * rwa_texture_from_surface -- air_metal.c's struct of the same name and use.
  */
+/*
+ * IMAGES KEPT FOR THE NEXT TEXTURE (M5g, the owner: 「地圖伸縮卡頓」). A texture's memory is a GEM buffer of its own, each a call into the kernel to make and another to free (run 013944: most of
+ * the samples of Maps' render thread during a pinch, in msm_bo_init and tu_drm_bo_finish). Metal programs make and drop textures of the same shape frame after frame. So the image and its memory
+ * of a texture let go of, its work done, wait here for the next of exactly its shape; what a new texture holds is undefined in Metal's terms anyway, and its old layout UNDEFINED says so. Bounded,
+ * oldest out. Only of images made here, not over a surface or a buffer.
+ */
+#define RWA_KEPT_IMAGES 32
+#define RWA_KEPT_BYTES (256u << 20)   /* (Maps: 4x MSAA targets of the whole screen, 44 and 55 MB, memoryless on Apple's GPU, made anew frame after frame: 50 ms each, run 015038) */
+struct rwa_kept_image {
+   struct rwa_image_key key;
+   VkImage image;
+   VkDeviceMemory memory;
+   VkDeviceSize size;
+};
+static pthread_mutex_t rwa_kept_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct rwa_kept_image rwa_kept[RWA_KEPT_IMAGES];
+static unsigned rwa_kept_count;
+static VkDeviceSize rwa_kept_total;
+
+static bool
+image_take_kept(const struct rwa_image_key *key, VkImage *image, VkDeviceMemory *memory)
+{
+   bool found = false;
+   pthread_mutex_lock(&rwa_kept_lock);
+   for (unsigned i = 0; i < rwa_kept_count && !found; i++) {
+      if (memcmp(&rwa_kept[i].key, key, sizeof(*key)) == 0) {
+         *image = rwa_kept[i].image;
+         *memory = rwa_kept[i].memory;
+         rwa_kept_total -= rwa_kept[i].size;
+         memmove(&rwa_kept[i], &rwa_kept[i + 1], (rwa_kept_count - i - 1) * sizeof(rwa_kept[0]));
+         rwa_kept_count--;
+         found = true;
+      }
+   }
+   pthread_mutex_unlock(&rwa_kept_lock);
+   return found;
+}
+
+static void
+image_keep(struct rwa_device *device, const struct rwa_image_key *key, VkImage image, VkDeviceMemory memory)
+{
+   VkMemoryRequirements req;
+   device->vk.GetImageMemoryRequirements(device->dev, image, &req);
+   if (req.size <= RWA_KEPT_BYTES) {
+      pthread_mutex_lock(&rwa_kept_lock);
+      while (rwa_kept_count > 0 && (rwa_kept_count == RWA_KEPT_IMAGES || rwa_kept_total + req.size > RWA_KEPT_BYTES)) {
+         device->vk.DestroyImage(device->dev, rwa_kept[0].image, NULL);
+         device->vk.FreeMemory(device->dev, rwa_kept[0].memory, NULL);
+         rwa_kept_total -= rwa_kept[0].size;
+         memmove(&rwa_kept[0], &rwa_kept[1], (rwa_kept_count - 1) * sizeof(rwa_kept[0]));
+         rwa_kept_count--;
+      }
+      rwa_kept[rwa_kept_count++] = (struct rwa_kept_image){ *key, image, memory, req.size };
+      rwa_kept_total += req.size;
+      pthread_mutex_unlock(&rwa_kept_lock);
+      return;
+   }
+   device->vk.DestroyImage(device->dev, image, NULL);
+   device->vk.FreeMemory(device->dev, memory, NULL);
+}
+
+static void
+images_kept_free(struct rwa_device *device)
+{
+   pthread_mutex_lock(&rwa_kept_lock);
+   for (unsigned i = 0; i < rwa_kept_count; i++) {
+      device->vk.DestroyImage(device->dev, rwa_kept[i].image, NULL);
+      device->vk.FreeMemory(device->dev, rwa_kept[i].memory, NULL);
+   }
+   rwa_kept_count = 0;
+   rwa_kept_total = 0;
+   pthread_mutex_unlock(&rwa_kept_lock);
+}
+
+/* [K40, memory the live objects do not explain] What this library and turnip hold that hkmetal's counts do not
+ * show: the images kept for use again, what destroys left waiting for a fence, every BO by its name. */
+extern int tu_hackios_bos(VkDevice device, char *text, size_t size);
+
+int
+rwa_vk_memory(struct rwa_device *device, char *text, size_t size)
+{
+   unsigned kept, waiting = 0;
+   VkDeviceSize kept_bytes;
+
+   pthread_mutex_lock(&rwa_kept_lock);
+   kept = rwa_kept_count;
+   kept_bytes = rwa_kept_total;
+   pthread_mutex_unlock(&rwa_kept_lock);
+   pthread_mutex_lock(&device->lock);
+   for (const struct rwa_after *a = device->after; a; a = a->next)
+      waiting++;
+   pthread_mutex_unlock(&device->lock);
+   int said = snprintf(text, size, "images kept %u, %llu MB; waiting for a fence %u; ", kept,
+                       (unsigned long long)(kept_bytes >> 20), waiting);
+   if (said < 0 || (size_t)said >= size)
+      return said;
+   return said + tu_hackios_bos(device->dev, text + said, size - said);
+}
+
 struct rwa_surface_import {
    int id;
    unsigned offset, row_bytes;
+   /* (rwa_texture_over_buffer) not a surface: this memory, already the device's, at this offset */
+   VkDeviceMemory over;
+   VkDeviceSize over_offset;
 };
 
 /* The row pitch an imported surface's rows must be a multiple of, by the size of a texel:
@@ -4653,7 +5102,19 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
    };
-   VkResult r = device->vk.CreateImage(device->dev, &ici, NULL, &t->image);
+   const uint64_t made_began = rwa_now_us();
+   const struct rwa_image_key image_key = {
+      .flags = ici.flags, .type = ici.imageType, .format = ici.format, .width = ici.extent.width, .height = ici.extent.height,
+      .depth = ici.extent.depth, .levels = ici.mipLevels, .layers = ici.arrayLayers, .samples = ici.samples, .usage = ici.usage,
+   };
+   VkResult r = VK_SUCCESS;
+   if (!import && image_take_kept(&image_key, &t->image, &t->memory)) {
+      t->image_key = image_key;
+      t->kept = true;
+      RWA_COUNT(RWA_STAT_TEXTURES_KEPT, 1);
+      goto have_memory;
+   }
+   r = device->vk.CreateImage(device->dev, &ici, NULL, &t->image);
    if (r != VK_SUCCESS) {
       say(why, why_size, "turnip would not make a %ux%ux%u %s image (%s)", shape->width,
           shape->height, depth, fmt->name, vk_Result_to_str(r));
@@ -4699,8 +5160,11 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       .allocationSize = req.size,
       .memoryTypeIndex = type,
    };
-   if (import && type != UINT32_MAX &&
-       (r = device->vk.AllocateMemory(device->dev, &mai, NULL, &t->memory)) != VK_SUCCESS) {
+   if (import && import->over) {
+      t->memory = import->over;
+      t->memory_borrowed = true;
+   } else if (import && type != UINT32_MAX &&
+              (r = device->vk.AllocateMemory(device->dev, &mai, NULL, &t->memory)) != VK_SUCCESS) {
       /* Everything this side could check has been checked, so what is left is named as
        * what is left, in air_metal.c's words for the same failure: the kernel declining to
        * hand the surface's memory over, and a surface ID its table does not hold -- and
@@ -4720,12 +5184,30 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
    if (type == UINT32_MAX ||
        (!import &&
         (r = device->vk.AllocateMemory(device->dev, &mai, NULL, &t->memory)) != VK_SUCCESS) ||
-       (r = device->vk.BindImageMemory(device->dev, t->image, t->memory, 0)) != VK_SUCCESS) {
+       (r = device->vk.BindImageMemory(device->dev, t->image, t->memory, import ? import->over_offset : 0)) != VK_SUCCESS) {
       say(why, why_size, "memory for a %ux%ux%u %s image could not be allocated and bound "
                          "(%s)", shape->width, shape->height, depth, fmt->name,
           type == UINT32_MAX ? "no memory type holds it" : vk_Result_to_str(r));
       goto fail;
    }
+   if (!import) {
+      t->image_key = image_key;
+      t->kept = true;
+   }
+   RWA_COUNT(RWA_STAT_TEXTURES, 1);
+   RWA_COUNT(RWA_STAT_TEXTURE_US, rwa_now_us() - made_began);
+   {
+      /* (a slow one, said: what a pinch of Maps' spends its time on, run 014540) */
+      static unsigned said;
+      const uint64_t took = rwa_now_us() - made_began;
+      if (took >= 5000 && said++ < 60) {
+         VkMemoryRequirements told;
+         device->vk.GetImageMemoryRequirements(device->dev, t->image, &told);
+         rwa_console("air_vk: an image of %ux%u %s, %u samples, %u levels, %llu KB took %llu us\n", shape->width, shape->height, fmt->name, samples,
+                     levels, (unsigned long long)told.size / 1024, (unsigned long long)took);
+      }
+   }
+have_memory:;
    /*
     * THE SURFACE MARKED "SEEN" (M3e, run 061800), which is what Gallium's path gets without
     * asking. The kernel cleans and invalidates the processor's cache over a surface's buffer
@@ -4754,7 +5236,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
     * whole surface at every submission of this process, which for a full-screen drawable is
     * ten megabytes each time. AIR_VK_NOSEEN=1 turns it off.
     */
-   if (import && !device->no_seen) {
+   if (import && !import->over && !device->no_seen) {
       void *map = NULL;
       if ((r = device->vk.MapMemory(device->dev, t->memory, 0, VK_WHOLE_SIZE, 0, &map)) !=
           VK_SUCCESS) {
@@ -4871,7 +5353,7 @@ fail:
    if (t->view)
       device->vk.DestroyImageView(device->dev, t->view, NULL);
    device->vk.DestroyImage(device->dev, t->image, NULL);
-   if (t->memory)
+   if (t->memory && !t->memory_borrowed)
       device->vk.FreeMemory(device->dev, t->memory, NULL);
    free(t);
    return NULL;
@@ -4907,6 +5389,29 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
    const struct rwa_surface_import import = {
       .id = surface_id, .offset = offset, .row_bytes = row_bytes };
    return texture_of_shape(device, shape, &import, why, why_size);
+}
+
+/*
+ * A TEXTURE OVER A BUFFER (M5g, the owner: 「地圖在widget顯示黃色」): -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:], the same memory as linear rows. RenderBox
+ * makes every large image this way (RB::TextureCache::prepare), and with no texture it draws RB::Device::invalid_texture(), one yellow pixel [source: 20F66, disassembled].
+ * The image is an import's, explicit pitch and all, bound into the memory the buffer already has instead of memory a surface brings. Whoever calls keeps the buffer as long
+ * as the texture (hkmetal.m); the texture does not free this memory.
+ */
+struct rwa_texture *
+rwa_texture_over_buffer(struct rwa_buffer *buffer, const struct rwa_texture_shape *shape, size_t offset, unsigned row_bytes,
+                        char *why, size_t why_size)
+{
+   if (offset % 64 != 0) {
+      say(why, why_size, "a texture at offset %zu of a buffer: this GPU reads a linear image from a multiple of 64 bytes", offset);
+      return NULL;
+   }
+   if ((uint64_t)offset + (uint64_t)row_bytes * shape->height > buffer->size) {
+      say(why, why_size, "a texture of %u rows of %u bytes at offset %zu of a buffer of %zu bytes", shape->height, row_bytes, offset, buffer->size);
+      return NULL;
+   }
+   const struct rwa_surface_import import = {
+      .row_bytes = row_bytes, .over = buffer->raw.memory, .over_offset = offset };
+   return texture_of_shape(buffer->device, shape, &import, why, why_size);
 }
 
 /*
@@ -5244,8 +5749,13 @@ texture_free(struct rwa_device *device, void *object)
       free(texture);
    }
    if (p_atomic_dec_zero(&root->refs)) {
-      device->vk.DestroyImage(device->dev, root->image, NULL);
-      device->vk.FreeMemory(device->dev, root->memory, NULL);
+      if (root->kept) {
+         image_keep(device, &root->image_key, root->image, root->memory);
+      } else {
+         device->vk.DestroyImage(device->dev, root->image, NULL);
+         if (!root->memory_borrowed)
+            device->vk.FreeMemory(device->dev, root->memory, NULL);
+      }
       p_atomic_dec(&device->children);
       free(root);
    }
@@ -5283,7 +5793,7 @@ image_barrier(struct rwa_texture *t, VkCommandBuffer cmd, VkImageLayout to,
     * for what a destroy waits for, every use of a texture coming through here. And the layout is
     * read and written under the lock, because an upload on another thread reads it. The first
     * barrier of a recording on an image notes what it found (upload_image_begin).] */
-   const struct rwa_fence *s = device->current;
+   struct rwa_fence *s = device->current;
    /* [M5b: all of it through the root: a view is another window on one image, one layout] */
    struct rwa_texture *root = t->root;
    pthread_mutex_lock(&device->lock);
@@ -5291,7 +5801,13 @@ image_barrier(struct rwa_texture *t, VkCommandBuffer cmd, VkImageLayout to,
    if (s && root->use.recording != s->recording) {
       root->layout_at_start = from;
       named(&root->use, s);
+      if (root->surface_id)
+         surfaces_add(&s->surfaces, root->surface_id);
    }
+   /* (not only the first time this recording names it: sampled first and drawn into next is ordinary) */
+   if (s && root->surface_id && to != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+       to != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+      surfaces_add(&s->written, root->surface_id);
    root->layout = to;
    pthread_mutex_unlock(&device->lock);
 
@@ -5310,6 +5826,55 @@ image_barrier(struct rwa_texture *t, VkCommandBuffer cmd, VkImageLayout to,
    };
    device->vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, dst_stage, 0, 0,
                                  NULL, 0, NULL, 1, &b);
+}
+
+/* [M5g, ONE PASS FOR MANY DRAWS] A texture a draw samples, if it needs no barrier for that: already
+ * in this layout. If so it is named as image_barrier would have. */
+static bool
+image_stays(struct rwa_texture *t, VkImageLayout layout)
+{
+   struct rwa_device *device = t->device;
+   struct rwa_fence *s = device->current;
+   struct rwa_texture *root = t->root;
+   pthread_mutex_lock(&device->lock);
+   const bool same = root->layout == layout;
+   if (same && s && root->use.recording != s->recording) {
+      root->layout_at_start = root->layout;
+      named(&root->use, s);
+      if (root->surface_id)
+         surfaces_add(&s->surfaces, root->surface_id);
+   }
+   pthread_mutex_unlock(&device->lock);
+   return same;
+}
+
+int
+rwa_texture_prepare(struct rwa_texture *texture, struct rwa_texture *const *color,
+                    unsigned color_count, struct rwa_texture *depth, char *why, size_t why_size)
+{
+   if (!texture)
+      return 0;
+   struct rwa_device *device = texture->device;
+   struct rwa_texture *root = texture->root;
+   if (!device->join_passes)
+      return 0;
+   for (unsigned i = 0; i < color_count; i++)
+      if (color[i] && color[i]->root == root)
+         return 0;
+   if (depth && depth->root == root)
+      return 0;
+   pthread_mutex_lock(&device->lock);
+   const bool there = root->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+   pthread_mutex_unlock(&device->lock);
+   if (there)
+      return 0;
+   struct rwa_fence *cmd = record_begin(device, why, why_size);
+   if (!cmd)
+      return -1;
+   image_barrier(texture, cmd->cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                 VK_ACCESS_SHADER_READ_BIT);
+   return 0;
 }
 
 /*
@@ -5339,6 +5904,11 @@ upload_image_begin(struct rwa_texture *t, VkCommandBuffer cmd, VkImageLayout to,
    else if (!back)
       root->layout_at_start = to;
    root->use.upload = device->uploads;
+   if (root->surface_id && device->uploading) {
+      surfaces_add(&device->uploading->surfaces, root->surface_id);
+      if (to != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+         surfaces_add(&device->uploading->written, root->surface_id);
+   }
    root->upload_id = 0;              /* (a write that wants to, says so after this) */
    pthread_mutex_unlock(&device->lock);
    *back_to = back ? from : to;
@@ -6296,6 +6866,7 @@ rwa_copy_buffer(struct rwa_buffer *src, size_t src_offset, struct rwa_buffer *ds
       return -1;
    named(&src->use, cmd);
    named(&dst->use, cmd);
+   dst->gpu_writes = true;
    barrier_all(device, cmd->cmd);
    const VkBufferCopy region = { src_offset, dst_offset, size };
    device->vk.CmdCopyBuffer(cmd->cmd, src->raw.buffer, dst->raw.buffer, 1, &region);
@@ -6329,6 +6900,7 @@ rwa_fill_buffer(struct rwa_buffer *buffer, size_t offset, size_t size, uint8_t v
    if (!cmd)
       return -1;
    named(&buffer->use, cmd);
+   buffer->gpu_writes = true;
    barrier_all(device, cmd->cmd);
    device->vk.CmdFillBuffer(cmd->cmd, buffer->raw.buffer, offset, size,
                             0x01010101u * (uint32_t)value);
@@ -6586,6 +7158,7 @@ rwa_copy_texture_to_buffer(struct rwa_texture *src, unsigned src_layer, unsigned
    if (!cmd)
       return -1;
    named(&dst->use, cmd);
+   dst->gpu_writes = true;
    barrier_all(device, cmd->cmd);
    image_barrier(src, cmd->cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -8441,6 +9014,45 @@ topology_from_metal(unsigned p, VkPrimitiveTopology *out, char *why, size_t why_
    return false;
 }
 
+/*
+ * (A TRANSLATION KEPT ON DISK, air_to_nir.c) What turnip makes of a render pipeline, a file for each, as for a compute
+ * pipeline: known by the two stages as they stand after everything done to them here, and by whatever else of the
+ * pipeline this file gives turnip that is not dynamic. A key that says too much only misses.
+ */
+static bool
+pipeline_cache_path(const struct rwa_render *render, VkPrimitiveTopology topology, char *path, size_t path_size)
+{
+   /* not proven yet (its one harvest had fingers in it): the file gfx_cache in share/probes turns it on */
+   static int on = -1;
+   if (on < 0)
+      on = access("/hackios/share/probes/gfx_cache", F_OK) == 0;
+   if (!on)
+      return false;
+   const struct rwa_vertex_state *vst = &render->vstate;
+   const uint32_t words[] = {
+      (uint32_t)topology, (uint32_t)render->sample_bit, render->shape.color_count, (uint32_t)render->zs_format,
+      (uint32_t)render->zs_aspects, render->fetch_targets ? 1 : 0, render->device->bresenham ? 1 : 0, vst->bindings,
+      vst->attributes, vst->divisors,
+   };
+   uint8_t key[20];
+   struct blob b;
+   bool made;
+
+   blob_init(&b);
+   nir_serialize(&b, render->vs, true);
+   nir_serialize(&b, render->fs, true);
+   blob_write_bytes(&b, words, sizeof(words));
+   blob_write_bytes(&b, render->color_format, render->shape.color_count * sizeof(render->color_format[0]));
+   blob_write_bytes(&b, render->blend, render->shape.color_count * sizeof(render->blend[0]));
+   blob_write_bytes(&b, vst->binding, vst->bindings * sizeof(vst->binding[0]));
+   blob_write_bytes(&b, vst->attribute_vk, vst->attributes * sizeof(vst->attribute_vk[0]));
+   blob_write_bytes(&b, vst->divisor, vst->divisors * sizeof(vst->divisor[0]));
+   made = !b.out_of_memory && air_cache_key_of(b.data, b.size, "render pipeline", key) &&
+          air_cache_path(key, ".gfx", path, path_size);
+   blob_finish(&b);
+   return made;
+}
+
 /* The pipeline for one topology, made the first time a draw asks for it. */
 /* The pipeline for one topology, made the first time a draw asks for it. */
 static VkPipeline
@@ -8641,8 +9253,35 @@ pipeline_for(struct rwa_render *render, unsigned primitive, char *why, size_t wh
       .layout = render->layout,
    };
    VkPipeline p = VK_NULL_HANDLE;
-   VkResult r = device->vk.CreateGraphicsPipelines(device->dev, VK_NULL_HANDLE, 1, &gci, NULL,
-                                                   &p);
+   const uint64_t pipeline_began = rwa_now_us();
+   VkPipelineCache cache = VK_NULL_HANDLE;
+   char cache_path[256];
+   void *cached = NULL;
+   size_t cached_size = 0;
+   if (pipeline_cache_path(render, topology, cache_path, sizeof(cache_path))) {
+      cached = air_cache_read(cache_path, &cached_size);
+      const VkPipelineCacheCreateInfo cache_info = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+         .initialDataSize = cached_size,
+         .pInitialData = cached,
+      };
+      device->vk.CreatePipelineCache(device->dev, &cache_info, NULL, &cache);
+   }
+   VkResult r = device->vk.CreateGraphicsPipelines(device->dev, cache, 1, &gci, NULL, &p);
+   RWA_COUNT(RWA_STAT_PIPELINES, 1);
+   RWA_COUNT(RWA_STAT_PIPELINE_US, rwa_now_us() - pipeline_began);
+   if (cache != VK_NULL_HANDLE) {
+      size_t made = 0;
+      void *bytes = NULL;
+      if (!cached && r == VK_SUCCESS &&
+          device->vk.GetPipelineCacheData(device->dev, cache, &made, NULL) == VK_SUCCESS && made > 0 &&
+          (bytes = malloc(made)) != NULL &&
+          device->vk.GetPipelineCacheData(device->dev, cache, &made, bytes) == VK_SUCCESS)
+         air_cache_write(cache_path, bytes, made);
+      free(bytes);
+      device->vk.DestroyPipelineCache(device->dev, cache, NULL);
+   }
+   free(cached);
    if (r != VK_SUCCESS) {
       say(why, why_size, "turnip would not make the pipeline of %s over %s (%s)",
           render->fstage.name,
@@ -10926,6 +11565,52 @@ stages_sample_image(const struct rwa_draw_binding *db, unsigned total, const str
    return false;
 }
 
+/* [M5g, ONE PASS FOR MANY DRAWS] A draw whose order against the next one needs a barrier: it
+ * writes something other than its attachments, or samples one of them. */
+static bool
+draw_stands_apart(const struct rwa_render *render, const struct rwa_draw *draw,
+                  const struct rwa_draw_binding *db, unsigned total)
+{
+   if (render->fetch_targets && !render->device->fetch_joins)
+      return true;
+   for (unsigned i = 0; i < total; i++) {
+      if (db[i].absent)
+         continue;
+      if (db[i].b->written || db[i].b->stored ||
+          (db[i].texture && draw_shares_image(draw, db[i].texture)))
+         return true;
+   }
+   return false;
+}
+
+/* Why a draw cannot go on in the pass left open, as the number it is counted under, or
+ * RWA_STAT_COUNT when it can. A texture is named by this when it needs no barrier. */
+static unsigned
+pass_refused_by(const struct rwa_device *device, const struct rwa_render *render,
+                const struct rwa_draw *draw, const struct rwa_draw_binding *db, unsigned total,
+                const VkImageView *color, VkImageView zs, unsigned w, unsigned h)
+{
+   if (draw->fresh_pass)
+      return RWA_STAT_BREAK_BARRIER;
+   if (draw->color_count != device->pass.color_count || zs != device->pass.zs ||
+       w != device->pass.w || h != device->pass.h ||
+       memcmp(color, device->pass.color, draw->color_count * sizeof(*color)) != 0)
+      return RWA_STAT_BREAK_TARGET;
+   if ((draw->color_clears ? draw->color_clear_mask != 0 : draw->clear_color != NULL) ||
+       draw->clear_depth || draw->clear_stencil)
+      return RWA_STAT_BREAK_CLEAR;
+   if (draw_stands_apart(render, draw, db, total))
+      return RWA_STAT_BREAK_SHARED;
+   for (unsigned i = 0; i < total; i++)
+      if (!db[i].absent && db[i].copy && db[i].buffer->gpu_writes)
+         return RWA_STAT_BREAK_COPY;
+   for (unsigned i = 0; i < total; i++)
+      if (!db[i].absent && db[i].texture &&
+          !image_stays(db[i].texture, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))
+         return RWA_STAT_BREAK_LAYOUT;
+   return RWA_STAT_COUNT;
+}
+
 /*
  * Whether one attachment of a pass has the shape the pipeline was made for, in the two ways
  * that are not its pixel format: air_metal.c's attachment_shape_fits, check for check and
@@ -11344,7 +12029,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    VkPipeline pipeline = pipeline_for(render, draw->primitive, why, why_size);
    if (!pipeline)
       goto refused;
-   struct rwa_fence *cmd = record_begin(device, why, why_size);
+   /* [M5g: not record_begin, which would end a pass this draw may go on in] */
+   struct rwa_fence *cmd = record_go_on(device, why, why_size);
    if (!cmd)
       goto refused;
 
@@ -11377,7 +12063,33 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    for (unsigned k = 0; vst->count && k < RWA_MAX_VERTEX_BUFFERS; k++)
       if (vst->stream_mask & (1u << k))
          named(&draw->vertex_streams[k].buffer->use, cmd);
-   barrier_all(device, cmd->cmd);
+   /* [M5g, ONE PASS FOR MANY DRAWS: `joins` is this draw going on in the open pass, which skips
+    * everything down to the binding of its pipeline] */
+   const bool apart = draw_stands_apart(render, draw, db, total);
+   if (apart) {
+      bool writes = false, shares = false;
+      for (unsigned i = 0; i < total; i++) {
+         writes = writes || (!db[i].absent && (db[i].b->written || db[i].b->stored));
+         shares = shares || (!db[i].absent && db[i].texture && draw_shares_image(draw, db[i].texture));
+      }
+      RWA_COUNT(render->fetch_targets ? RWA_STAT_APART_FETCH : writes ? RWA_STAT_APART_WRITES : RWA_STAT_APART_SHARES, 1);
+   }
+   bool joins = false;
+   for (unsigned i = 0; i < total; i++)
+      if (!db[i].absent && db[i].b->written && db[i].buffer)
+         db[i].buffer->gpu_writes = true;
+   if (device->pass.open) {
+      const unsigned refused_by = pass_refused_by(device, render, draw, db, total, att_views,
+                                                  zs_att_view, w, h);
+      joins = refused_by == RWA_STAT_COUNT;
+      if (!joins) {
+         RWA_COUNT(refused_by, 1);
+         pass_end(device, cmd);
+      }
+   }
+   RWA_COUNT(RWA_STAT_DRAWS, 1);
+   if (!joins)
+      barrier_all(device, cmd->cmd);
    bool copied = false;
    for (unsigned i = 0; i < total; i++) {
       const struct rwa_binding *b = db[i].b;
@@ -11395,15 +12107,26 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          VkDeviceSize at = db[i].offset;
          if (db[i].copy) {
             VkDeviceSize size = db[i].range;
-            if (!upload_alloc(device, cmd, size, &target, &at, why, why_size)) {
+            void *map;
+            if (!upload_alloc(device, cmd, size, &target, &at, &map, why, why_size)) {
                free(writes);
                free(bufs);
                free(imgs);
                goto refused;
             }
-            const VkBufferCopy region = { db[i].offset, at, size };
-            device->vk.CmdCopyBuffer(cmd->cmd, db[i].buffer->raw.buffer, target, 1, &region);
-            copied = true;
+            RWA_COUNT(RWA_STAT_COPIES, 1);
+            RWA_COUNT(RWA_STAT_COPY_BYTES, size);
+            /* [M5g: what only the processor has written is here to be copied now, with no
+             * command, which a pass could not have in it. This call is at -commit: the work
+             * has been given to the GPU no earlier than it would see these bytes.] */
+            if (db[i].buffer->gpu_writes) {
+               const VkBufferCopy region = { db[i].offset, at, size };
+               device->vk.CmdCopyBuffer(cmd->cmd, db[i].buffer->raw.buffer, target, 1, &region);
+               copied = true;
+            } else {
+               memcpy(map, (const uint8_t *)db[i].buffer->raw.map + db[i].offset,
+                      MIN2(size, db[i].buffer->size - db[i].offset));
+            }
          }
          bufs[i] = (VkDescriptorBufferInfo){ target, at, db[i].range };
          writes[i].pBufferInfo = &bufs[i];
@@ -11432,7 +12155,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    /* [M5b: one image sampled through one window and rendered through another is in one layout for
     * both, and that layout is GENERAL (TEXTURES, LEVELS AND SLICES, THE LAYOUT OF ONE IMAGE).] */
-   for (unsigned i = 0; i < total; i++)
+   for (unsigned i = 0; !joins && i < total; i++)
       if (db[i].texture) {
          /* [M5c: and a texture a stage writes (ARGUMENT BUFFERS, A TEXTURE A FRAGMENT OR VERTEX
           * SHADER WRITES)] */
@@ -11455,7 +12178,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * VkClearColorValue is a union, and turnip reads it by the attachment's format.
     */
    VkRenderingAttachmentInfo att[8];
-   for (unsigned i = 0; i < draw->color_count; i++) {
+   for (unsigned i = 0; !joins && i < draw->color_count; i++) {
       struct rwa_texture *t = draw->color[i];
       const bool shared = stages_sample_image(db, total, t);
       const VkImageLayout att_layout = shared ? VK_IMAGE_LAYOUT_GENERAL
@@ -11476,7 +12199,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
          .imageView = att_views[i],
          .imageLayout = att_layout,
-         .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+         .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                   : (draw->dont_care_mask & (1u << i)) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                                                        : VK_ATTACHMENT_LOAD_OP_LOAD,
          .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
       };
       for (unsigned c = 0; c < 4; c++)
@@ -11493,7 +12218,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    VkRenderingAttachmentInfo zatt = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
    VkRenderingAttachmentInfo satt = zatt;
-   if (zt) {
+   if (zt && !joins) {
       const VkImageLayout zs_layout = stages_sample_image(db, total, zt)
          ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
       image_barrier(zt, cmd->cmd, zs_layout,
@@ -11504,9 +12229,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       zatt.imageView = satt.imageView = zs_att_view;
       zatt.imageLayout = satt.imageLayout = zs_layout;
       zatt.storeOp = satt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-      zatt.loadOp = draw->clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+      zatt.loadOp = draw->clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                    : (draw->dont_care_mask & RWA_DONT_CARE_DEPTH) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                                                                   : VK_ATTACHMENT_LOAD_OP_LOAD;
       satt.loadOp = draw->clear_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                                        : VK_ATTACHMENT_LOAD_OP_LOAD;
+                    : (draw->dont_care_mask & RWA_DONT_CARE_STENCIL) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                                                                     : VK_ATTACHMENT_LOAD_OP_LOAD;
       zatt.clearValue.depthStencil.depth = draw->clear_depth ? *draw->clear_depth : 0.0f;
       satt.clearValue.depthStencil.stencil = draw->clear_stencil ? *draw->clear_stencil & 0xff
                                                                  : 0;
@@ -11520,7 +12248,29 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       .pDepthAttachment = zt && (zt->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? &zatt : NULL,
       .pStencilAttachment = zt && (zt->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? &satt : NULL,
    };
-   device->CmdBeginRendering(cmd->cmd, &ri);
+   if (!joins) {
+      if (device->times.armed && device->times.passes < RWA_TIMES_PASSES) {
+         struct rwa_device *d = device;
+         const unsigned n = d->times.passes++;
+         d->times.pass[n].w = w;
+         d->times.pass[n].h = h;
+         d->times.pass[n].draws = 0;
+         d->times.pass[n].end = UINT_MAX;
+         d->times.pass[n].format = draw->color_count ? draw->color[0]->format->name : "(depth)";
+         d->times.pass[n].function = render->fstage.name;
+         times_stamp(d, cmd, &d->times.pass[n].begin);
+      }
+      device->CmdBeginRendering(cmd->cmd, &ri);
+      RWA_COUNT(RWA_STAT_PASSES, 1);
+      device->pass.open = true;
+      device->pass.color_count = draw->color_count;
+      device->pass.w = w;
+      device->pass.h = h;
+      device->pass.zs = zs_att_view;
+      memcpy(device->pass.color, att_views, sizeof(device->pass.color));
+   }
+   if (device->times.armed && device->times.passes)
+      device->times.pass[device->times.passes - 1].draws++;
    device->vk.CmdBindPipeline(cmd->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
    const bool bound = bind_descriptors(device, cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                        render->ordinary_set, render->set_layout, render->layout,
@@ -11532,7 +12282,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    /* [M5c: no set is no draw, and the sentence says (out of memory: a full pool only makes another).
     * The pass ends here with what it loaded, inside a recording that goes on.] */
    if (!bound) {
-      device->CmdEndRendering(cmd->cmd);
+      pass_end(device, cmd);
       return -1;
    }
    /*
@@ -11612,7 +12362,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       device->vk.CmdDraw(cmd->cmd, draw->vertex_count, instances, draw->vertex_start,
                          draw->base_instance);
    }
-   device->CmdEndRendering(cmd->cmd);
+   if (apart || !device->join_passes)
+      pass_end(device, cmd);
    return recorded(device, "draw", why, why_size);
 
 refused:
@@ -11769,13 +12520,14 @@ rwa_module_function_constants(struct rwa_device *device, const void *bitcode, si
 static struct rwa_compute *
 compute_create(struct rwa_device *device, const void *bitcode, size_t size, const char *entry,
                const struct rwa_function_constant *given, unsigned given_count, unsigned is_given,
+               const struct air_stitch_node *stitched, unsigned stitched_count,
                struct rwa_compute_info *info, char *why, size_t why_size)
 {
    if (!device) {
       say(why, why_size, "no device to make a compute pipeline on");
       return NULL;
    }
-   if (!bitcode || size < 4) {
+   if (!stitched && (!bitcode || size < 4)) {
       say(why, why_size, "%zu bytes is not a shader module", size);
       return NULL;
    }
@@ -11798,10 +12550,16 @@ compute_create(struct rwa_device *device, const void *bitcode, size_t size, cons
     * No library wrapper either: a wrapped air.visible function is not a pipeline.
     * [M5c: or the application's, FUNCTION CONSTANTS above.] */
    struct air_to_nir_options options = { 0 };
-   constant_options(compute->mem_ctx, bitcode, size, given, given_count, is_given, &options);
-   const char *error;
-   compute->nir = air_to_nir(compute->mem_ctx, bitcode, size, entry, &options,
-                             device->nir_options, &compute->info, &error);
+   const char *error = NULL;
+   if (stitched) {
+      /* (FUNCTION STITCHING, nir_air.h: a graph of library functions and not one module) */
+      compute->nir = air_stitch_to_nir(compute->mem_ctx, entry, stitched, stitched_count, device->nir_options,
+                                       &compute->info, &error);
+   } else {
+      constant_options(compute->mem_ctx, bitcode, size, given, given_count, is_given, &options);
+      compute->nir = air_to_nir(compute->mem_ctx, bitcode, size, entry, &options,
+                                device->nir_options, &compute->info, &error);
+   }
    if (!compute->nir) {
       say(why, why_size, "%s", error ? error : "the module could not be translated");
       goto fail;
@@ -11939,8 +12697,11 @@ compute_pipeline_for(struct rwa_compute *compute, const unsigned block[3], char 
       };
       device->vk.CreatePipelineCache(device->dev, &cache_info, NULL, &cache);
    }
+   const uint64_t pipeline_began = rwa_now_us();
    VkResult r = device->vk.CreateComputePipelines(device->dev, cache, 1, &ci, NULL,
                                                   &p);
+   RWA_COUNT(RWA_STAT_PIPELINES, 1);
+   RWA_COUNT(RWA_STAT_PIPELINE_US, rwa_now_us() - pipeline_began);
    if (cache != VK_NULL_HANDLE) {
       size_t made = 0;
       void *bytes = NULL;
@@ -11985,7 +12746,17 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                    const char *entry, struct rwa_compute_info *info, char *why,
                    size_t why_size)
 {
-   return compute_create(device, bitcode, size, entry, NULL, 0, 0, info, why, why_size);
+   return compute_create(device, bitcode, size, entry, NULL, 0, 0, NULL, 0, info, why, why_size);
+}
+
+/* FUNCTION STITCHING (K37): rwa_stitch_node is air_stitch_node, field for field (air_metal.h) */
+struct rwa_compute *
+rwa_compute_create_stitched(struct rwa_device *device, const char *name, const struct rwa_stitch_node *nodes,
+                            unsigned node_count, struct rwa_compute_info *info, char *why, size_t why_size)
+{
+   STATIC_ASSERT(sizeof(struct rwa_stitch_node) == sizeof(struct air_stitch_node));
+   STATIC_ASSERT(sizeof(struct rwa_stitch_input) == sizeof(struct air_stitch_input));
+   return compute_create(device, NULL, 0, name, NULL, 0, 0, (const struct air_stitch_node *)nodes, node_count, info, why, why_size);
 }
 
 struct rwa_compute *
@@ -11994,7 +12765,7 @@ rwa_compute_create_constants(struct rwa_device *device, const void *bitcode, siz
                              unsigned constant_count, struct rwa_compute_info *info, char *why,
                              size_t why_size)
 {
-   return compute_create(device, bitcode, size, entry, constants, constant_count, 1, info, why,
+   return compute_create(device, bitcode, size, entry, constants, constant_count, 1, NULL, 0, info, why,
                          why_size);
 }
 
@@ -12119,6 +12890,10 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
       if (db[i].sampler_object)
          named(&db[i].sampler_object->use, cmd);
    }
+   for (unsigned i = 0; i < total; i++)
+      if (!db[i].absent && db[i].b->written && db[i].buffer)
+         db[i].buffer->gpu_writes = true;
+   RWA_COUNT(RWA_STAT_DISPATCHES, 1);
    /* Everything earlier made visible to this dispatch (THE DISPATCH AND ITS ORDER), then
     * the descriptors, a misaligned read-only buffer copied into this command buffer's
     * upload memory first, in order, as a draw does it (RESOURCES, OFFSETS). */
@@ -12140,15 +12915,26 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
          VkDeviceSize at = db[i].offset;
          if (db[i].copy) {
             VkDeviceSize size = db[i].range;
-            if (!upload_alloc(device, cmd, size, &target, &at, why, why_size)) {
+            void *map;
+            if (!upload_alloc(device, cmd, size, &target, &at, &map, why, why_size)) {
                free(writes);
                free(bufs);
                free(imgs);
                goto refused;
             }
-            const VkBufferCopy region = { db[i].offset, at, size };
-            device->vk.CmdCopyBuffer(cmd->cmd, db[i].buffer->raw.buffer, target, 1, &region);
-            copied = true;
+            RWA_COUNT(RWA_STAT_COPIES, 1);
+            RWA_COUNT(RWA_STAT_COPY_BYTES, size);
+            /* [M5g: what only the processor has written is here to be copied now, with no
+             * command, which a pass could not have in it. This call is at -commit: the work
+             * has been given to the GPU no earlier than it would see these bytes.] */
+            if (db[i].buffer->gpu_writes) {
+               const VkBufferCopy region = { db[i].offset, at, size };
+               device->vk.CmdCopyBuffer(cmd->cmd, db[i].buffer->raw.buffer, target, 1, &region);
+               copied = true;
+            } else {
+               memcpy(map, (const uint8_t *)db[i].buffer->raw.map + db[i].offset,
+                      MIN2(size, db[i].buffer->size - db[i].offset));
+            }
          }
          bufs[i] = (VkDescriptorBufferInfo){ target, at, db[i].range };
          writes[i].pBufferInfo = &bufs[i];

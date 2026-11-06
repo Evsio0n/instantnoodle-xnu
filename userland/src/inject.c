@@ -1366,6 +1366,85 @@ ca_rates(void)
 }
 
 /*
+ * Boot-arg ca_nits=1: what the window server takes the SDR white for (CAWindowServerDisplay's nits; under 20 of them on this
+ * phone's identity it boosts dim content and refuses detached layers, docs/research/mdp-driver-plan.md 8): each -setNits:, the first 40,
+ * and a look every 5 s, with the headroom and the brightness it knows.
+ */
+static IMP ca_nits_set;
+
+static void
+ca_nits_set_float(id self, SEL cmd, float nits)
+{
+	static unsigned said;
+
+	if (said++ < 40) {
+		say("redwood: ca_nits: setNits: %g\n", (double)nits);
+	}
+	((void (*)(id, SEL, float))ca_nits_set)(self, cmd, nits);
+}
+
+static void
+ca_nits_set_double(id self, SEL cmd, double nits)
+{
+	static unsigned said;
+
+	if (said++ < 40) {
+		say("redwood: ca_nits: setNits: %g\n", nits);
+	}
+	((void (*)(id, SEL, double))ca_nits_set)(self, cmd, nits);
+}
+
+static void
+ca_nits_look(void)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		static const char *names[] = { "nits", "maximumBrightness", "brightnessAvailable" };
+		Class server = objc_getClass("CAWindowServer"), cls = objc_getClass("CAWindowServerDisplay");
+		id ws = server ? ((id (*)(Class, SEL))objc_msgSend)(server, sel_registerName("serverIfRunning")) : nil;
+		id displays = ws ? ((id (*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays")) : nil;
+		id first = displays ? ((id (*)(id, SEL))objc_msgSend)(displays, sel_registerName("firstObject")) : nil;
+
+		for (unsigned i = 0; first != nil && i < sizeof(names) / sizeof(names[0]); i++) {
+			Method method = class_getInstanceMethod(cls, sel_registerName(names[i]));
+			char type = 0;
+
+			if (method == NULL) {
+				continue;
+			}
+			method_getReturnType(method, &type, 1);
+			if (type == 'd') {
+				say("redwood: ca_nits: %s = %g\n", names[i], ((double (*)(id, SEL))objc_msgSend)(first, method_getName(method)));
+			} else if (type == 'f') {
+				say("redwood: ca_nits: %s = %g\n", names[i], (double)((float (*)(id, SEL))objc_msgSend)(first, method_getName(method)));
+			} else if (strchr("qQiIlLcB", type) != NULL) {
+				say("redwood: ca_nits: %s = %lld\n", names[i], (long long)((long (*)(id, SEL))objc_msgSend)(first, method_getName(method)));
+			}
+		}
+		ca_nits_look();
+	});
+}
+
+static void
+ca_nits(void)
+{
+	Class cls = objc_getClass("CAWindowServerDisplay");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("setNits:")) : NULL;
+
+	if (method != NULL) {
+		char type = 0;
+
+		method_getArgumentType(method, 2, &type, 1);
+		say("redwood: ca_nits: setNits: takes %c (%s)\n", type, method_getTypeEncoding(method));
+		if (type == 'f') {
+			ca_nits_set = method_setImplementation(method, (IMP)ca_nits_set_float);
+		} else if (type == 'd') {
+			ca_nits_set = method_setImplementation(method, (IMP)ca_nits_set_double);
+		}
+	}
+	ca_nits_look();
+}
+
+/*
  * Boot-arg ca_fps=N (by default the panel's rate where it is above 60; ca_fps=0: off): the window server's
  * own idea of the display's rate. It takes the preferred mode's (60, an iPhone X) as its ideal rate and paces every
  * animation and VBL delta by it (ca_rates=1 showed idealRefreshRate 60, vblDelta 16.7 ms); told not to,
@@ -1454,6 +1533,9 @@ hk_init(void)
 		}
 		if (strstr(arguments, "ca_rates=1") != NULL) {
 			ca_rates();
+		}
+		if (strstr(arguments, "ca_nits=1") != NULL) {
+			ca_nits();
 		}
 		const char *fps = strstr(arguments, "ca_fps=");
 		int wanted = fps != NULL && (fps == arguments || fps[-1] == ' ') ? atoi(fps + 7) :

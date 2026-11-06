@@ -93,10 +93,15 @@
 #import <Metal/Metal.h>          /* for MTLSize and the public enumerations, nothing private */
 #import <objc/message.h>
 #import <objc/runtime.h>
+#include <arm_neon.h>
+#include <notify.h>
 #include <IOKit/IOKitLib.h>
+#include <mach/mach.h>
+#include <malloc/malloc.h>
 #include <dlfcn.h>
 #include <pthread.h>
 
+#include <sys/stat.h>
 #include "hk_drawable.h"
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -116,6 +121,20 @@ struct rwa_texture;
 struct rwa_sampler;
 struct rwa_compute;
 struct rwa_fence;
+/* (FUNCTION STITCHING: air_metal.h) */
+struct rwa_stitch_input {
+	unsigned kind;
+	unsigned bind, offset, node;
+};
+struct rwa_stitch_node {
+	const char *name;
+	const void *bitcode;
+	size_t size;
+	bool early_return;
+	unsigned num_inputs;
+	const struct rwa_stitch_input *inputs;
+};
+
 struct rwa_compute_info {
 	unsigned max_threads_per_group, thread_execution_width, static_shared_bytes;
 	unsigned buffers, textures, samplers;
@@ -356,7 +375,20 @@ struct rwa_draw {
 	const unsigned *color_slice;
 	unsigned depth_level;
 	unsigned depth_slice;
+	/* one pass for many draws (M5g, air_metal.h) */
+	unsigned fresh_pass;
+	unsigned dont_care_mask;
 };
+#define RWA_DONT_CARE_DEPTH   (1u << 8)
+#define RWA_DONT_CARE_STENCIL (1u << 9)
+/* where a frame's time goes (M5g, air_metal.h has what each is) */
+enum rwa_stat_index {
+	RWA_STAT_DRAWS, RWA_STAT_PASSES, RWA_STAT_BREAK_TARGET, RWA_STAT_BREAK_CLEAR, RWA_STAT_BREAK_LAYOUT,
+	RWA_STAT_BREAK_SHARED, RWA_STAT_BREAK_COPY, RWA_STAT_BREAK_BARRIER, RWA_STAT_COPIES, RWA_STAT_COPY_BYTES,
+	RWA_STAT_SUBMITS, RWA_STAT_PIPELINES, RWA_STAT_PIPELINE_US, RWA_STAT_DISPATCHES, RWA_STAT_BUFFERS,
+	RWA_STAT_BUFFER_US, RWA_STAT_SUBMIT_US, RWA_STAT_APART_FETCH, RWA_STAT_APART_WRITES, RWA_STAT_APART_SHARES, RWA_STAT_TEXTURES, RWA_STAT_TEXTURE_US, RWA_STAT_TEXTURES_KEPT, RWA_STAT_COUNT
+};
+
 
 /*
  * The library's MTLVertexFormat table, checked against Apple's own header HERE, where the
@@ -500,6 +532,7 @@ _Static_assert(sizeof(struct rwa_render_info) == 116 &&
  * that provoked it.
  */
 static void rw_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void hk_console_line(const char *line, size_t length);
 /* and the one method this driver installs into Metal's own function class, whose reason
  * is a measurement and is written where it is done (the end of this file) */
 static void ensure_function_encoder(void);
@@ -512,6 +545,24 @@ rw_print(const char *fmt, ...)
 
 	if (who[0] == '\0') {
 		snprintf(who, sizeof(who), "hkmetal[%s %d]", getprogname(), getpid());
+	}
+	/* (an application's stdout is /dev/null, and what Metal refused an application is what is wanted: such a process says it on the console) */
+	static int nowhere = -1;
+
+	if (nowhere < 0) {
+		struct stat out, null;
+
+		nowhere = fstat(1, &out) != 0 || (stat("/dev/null", &null) == 0 && out.st_rdev == null.st_rdev);
+	}
+	if (nowhere) {
+		char line[512];
+		int at = snprintf(line, sizeof(line), "%s: ", who);
+
+		va_start(ap, fmt);
+		vsnprintf(line + at, sizeof(line) - (size_t)at, fmt, ap);
+		va_end(ap);
+		hk_console_line(line, strlen(line));
+		return;
 	}
 	printf("%s: ", who);
 	va_start(ap, fmt);
@@ -529,9 +580,12 @@ static struct {
 	void (*device_close)(struct rwa_device *);
 	const char *(*device_name)(struct rwa_device *);
 	struct rwa_buffer *(*buffer_create)(struct rwa_device *, size_t, char *, size_t);
+	struct rwa_texture *(*texture_over_buffer)(struct rwa_buffer *, const struct rwa_texture_shape *, size_t, unsigned, char *, size_t);
 	void *(*buffer_map)(struct rwa_buffer *);
 	size_t (*buffer_size)(struct rwa_buffer *);
 	void (*buffer_destroy)(struct rwa_buffer *);
+	int (*buffer_busy)(struct rwa_buffer *);               /* (a library before 33ee0e40: none, and no buffers kept) */
+	int (*vk_memory)(struct rwa_device *, char *, size_t);
 	struct rwa_compute *(*compute_create)(struct rwa_device *, const void *, size_t,
 					      const char *, struct rwa_compute_info *, char *,
 					      size_t);
@@ -552,6 +606,8 @@ static struct {
 	int (*module_function_constants)(struct rwa_device *, const void *, size_t,
 					 struct rwa_function_constant_decl *, unsigned, unsigned *,
 					 char *, size_t);
+	struct rwa_compute *(*compute_create_stitched)(struct rwa_device *, const char *, const struct rwa_stitch_node *, unsigned,
+						       struct rwa_compute_info *, char *, size_t);
 	struct rwa_compute *(*compute_create_constants)(struct rwa_device *, const void *, size_t,
 							const char *,
 							const struct rwa_function_constant *,
@@ -586,6 +642,9 @@ static struct {
 							  char *, size_t);
 	void (*depth_stencil_destroy)(struct rwa_depth_stencil *);
 	int (*finish)(struct rwa_device *, char *, size_t);
+	void (*stats_read)(uint64_t *, unsigned);
+	int (*texture_prepare)(struct rwa_texture *, struct rwa_texture *const *, unsigned, struct rwa_texture *,
+			       char *, size_t);
 	/* one submission and one fence per command buffer; optional, and without them every
 	 * draw and dispatch waits for itself, as an older library does */
 	void (*defer_waits)(struct rwa_device *, int);
@@ -675,9 +734,12 @@ mesa_available(void)
 	*(void **)&mesa.device_close = dlsym(mesa.handle, "rwa_device_close");
 	*(void **)&mesa.device_name = dlsym(mesa.handle, "rwa_device_name");
 	*(void **)&mesa.buffer_create = dlsym(mesa.handle, "rwa_buffer_create");
+	*(void **)&mesa.texture_over_buffer = dlsym(mesa.handle, "rwa_texture_over_buffer");
 	*(void **)&mesa.buffer_map = dlsym(mesa.handle, "rwa_buffer_map");
 	*(void **)&mesa.buffer_size = dlsym(mesa.handle, "rwa_buffer_size");
 	*(void **)&mesa.buffer_destroy = dlsym(mesa.handle, "rwa_buffer_destroy");
+	*(void **)&mesa.buffer_busy = dlsym(mesa.handle, "rwa_buffer_busy");
+	*(void **)&mesa.vk_memory = dlsym(mesa.handle, "rwa_vk_memory");
 	*(void **)&mesa.compute_create = dlsym(mesa.handle, "rwa_compute_create");
 	*(void **)&mesa.compute_destroy = dlsym(mesa.handle, "rwa_compute_destroy");
 	*(void **)&mesa.texture_create = dlsym(mesa.handle, "rwa_texture_create");
@@ -711,6 +773,8 @@ mesa_available(void)
 	 * rather than the driver refusing to load. */
 	*(void **)&mesa.depth_stencil_create = dlsym(mesa.handle, "rwa_depth_stencil_create");
 	*(void **)&mesa.depth_stencil_destroy = dlsym(mesa.handle, "rwa_depth_stencil_destroy");
+	*(void **)&mesa.stats_read = dlsym(mesa.handle, "rwa_stats_read");
+	*(void **)&mesa.texture_prepare = dlsym(mesa.handle, "rwa_texture_prepare");
 	*(void **)&mesa.finish = dlsym(mesa.handle, "rwa_finish");
 	*(void **)&mesa.defer_waits = dlsym(mesa.handle, "rwa_device_defer_waits");
 	*(void **)&mesa.flush = dlsym(mesa.handle, "rwa_flush");
@@ -735,6 +799,7 @@ mesa_available(void)
 	    dlsym(mesa.handle, "rwa_module_function_constants");
 	*(void **)&mesa.compute_create_constants =
 	    dlsym(mesa.handle, "rwa_compute_create_constants");
+	*(void **)&mesa.compute_create_stitched = dlsym(mesa.handle, "rwa_compute_create_stitched");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -841,6 +906,150 @@ hk_sample_threads(void)
 	}
 }
 
+/*
+ * (The owner: 「地圖伸縮卡頓」; Maps' pinch, 76 frames against hk-gl's 182, runs 005452 and 010021.) With a program's name in the file sample_of: on the Darwin notification com.hackios.sample,
+ * for 12 s, every 250 ms, the threads of that program that are running, their CPU, and where; at the end the CPU each thread used in those 12 s. To the console.
+ */
+extern kern_return_t thread_info(thread_act_t, thread_flavor_t, thread_info_t, mach_msg_type_number_t *);
+extern kern_return_t mach_port_deallocate(ipc_space_t, mach_port_name_t);
+extern kern_return_t vm_deallocate(vm_map_t, vm_address_t, vm_size_t);
+extern kern_return_t vm_read_overwrite(vm_map_t, vm_address_t, vm_size_t, vm_address_t, vm_size_t *);
+extern kern_return_t thread_suspend(thread_act_t);
+extern kern_return_t thread_resume(thread_act_t);
+static void hk_console_line(const char *line, size_t length);
+
+static void
+hk_sample_tick(unsigned tick)
+{
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t count = 0;
+	static struct { thread_act_t thread; uint64_t us; } was[128];
+	char line[1200];
+
+	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		return;
+	}
+	for (mach_msg_type_number_t t = 0; t < count && t < 128; t++) {
+		thread_basic_info_data_t info;
+		mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+		arm_thread_state64_t state;
+		mach_msg_type_number_t m = ARM_THREAD_STATE64_COUNT;
+		char name[48] = "";
+
+		if (threads[t] == mach_thread_self() || thread_info(threads[t], THREAD_BASIC_INFO, (thread_info_t)&info, &n) != KERN_SUCCESS) {
+			continue;
+		}
+		pthread_t pt = pthread_from_mach_thread_np(threads[t]);
+
+		if (pt != NULL) {
+			pthread_getname_np(pt, name, sizeof(name));
+		}
+		const uint64_t us = (uint64_t)info.user_time.seconds * 1000000 + info.user_time.microseconds + (uint64_t)info.system_time.seconds * 1000000 + info.system_time.microseconds;
+		size_t at;
+
+		if (tick == 0 || tick == 48) {
+			unsigned k;
+
+			for (k = 0; k < 128 && was[k].thread != 0 && was[k].thread != threads[t]; k++) {
+			}
+			if (k < 128 && tick == 48 && us - was[k].us >= 20000) {
+				at = (size_t)snprintf(line, sizeof(line), "hk-sample[%s] thread %#x '%s' used %llu ms\n", getprogname(), threads[t], name, (unsigned long long)(us - was[k].us) / 1000);
+				hk_console_line(line, MIN(at, sizeof(line) - 1));
+			}
+			if (k < 128) {
+				was[k].thread = threads[t];
+				was[k].us = us;
+			}
+		}
+		/* (stopped first, and its stack read by a call that can fail: a thread that runs on makes a frame pointer of a moment ago a fault here, Maps' SIGSEGV of run 015038) */
+		/* (a waiting thread every other tick: what a frame waits on is on the stack of a thread that does not run) */
+		const bool running = info.run_state == TH_STATE_RUNNING && !(info.flags & TH_FLAGS_IDLE);
+
+		if ((!running && (tick & 1) != 0) || thread_suspend(threads[t]) != KERN_SUCCESS) {
+			continue;
+		}
+		if (thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &m) != KERN_SUCCESS) {
+			thread_resume(threads[t]);
+			continue;
+		}
+		uint64_t pc = __darwin_arm_thread_state64_get_pc(state) & 0x0000000fffffffffull;
+		uint64_t fp = __darwin_arm_thread_state64_get_fp(state);
+		uint64_t pcs[24];
+		unsigned depth = 0;
+
+		for (; depth < 24; depth++) {
+			uint64_t frame[2];
+			vm_size_t got = 0;
+
+			pcs[depth] = pc;
+			if (fp == 0 || (fp & 7) != 0 || fp < 0x100000000ull ||
+			    vm_read_overwrite(mach_task_self(), fp, sizeof(frame), (vm_address_t)frame, &got) != KERN_SUCCESS || got != sizeof(frame)) {
+				depth++;
+				break;
+			}
+			pc = frame[1] & 0x0000000fffffffffull;
+			fp = frame[0];
+		}
+		thread_resume(threads[t]);
+		if (!running && depth <= 3) {
+			continue;       /* a worker with nothing to do */
+		}
+
+		at = (size_t)snprintf(line, sizeof(line), "hk-sample[%s] %u %#x %c '%s' %u%%:", getprogname(), tick, threads[t], running ? 'R' : 'W', name, info.cpu_usage / 10);
+		for (unsigned i = 0; i < depth && at + 70 < sizeof(line); i++) {
+			Dl_info where;
+
+			if (dladdr((const void *)pcs[i], &where) && where.dli_fname != NULL) {
+				const char *leaf = strrchr(where.dli_fname, '/');
+
+				/* (the shared cache has no local names: such a frame by its offset, for ipsw dyld a2s) */
+				if (where.dli_sname != NULL && strcmp(where.dli_sname, "<redacted>") != 0) {
+					at += (size_t)snprintf(line + at, sizeof(line) - at, " %.14s:%.34s", leaf != NULL ? leaf + 1 : where.dli_fname, where.dli_sname);
+				} else {
+					at += (size_t)snprintf(line + at, sizeof(line) - at, " %.14s+%#llx", leaf != NULL ? leaf + 1 : where.dli_fname, (unsigned long long)(pcs[i] - (uint64_t)where.dli_fbase));
+				}
+			}
+		}
+		at += (size_t)snprintf(line + at, sizeof(line) - at, "\n");
+		hk_console_line(line, MIN(at, sizeof(line) - 1));
+	}
+	for (mach_msg_type_number_t t = 0; t < count; t++) {
+		mach_port_deallocate(mach_task_self(), threads[t]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(*threads));
+}
+
+static void
+hk_sample_on_notice(void)
+{
+	char wanted[64] = "";
+	int file = open("/hackios/share/probes/sample_of", O_RDONLY);
+
+	if (file < 0) {
+		return;
+	}
+	ssize_t got = read(file, wanted, sizeof(wanted) - 1);
+
+	close(file);
+	while (got > 0 && (wanted[got - 1] == '\n' || wanted[got - 1] == ' ')) {
+		got--;
+	}
+	wanted[got > 0 ? got : 0] = 0;
+	if (strcmp(getprogname(), wanted) != 0) {
+		return;
+	}
+	int token;
+
+	notify_register_dispatch("com.hackios.sample", &token, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(int unused) {
+		(void)unused;
+		for (unsigned tick = 0; tick <= 48; tick++) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, tick * 250 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+				hk_sample_tick(tick);
+			});
+		}
+	});
+}
+
 static void
 hk_say_traps(void)
 {
@@ -849,6 +1058,7 @@ hk_say_traps(void)
 	action.sa_sigaction = hk_trap_handler;
 	action.sa_flags = SA_SIGINFO;
 	sigaction(SIGTRAP, &action, NULL);
+	hk_sample_on_notice();
 	if (access("/hackios/share/probes/sample", F_OK) == 0 && strcmp(getprogname(), "SpringBoard") == 0) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 45 * NSEC_PER_SEC),
 			       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
@@ -1114,6 +1324,13 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 &&
 	       __builtin_offsetof(struct MTLTargetDeviceArch, name) == 0x10,
 	       "Metal reads the name at +0x10 (0x181a3ca3c) and the version at +0x8");
 
+/* M5g: -setVertexBytes: and its kind (-[HKMetalCommandBuffer hkBytes:...]). Metal's limit for them is
+ * 4 KB; more goes to a buffer of its own, as all of them did. */
+#define RW_BYTES_CHUNK       (64u * 1024)
+#define RW_BYTES_MOST        (8u * 1024)
+#define RW_BYTES_ALIGN       64u
+#define RW_BYTES_CHUNKS_KEPT 8u
+
 @interface HKMetalDevice : _MTLDevice {
 	io_service_t _acceleratorService;   /* the IOAcceleratorES service Metal handed us */
 	io_connect_t _gpu;                  /* this port's own gpu client, or IO_OBJECT_NULL */
@@ -1121,9 +1338,13 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 &&
 	BOOL _assertions;                   /* Metal's own assertion switch, stored for it */
 	struct MTLTargetDeviceArch _target;     /* answered by pointer; see -targetDeviceInfo */
 	char _targetName[96];               /* the bytes _target.name points at, inside the object */
+	NSMutableArray *_bytesChunks;       /* M5g: chunks of -setVertexBytes: and friends the GPU has finished with */
 }
 /* Not part of any Metal protocol: how this driver's own objects reach the compiler. */
 - (struct rwa_device *)mesaDevice;
+/* M5g: a chunk for -[HKMetalCommandBuffer hkBytes:...], retained; and these back, once the GPU is done */
+- (id)hkTakeBytesChunk;
+- (void)hkGiveBackBytesChunks:(NSArray *)chunks;
 /* and the argument encoder of one function's `[[buffer(n)]]` set, which the method this
  * driver installs into Metal's own _MTLFunction forwards to (the end of this file says
  * why it has to): the layout is read out of the function's own bitcode, which is the one
@@ -1223,6 +1444,10 @@ struct gem_close { uint32_t handle, pad; };
 - (instancetype)initWithHKQueue:(HKMetalCommandQueue *)queue;
 - (void)recordWork:(HKMetalWork *)work;
 - (id)device;
+/* M5g: these bytes in memory the GPU can read for as long as this buffer runs; the buffer they are
+ * in, not retained, and where. A buffer of its own for each -setVertexBytes: was memory from the
+ * kernel for each draw. */
+- (id)hkBytes:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset;
 /* runs what was recorded from where it stopped: at -commit, and again when an event it waits for is signalled */
 - (void)hkRun;
 @end
@@ -1425,6 +1650,9 @@ hk_note_packed16(const char *route, unsigned format, unsigned usage,
 	unsigned colorCount;
 	float clearColor[4];
 	BOOL clears;
+	/* M5g: rwa_draw's fresh_pass and dont_care_mask */
+	BOOL freshPass;
+	unsigned dontCareMask;
 	/* M5b: the level, and the slice or depth plane, each attachment is rendered at */
 	unsigned colorLevel[8], colorSlice[8];
 	unsigned depthLevel, depthSlice;
@@ -1475,6 +1703,10 @@ hk_note_packed16(const char *route, unsigned format, unsigned usage,
 	id textures[RW_MAX_BUFFERS];
 	id samplers[RW_MAX_BUFFERS];
 	unsigned count, textureCount, samplerCount;
+	/* a draw's vertex stage has its own, at its own indices (-setVertexTexture:atIndex:) */
+	id vertexTextures[RW_MAX_BUFFERS];
+	id vertexSamplers[RW_MAX_BUFFERS];
+	unsigned vertexTextureCount, vertexSamplerCount;
 	unsigned groups[3], size[3];
 	/* A BLIT instead of a dispatch or a draw (RW_BLIT_*, 0: not one), from an
 	 * MTLBlitCommandEncoder: the two resources RETAINED (the blit's own -dealloc gives
@@ -1522,6 +1754,9 @@ enum {
 - (void)hkPlaceInHeap:(HKMetalHeap *)heap size:(NSUInteger)size offset:(NSUInteger)offset;
 @end
 
+static _Atomic(unsigned) hk_draw_backs;   /* how many textures stand for a surface (DRAWN AND PUT BACK) */
+static struct { void *surface; id texture; } hk_stand_ins[64];   /* this process's one texture for each surface it cannot have in place, under @synchronized of the class: not retained, each takes itself out */
+
 @interface HKMetalTexture : HKMetalResource {
 	HKMetalDevice *_owner;
 	struct rwa_texture *_texture;
@@ -1534,14 +1769,46 @@ enum {
 	/* M5e, a copy of a surface (hkFollowSurface): the surface, what it added up to, and when it was last looked at */
 	void *_followed;
 	uint64_t _followedSum, _followedLooked;
+	uint64_t _followedSummedAt;   /* M5g: when it was last added up, and the surface's seed then */
+	uint32_t _followedSeed;
 	BOOL _followedInPlace;   /* (frame_dump: the surface is only remembered, the GPU has its memory itself) */
+	int64_t _liveBytes;      /* (hk_live) */
+	BOOL _liveSurface;
+	void *_biplanar;         /* format 500's copy (hkBiplanarLook): the surface, its seed and a sample of it when copied, the RGB */
+	uint32_t _biplanarSeed;
+	uint64_t _biplanarSum;
+	uint8_t *_biplanarBytes;
+	id _overBuffer;          /* M5g: the buffer whose memory this is (-[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]) */
+	NSUInteger _rowGiven;    /* (census) the last bytesPerRow it was written with, or laid over a buffer with */
+	BOOL _drawsBack;         /* M5g: hkDrawnBackTexture */
+	BOOL _planeStandIn;      /* M5g: hkPlaneTexture */
+	NSUInteger _plane;
+	BOOL _putBackDue;
+	_Atomic(uint64_t) _lastDrawn;
 }
+/* M5g: this texture's memory is that buffer's: kept for as long as the texture */
+- (void)hkOverBuffer:(id)buffer row:(NSUInteger)row;
+/* M5g, DRAWN AND PUT BACK (hkDrawnBackTexture): this texture stands for that surface as a target, and the surface gets what it holds */
+- (void)hkDrawBackTo:(void *)surface;
+- (void)hkStandInFor:(void *)surface;
+- (void)hkStandInForPlane:(NSUInteger)plane of:(void *)surface;
+- (BOOL)hkWritesPlaneBack;
+- (void)hkPutBack;
+- (id)hkOverBuffer;
+- (void)hkStartDrawingBack;
+- (BOOL)hkDrawsBack;
+- (void)hkPutBackSoon;
+/* format 500: this texture is that surface in RGB from now on; and the look that keeps it so */
+- (void)hkBiplanarOf:(void *)surface seed:(uint32_t)seed sum:(uint64_t)sum;
+- (void)hkBiplanarLook;
 /* M5e: this texture is a copy of plane 0 of that surface from now on; and the look that keeps it one */
 - (void)hkFollow:(void *)surface;
 - (void)hkFollowSurface;
 /* frame_dump: remember the surface of a texture over it; and what is known of either kind, for a line */
 - (void)hkRememberSurface:(void *)surface;
 - (size_t)hkDescribeSurface:(char *)out size:(size_t)size;
+/* census (hkCensus): how it was made, and what it holds at its centre as R G B A, or byte by byte if it is not BGRA */
+- (size_t)hkCensus:(char *)out size:(size_t)size centre:(uint8_t *)centre;
 /* M5b: the slices Metal counts in this texture, a cube's six in them; and one level and one slice
  * of it as a texture of its own, or nil on a library without views: how a pass's clear and resolve,
  * whose calls take no level, say which (air_metal.h). A depth plane is a slice of a 3D texture. */
@@ -1592,12 +1859,15 @@ enum {
 @end
 
 @interface HKMetalBuffer : HKMetalResource {
+	void *_wrapped;          /* newBufferWithBytesNoCopy: the caller's pages, and what gives them back */
+	void (^_wrappedGone)(void *, NSUInteger);
 	HKMetalDevice *_owner;
 	io_connect_t _gpu;        /* not owned: the device holds it */
 	uint32_t _handle;         /* set on the kernel path only */
 	uint64_t _iova;
 	void *_contents;
 	NSUInteger _length;
+	BOOL _neverKept;         /* has been an argument buffer (the pool of buffers) */
 	struct rwa_buffer *_mesa; /* set instead when the memory came from Mesa */
 	int _responsibleProcess;  /* what <MTLResourceSPI> calls the owner, for accounting */
 }
@@ -1605,6 +1875,8 @@ enum {
 - (instancetype)initWithDevice:(HKMetalDevice *)device
 			   gpu:(io_connect_t)gpu
 			length:(NSUInteger)length;
+- (void)hkWrap:(void *)bytes deallocator:(void (^)(void *, NSUInteger))deallocator;
+- (void)hkWrappedBack;
 @end
 
 @interface HKMetalFence : _MTLObjectWithLabel
@@ -1848,6 +2120,26 @@ hk_values_copy(id self, SEL cmd, void *zone)
 }
 
 /* One specialization: the function, and the values the module declares a place for. */
+/* (a module's or a set of constants' identity, within this process) */
+static uint64_t
+hk_bytes_hash(const void *bytes, size_t size)
+{
+	uint64_t h = 0xcbf29ce484222325ull ^ size;
+	const uint8_t *p = bytes;
+
+	for (; size >= 8; size -= 8, p += 8) {
+		uint64_t word;
+
+		memcpy(&word, p, 8);
+		h = (h ^ word) * 0x100000001b3ull;
+		h ^= h >> 29;
+	}
+	for (; size > 0; size--, p++) {
+		h = (h ^ *p) * 0x100000001b3ull;
+	}
+	return h;
+}
+
 static id
 hk_specialize(id library, id name, id values, NSError **error)
 {
@@ -1856,7 +2148,14 @@ hk_specialize(id library, id name, id values, NSError **error)
 	 * black when it succeeded: its pipeline took 2-3 s to make, and the poster extension that decodes the wallpaper is
 	 * killed by launchd at 5 s for hanging on launch. The file vt_decline answers nil again, for a comparison.
 	 */
-	if ([name isEqualToString:@"VTMTSComputeFunction"] && access("/hackios/share/probes/vt_decline", F_OK) == 0) {
+	/*
+	 * [M5g: the file vt_decline_sb declines it in SpringBoard alone, a probe: its one use there scales the screen for a
+	 * snapshot, 1125x2436 to 787x1705, and that one dispatch holds the GPU's one ring for 170 to 230 ms, once per app opened
+	 * or closed (run 212454). Served is what HEIC needs; the hitch needs the shader's own speed found (TODO, M5g).]
+	 */
+	if ([name isEqualToString:@"VTMTSComputeFunction"] && (access("/hackios/share/probes/vt_decline", F_OK) == 0 ||
+							       (strcmp(getprogname(), "SpringBoard") == 0 &&
+								access("/hackios/share/probes/vt_decline_sb", F_OK) == 0))) {
 		if (error != NULL) {
 			*error = [NSError errorWithDomain:@"MTLLibraryErrorDomain" code:3 userInfo:@{
 				NSLocalizedDescriptionKey: @"VideoToolbox's scaler is declined here" }];
@@ -1882,11 +2181,42 @@ hk_specialize(id library, id name, id values, NSError **error)
 	unsigned declared = 0;
 	char why[256] = { 0 };
 
-	if (air == nil || decls == NULL ||
-	    mesa.module_function_constants(NULL, [air bytes], [air length], decls, MOST_DECLS,
-					   &declared, why, sizeof(why)) != 0) {
-		rw_print("the function constants of %s cannot be read: %s\n", [name UTF8String], why);
-		declared = 0;
+	/*
+	 * What a module declares does not change: read once per module. VideoToolbox asks for its function again for every
+	 * transfer, and reading 464 KB of bitcode each time was most of the 10 s a thread of Photos' spent turning an HDR photo
+	 * (run 051210: 10238 ms of 12 s on one thread, air_module_read under this call).
+	 */
+	static struct { uint64_t hash; size_t size; struct rwa_function_constant_decl *decls; unsigned declared; } known[8];
+	static unsigned known_count;
+	const uint64_t air_hash = air != nil ? hk_bytes_hash([air bytes], [air length]) : 0;
+	bool remembered = false;
+
+	@synchronized([NSObject class]) {
+		for (unsigned k = 0; air != nil && decls != NULL && k < known_count && !remembered; k++) {
+			if (known[k].hash == air_hash && known[k].size == [air length]) {
+				memcpy(decls, known[k].decls, known[k].declared * sizeof(*decls));
+				declared = known[k].declared;
+				remembered = true;
+			}
+		}
+	}
+	if (!remembered) {
+		if (air == nil || decls == NULL ||
+		    mesa.module_function_constants(NULL, [air bytes], [air length], decls, MOST_DECLS,
+						   &declared, why, sizeof(why)) != 0) {
+			rw_print("the function constants of %s cannot be read: %s\n", [name UTF8String], why);
+			declared = 0;
+		} else {
+			@synchronized([NSObject class]) {
+				if (known_count < 8) {
+					known[known_count].hash = air_hash;
+					known[known_count].size = [air length];
+					known[known_count].decls = malloc(MAX(declared, 1) * sizeof(*decls));
+					memcpy(known[known_count].decls, decls, declared * sizeof(*decls));
+					known[known_count++].declared = declared;
+				}
+			}
+		}
 	}
 	NSMutableData *constants = [NSMutableData data];
 
@@ -2034,7 +2364,516 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 	return made;
 }
 
+/*
+ * M5g, WHERE A FRAME'S TIME GOES. With the file metal_stats, each process that commits says every 5 s
+ * what it did in that time, here and in the library (rwa_stats_read). It costs a few additions a
+ * command buffer, so that the numbers are the numbers of a run with the trace off.
+ */
+static struct {
+	_Atomic(uint64_t) commits, run_us, run_longest;
+	_Atomic(uint64_t) done, done_us, done_longest;
+	_Atomic(uint64_t) looks, look_bytes, look_us;
+	_Atomic(uint64_t) bytes_calls, imports, import_us, copied;
+	_Atomic(uint64_t) made, made_us;
+	_Atomic(uint64_t) biplanar, biplanar_us;   /* format 500 and 540 turned into RGB on the CPU (hkBiplanarTexture) */
+} hk_stat;
+
+/*
+ * With metal_stats, what this process holds of this driver's objects at this moment, beside its footprint (K40: the compositor
+ * growing to 1.5 GB, run 091520): flat here while the footprint climbs says the memory is held below this file. A texture's
+ * bytes are its pixels at 4 bytes each, mip levels and block sizes aside: a figure to watch, not an account.
+ */
+static struct {
+	_Atomic(int64_t) textures, texture_bytes, surfaces, surface_bytes, buffers, buffer_bytes;
+	_Atomic(int64_t) asked, refused_again, made_again;   /* render pipelines asked for, in all; see the memo there */
+	_Atomic(int64_t) pool_taken, pool_kept, pool_busy;              /* buffers that came from the pool below, and went into it */
+} hk_live;
+
+static uint64_t
+hk_now_us(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000000 + (uint64_t)t.tv_nsec / 1000;
+}
+
+static void
+hk_stat_most(_Atomic(uint64_t) *most, uint64_t value)
+{
+	uint64_t was = atomic_load(most);
+
+	while (value > was && !atomic_compare_exchange_weak(most, &was, value)) {
+	}
+}
+
+static bool
+hk_stats_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		on = access("/hackios/share/probes/metal_stats", F_OK) == 0;
+	}
+	return on != 0;
+}
+
+/* (an application's stdout goes nowhere) */
+static void
+hk_console_line(const char *line, size_t length)
+{
+	static int console = -2;
+
+	if (console == -2) {
+		console = open("/dev/console", O_WRONLY | O_NOCTTY);
+	}
+	if (console >= 0) {
+		(void)!write(console, line, length);
+	}
+}
+
+/*
+ * THE MEMORY'S ACCOUNT (K40): backboardd reaches hundreds of MB of footprint with far less than that in live textures and buffers (the
+ * counts in hk-live). With the file mem_account in share/probes, every sixth stats line, what the rest is: the footprint and the
+ * heap as the process has them; what the library and turnip hold (rwa_vk_memory: every BO by its name, as MB); and the process's
+ * dirty pages by VM tag, the biggest first. It walks the address space, so it is not for a row.
+ */
+static struct rwa_device *hk_memory_device;
+extern kern_return_t mach_vm_region_recurse(vm_map_read_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t,
+					    mach_msg_type_number_t *);
+
+static void
+hk_memory_say(void)
+{
+	static int on = -1;
+	static _Atomic(unsigned) every;
+	char line[700];
+
+	if (on < 0) {
+		on = access("/hackios/share/probes/mem_account", F_OK) == 0;
+	}
+	if (!on || hk_memory_device == NULL || mesa.vk_memory == NULL || atomic_fetch_add(&every, 1) % 6 != 0) {
+		return;
+	}
+
+	task_vm_info_data_t vm = { 0 };
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	malloc_statistics_t heap = { 0 };
+
+	(void)task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count);
+	malloc_zone_statistics(NULL, &heap);
+
+	int said = snprintf(line, sizeof(line), "hk-bo[%s %d]: footprint %llu MB, heap %llu MB in use of %llu; ", getprogname(), getpid(),
+			    (unsigned long long)(vm.phys_footprint >> 20), (unsigned long long)(heap.size_in_use >> 20),
+			    (unsigned long long)(heap.size_allocated >> 20));
+
+	said += mesa.vk_memory(hk_memory_device, line + said, sizeof(line) - (size_t)said);
+	hk_console_line(line, MIN((size_t)said, sizeof(line) - 1));
+
+	static uint64_t pages[256];
+	mach_vm_address_t address = 0;
+	mach_vm_size_t size = 0;
+	natural_t depth = 0;
+
+	memset(pages, 0, sizeof(pages));
+	for (;;) {
+		vm_region_submap_info_data_64_t info;
+
+		count = VM_REGION_SUBMAP_INFO_COUNT_64;
+		if (mach_vm_region_recurse(mach_task_self(), &address, &size, &depth, (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS) {
+			break;
+		}
+		if (info.is_submap) {
+			depth++;
+			continue;
+		}
+		pages[info.user_tag & 255] += info.pages_dirtied + info.pages_swapped_out;
+		address += size;
+	}
+	said = snprintf(line, sizeof(line), "hk-vm[%s %d]: dirty MB by tag:", getprogname(), getpid());
+	for (int shown = 0; shown < 8; shown++) {
+		int top = 0;
+
+		for (int i = 1; i < 256; i++) {
+			if (pages[i] > pages[top]) {
+				top = i;
+			}
+		}
+		if (pages[top] == 0 || (size_t)said >= sizeof(line)) {
+			break;
+		}
+		said += snprintf(line + said, sizeof(line) - (size_t)said, " %d:%llu", top, (unsigned long long)(pages[top] * vm_page_size >> 20));
+		pages[top] = 0;
+	}
+	hk_console_line(line, MIN((size_t)said, sizeof(line) - 1));
+}
+
+static void
+hk_stats_say(void)
+{
+	static _Atomic(uint64_t) last_at;
+	static uint64_t was[32], was_lib[RWA_STAT_COUNT];
+
+	if (!hk_stats_on()) {
+		return;
+	}
+	const uint64_t now = hk_now_us();
+	uint64_t at = atomic_load(&last_at);
+
+	if (at == 0) {
+		atomic_compare_exchange_strong(&last_at, &at, now);
+		return;
+	}
+	if (now - at < 5000000 || !atomic_compare_exchange_strong(&last_at, &at, now)) {
+		return;
+	}
+	uint64_t lib[RWA_STAT_COUNT] = { 0 }, d[RWA_STAT_COUNT];
+
+	if (mesa.stats_read != NULL) {
+		mesa.stats_read(lib, RWA_STAT_COUNT);
+	}
+	for (unsigned i = 0; i < RWA_STAT_COUNT; i++) {
+		d[i] = lib[i] - was_lib[i];
+		was_lib[i] = lib[i];
+	}
+#define HK_STAT_TAKE(index, field) ({ const uint64_t v_ = atomic_load(&hk_stat.field), r_ = v_ - was[index]; was[index] = v_; r_; })
+	const uint64_t commits = HK_STAT_TAKE(0, commits), run_us = HK_STAT_TAKE(1, run_us);
+	const uint64_t done = HK_STAT_TAKE(2, done), done_us = HK_STAT_TAKE(3, done_us);
+	const uint64_t looks = HK_STAT_TAKE(4, looks), look_bytes = HK_STAT_TAKE(5, look_bytes), look_us = HK_STAT_TAKE(6, look_us);
+	const uint64_t bytes_calls = HK_STAT_TAKE(7, bytes_calls), imports = HK_STAT_TAKE(8, imports);
+	const uint64_t import_us = HK_STAT_TAKE(9, import_us), copied = HK_STAT_TAKE(10, copied);
+	const uint64_t made = HK_STAT_TAKE(11, made), made_us = HK_STAT_TAKE(12, made_us);
+#undef HK_STAT_TAKE
+	const uint64_t run_most = atomic_exchange(&hk_stat.run_longest, 0), done_most = atomic_exchange(&hk_stat.done_longest, 0);
+
+	char line[640];
+	const int length = snprintf(line, sizeof(line), "hkmetal[%s %d]: %llu s in %llu ms: %llu commits, recording %llu us each (longest %llu), done %llu us after commit (longest %llu); "
+		 "%llu draws in %llu passes, %llu dispatches, %llu submits %llu us; passes ended by target %llu clear %llu layout %llu "
+		 "apart %llu (fetch %llu writes %llu shares %llu) copy %llu barrier %llu; %llu buffer copies %llu KB; %llu setBytes; %llu buffers %llu us; "
+		 "%llu pipelines %llu us, %llu functions made %llu us; %llu surfaces %llu us, %llu as copies; "
+		 "%llu looks at copies, %llu MB, %llu us; textures %llu made %llu us, %llu kept; %llu 420 on the CPU %llu us\n", getprogname(), getpid(), (unsigned long long)(now / 1000000),
+		 (unsigned long long)((now - at) / 1000), (unsigned long long)commits,
+		 (unsigned long long)(commits ? run_us / commits : 0), (unsigned long long)run_most,
+		 (unsigned long long)(done ? done_us / done : 0), (unsigned long long)done_most,
+		 (unsigned long long)d[RWA_STAT_DRAWS], (unsigned long long)d[RWA_STAT_PASSES],
+		 (unsigned long long)d[RWA_STAT_DISPATCHES], (unsigned long long)d[RWA_STAT_SUBMITS],
+		 (unsigned long long)(d[RWA_STAT_SUBMITS] ? d[RWA_STAT_SUBMIT_US] / d[RWA_STAT_SUBMITS] : 0),
+		 (unsigned long long)d[RWA_STAT_BREAK_TARGET], (unsigned long long)d[RWA_STAT_BREAK_CLEAR],
+		 (unsigned long long)d[RWA_STAT_BREAK_LAYOUT], (unsigned long long)d[RWA_STAT_BREAK_SHARED],
+		 (unsigned long long)d[RWA_STAT_APART_FETCH], (unsigned long long)d[RWA_STAT_APART_WRITES], (unsigned long long)d[RWA_STAT_APART_SHARES],
+		 (unsigned long long)d[RWA_STAT_BREAK_COPY], (unsigned long long)d[RWA_STAT_BREAK_BARRIER],
+		 (unsigned long long)d[RWA_STAT_COPIES], (unsigned long long)(d[RWA_STAT_COPY_BYTES] / 1024),
+		 (unsigned long long)bytes_calls, (unsigned long long)d[RWA_STAT_BUFFERS],
+		 (unsigned long long)d[RWA_STAT_BUFFER_US], (unsigned long long)d[RWA_STAT_PIPELINES],
+		 (unsigned long long)d[RWA_STAT_PIPELINE_US], (unsigned long long)made, (unsigned long long)made_us,
+		 (unsigned long long)imports, (unsigned long long)import_us, (unsigned long long)copied,
+		 (unsigned long long)looks, (unsigned long long)(look_bytes >> 20), (unsigned long long)look_us,
+		 (unsigned long long)d[RWA_STAT_TEXTURES], (unsigned long long)d[RWA_STAT_TEXTURE_US], (unsigned long long)d[RWA_STAT_TEXTURES_KEPT], (unsigned long long)atomic_exchange(&hk_stat.biplanar, 0), (unsigned long long)atomic_exchange(&hk_stat.biplanar_us, 0));
+
+	if (length > 0) {
+		hk_console_line(line, MIN((size_t)length, sizeof(line) - 1));
+		{
+			char live[260];
+			const int said = snprintf(live, sizeof(live), "hk-live[%s %d]: pool took %lld kept %lld busy %lld; pipelines asked %lld, refused again %lld, made again %lld; textures %lld, %lld MB; of surfaces %lld, %lld MB; buffers %lld, %lld MB\n",
+						  getprogname(), getpid(), (long long)atomic_load(&hk_live.pool_taken), (long long)atomic_load(&hk_live.pool_kept), (long long)atomic_load(&hk_live.pool_busy),
+						  (long long)atomic_load(&hk_live.asked),
+						  (long long)atomic_load(&hk_live.refused_again), (long long)atomic_load(&hk_live.made_again),
+						  (long long)atomic_load(&hk_live.textures),
+						  (long long)(atomic_load(&hk_live.texture_bytes) >> 20), (long long)atomic_load(&hk_live.surfaces),
+						  (long long)(atomic_load(&hk_live.surface_bytes) >> 20), (long long)atomic_load(&hk_live.buffers),
+						  (long long)(atomic_load(&hk_live.buffer_bytes) >> 20));
+
+			hk_console_line(live, MIN((size_t)said, sizeof(live) - 1));
+		}
+		hk_memory_say();
+	}
+}
+
+/*
+ * FUNCTION STITCHING (K37). CoreImage on Metal makes its kernels with -newLibraryWithStitchedDescriptor:error: out of library functions,
+ * ci_stdlib_stitchable's and its filters'; without it Metal refuses the descriptor, CoreImage logs that and every image it makes is empty,
+ * status fine (ci_gain, runs 033712-034446). A graph is compiled when a pipeline is asked of it (air_stitch_to_nir): a function of this
+ * library has no bitcode of its own to answer with. The classes are as measured on real Metal (a spy on this Mac, 2026-11-06): nodes in
+ * order, an argument one of MTLFunctionStitchingBuiltinThreadPositionInGrid, ...InputBufferAddress, ...InputTexture, ...InputSampler or a
+ * node of the same array, and an early return a node of its own (a class here, a flag on iOS 16.5's FunctionNodeSPI).
+ */
+@interface HKStitchedFunction : NSObject {
+@public
+	NSString *_name, *_label;
+	id _graph, _device;
+	NSArray *_functions;
+}
+@end
+
+@implementation HKStitchedFunction
++ (void)initialize
+{
+	Protocol *p = objc_getProtocol("MTLFunction");
+
+	if (p != NULL && !class_conformsToProtocol(self, p)) {
+		class_addProtocol(self, p);
+	}
+}
+- (void)dealloc
+{
+	[_name release];
+	[_label release];
+	[_graph release];
+	[_device release];
+	[_functions release];
+	[super dealloc];
+}
+- (NSString *)name { return _name; }
+- (NSString *)label { return _label; }
+- (void)setLabel:(NSString *)label { [_label release]; _label = [label copy]; }
+- (id)device { return _device; }
+- (NSUInteger)functionType { return 3; }   /* MTLFunctionTypeKernel */
+- (NSInteger)patchControlPointCount { return -1; }
+- (NSDictionary *)functionConstantsDictionary { return @{}; }
+/* (what else Metal or CoreImage asks of a function is said and answered with nothing, rather than an exception that ends the process) */
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector
+{
+	return [super methodSignatureForSelector:selector] ?: [NSMethodSignature signatureWithObjCTypes:"@@:"];
+}
+- (void)forwardInvocation:(NSInvocation *)invocation
+{
+	rw_print("a stitched function was asked %s: nothing\n", sel_getName([invocation selector]));
+	id none = nil;
+
+	[invocation setReturnValue:&none];
+}
+@end
+
+@interface HKStitchedLibrary : NSObject {
+@public
+	NSArray *_graphs, *_functions;
+	id _device;
+	NSString *_label;
+}
+@end
+
+@implementation HKStitchedLibrary
++ (void)initialize
+{
+	Protocol *p = objc_getProtocol("MTLLibrary");
+
+	if (p != NULL && !class_conformsToProtocol(self, p)) {
+		class_addProtocol(self, p);
+	}
+}
+- (void)dealloc
+{
+	[_graphs release];
+	[_functions release];
+	[_device release];
+	[_label release];
+	[super dealloc];
+}
+- (id)newFunctionWithName:(NSString *)name
+{
+	for (id graph in _graphs) {
+		if ([[graph functionName] isEqualToString:name]) {
+			HKStitchedFunction *function = [[HKStitchedFunction alloc] init];
+
+			function->_name = [name copy];
+			function->_graph = [graph retain];
+			function->_device = [_device retain];
+			function->_functions = [_functions retain];
+			return function;
+		}
+	}
+	return nil;
+}
+- (id)newFunctionWithName:(NSString *)name constantValues:(id)values error:(NSError **)error
+{
+	(void)values;
+	id function = [self newFunctionWithName:name];
+
+	if (function == nil && error != NULL) {
+		*error = [NSError errorWithDomain:@"HKMetal" code:1 userInfo:@{ NSLocalizedDescriptionKey: @"no such function in this stitched library" }];
+	}
+	return function;
+}
+- (id)newFunctionWithDescriptor:(id)descriptor error:(NSError **)error
+{
+	return [self newFunctionWithName:[descriptor name] constantValues:nil error:error];
+}
+- (NSArray *)functionNames
+{
+	NSMutableArray *names = [NSMutableArray array];
+
+	for (id graph in _graphs) {
+		[names addObject:[graph functionName]];
+	}
+	return names;
+}
+- (NSString *)label { return _label; }
+- (void)setLabel:(NSString *)label { [_label release]; _label = [label copy]; }
+- (id)device { return _device; }
+- (NSInteger)type { return 0; }   /* MTLLibraryTypeExecutable */
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector
+{
+	return [super methodSignatureForSelector:selector] ?: [NSMethodSignature signatureWithObjCTypes:"@@:"];
+}
+- (void)forwardInvocation:(NSInvocation *)invocation
+{
+	rw_print("a stitched library was asked %s: nothing\n", sel_getName([invocation selector]));
+	id none = nil;
+
+	[invocation setReturnValue:&none];
+}
+@end
+
+static NSUInteger hk_uint_of(id object, const char *name) { return ((NSUInteger (*)(id, SEL))objc_msgSend)(object, sel_getUid(name)); }
+static BOOL hk_bool_of(id object, const char *name) { return ((BOOL (*)(id, SEL))objc_msgSend)(object, sel_getUid(name)); }
+static id hk_object_of(id object, const char *name) { return ((id (*)(id, SEL))objc_msgSend)(object, sel_getUid(name)); }
+
 @implementation HKMetalDevice
+
+- (id)newLibraryWithStitchedDescriptor:(id)descriptor error:(NSError **)error
+{
+	if (mesa.compute_create_stitched == NULL) {
+		return [self fail:error with:@"the compiler library here has no rwa_compute_create_stitched: stitching is the Vulkan back end's"];
+	}
+	HKStitchedLibrary *library = [[HKStitchedLibrary alloc] init];
+
+	library->_graphs = [hk_object_of(descriptor, "functionGraphs") retain];
+	library->_functions = [hk_object_of(descriptor, "functions") retain];
+	library->_device = [self retain];
+	return library;
+}
+
+- (void)newLibraryWithStitchedDescriptor:(id)descriptor completionHandler:(void (^)(id, NSError *))handler
+{
+	NSError *error = nil;
+	id library = [self newLibraryWithStitchedDescriptor:descriptor error:&error];
+
+	handler(library, error);
+	[library release];
+}
+
+- (id)newLibraryWithStitchedDescriptor:(id)descriptor destinationBinaryArchive:(id)archive error:(NSError **)error
+{
+	(void)archive;
+	return [self newLibraryWithStitchedDescriptor:descriptor error:error];
+}
+
+- (id)newLibraryWithStitchedDescriptorSPI:(id)descriptor error:(NSError **)error
+{
+	return [self newLibraryWithStitchedDescriptor:descriptor error:error];
+}
+
+/* The graph as rwa_compute_create_stitched wants it, by its classes, and the pipeline. */
+- (id)pipelineForStitched:(HKStitchedFunction *)function descriptor:(id)descriptor error:(NSError **)error
+{
+	NSArray *nodes = hk_object_of(function->_graph, "nodes");
+	const unsigned count = (unsigned)[nodes count];
+	struct rwa_stitch_node *out = calloc(MAX(count, 1), sizeof(*out));
+	NSMutableArray *keep = [NSMutableArray array];
+	NSString *refused = nil;
+	Class early = objc_getClass("MTLFunctionStitchingEarlyReturnNode"), address = objc_getClass("MTLFunctionStitchingInputBufferAddress");
+	Class buffer = objc_getClass("MTLFunctionStitchingInputBuffer"), texture = objc_getClass("MTLFunctionStitchingInputTexture");
+	Class sampler = objc_getClass("MTLFunctionStitchingInputSampler"), grid = objc_getClass("MTLFunctionStitchingBuiltinThreadPositionInGrid");
+	Class group = objc_getClass("MTLFunctionStitchingBuiltinThreadPositionInThreadgroup"), call = objc_getClass("MTLFunctionStitchingFunctionNode");
+
+	for (unsigned n = 0; n < count && refused == nil; n++) {
+		id node = nodes[n];
+		NSArray *arguments = hk_object_of(node, "arguments");
+		const unsigned given = (unsigned)[arguments count];
+		struct rwa_stitch_input *inputs = calloc(MAX(given, 1), sizeof(*inputs));
+
+		[keep addObject:[NSData dataWithBytesNoCopy:inputs length:MAX(given, 1) * sizeof(*inputs) freeWhenDone:YES]];
+		out[n].inputs = inputs;
+		out[n].num_inputs = given;
+		out[n].early_return = (early != Nil && [node isKindOfClass:early]) ||
+				      ([node respondsToSelector:sel_getUid("isEarlyReturn")] && hk_bool_of(node, "isEarlyReturn"));
+		NSString *name = hk_object_of(node, "name");
+
+		/* (iOS 16.5: an early return is a function's node with a flag, and its own call; a Mac today has it as a node of no name over another) */
+		if ([name length] != 0) {
+			out[n].name = [name UTF8String];
+			[keep addObject:name];
+			for (id candidate in function->_functions) {
+				if ([[candidate name] isEqualToString:name] && [candidate respondsToSelector:sel_getUid("bitcodeData")]) {
+					NSData *air = hk_object_of(candidate, "bitcodeData");
+
+					[keep addObject:air];
+					out[n].bitcode = [air bytes];
+					out[n].size = [air length];
+					break;
+				}
+			}
+			if (out[n].bitcode == NULL) {
+				refused = [NSString stringWithFormat:@"the stitched graph calls %@, which the descriptor's functions have no bitcode of", name];
+			}
+		}
+		for (unsigned a = 0; a < given && refused == nil; a++) {
+			id argument = arguments[a];
+
+			if (grid != Nil && [argument isKindOfClass:grid]) {
+				inputs[a].kind = 0;
+			} else if (group != Nil && [argument isKindOfClass:group]) {
+				inputs[a].kind = 1;
+			} else if (address != Nil && [argument isKindOfClass:address]) {
+				inputs[a].kind = hk_bool_of(argument, "dereference") ? 2 : 3;
+				inputs[a].bind = (unsigned)hk_uint_of(argument, "bindIndex");
+				inputs[a].offset = (unsigned)hk_uint_of(argument, "byteOffset");
+			} else if (buffer != Nil && [argument isKindOfClass:buffer]) {
+				inputs[a].kind = 3;
+				inputs[a].bind = (unsigned)hk_uint_of(argument, "bindIndex");
+			} else if (texture != Nil && [argument isKindOfClass:texture]) {
+				inputs[a].kind = 4;
+				inputs[a].bind = (unsigned)hk_uint_of(argument, "bindIndex");
+			} else if (sampler != Nil && [argument isKindOfClass:sampler]) {
+				inputs[a].kind = 5;
+				inputs[a].bind = (unsigned)hk_uint_of(argument, "bindIndex");
+			} else if (call != Nil && [argument isKindOfClass:call]) {
+				const NSUInteger at = [nodes indexOfObjectIdenticalTo:argument];
+
+				inputs[a].kind = 6;
+				inputs[a].node = (unsigned)(at != NSNotFound ? at : [nodes indexOfObject:argument]);
+				if (inputs[a].node >= n) {
+					refused = [NSString stringWithFormat:@"argument %u of stitched node %u is not an earlier node", a, n];
+				}
+			} else {
+				refused = [NSString stringWithFormat:@"argument %u of stitched node %u is a %s, which this does not read", a, n, class_getName([argument class])];
+			}
+		}
+	}
+	id state = nil;
+
+	if (refused != nil) {
+		state = [self fail:error with:refused];
+	} else {
+		char why[512] = { 0 };
+		struct rwa_compute_info info = { 0 };
+		const CFAbsoluteTime began = CFAbsoluteTimeGetCurrent();
+		struct rwa_compute *compute = mesa.compute_create_stitched(_mesa, [function->_name UTF8String], out, count, &info, why, sizeof(why));
+
+		if (CFAbsoluteTimeGetCurrent() - began > 0.25 || compute == NULL) {
+			rw_print("stitched compute %s took %.1f s to make: %s\n", [function->_name UTF8String], CFAbsoluteTimeGetCurrent() - began, compute != NULL ? "made" : why);
+		}
+		/* (a refused graph as this read it, the first few: what the frontend's sentence is about) */
+		static unsigned graphs_told;
+
+		if (compute == NULL && graphs_told++ < 3) {
+			for (unsigned n = 0; n < count; n++) {
+				char line[300];
+				int at = snprintf(line, sizeof(line), "  node %u %s %s%s:", n, class_getName([nodes[n] class]), out[n].name != NULL ? out[n].name : "(none)", out[n].early_return ? " early return" : "");
+
+				for (unsigned a = 0; a < out[n].num_inputs && at < 240; a++) {
+					at += snprintf(line + at, sizeof(line) - (size_t)at, " %u/%u/%u/%u", out[n].inputs[a].kind, out[n].inputs[a].bind, out[n].inputs[a].offset, out[n].inputs[a].node);
+				}
+				rw_print("%s\n", line);
+			}
+		}
+		state = compute == NULL ? [self fail:error with:[NSString stringWithUTF8String:why]]
+					: [[HKMetalComputePipeline alloc] initWithHKDevice:self compute:compute info:&info descriptor:descriptor];
+	}
+	free(out);
+	return state;
+}
+
 
 + (void)load
 {
@@ -2076,6 +2915,7 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 		char why[256] = { 0 };
 
 		_mesa = mesa.device_open(why, sizeof(why));
+		hk_memory_device = _mesa;
 		rw_print("the compiler library %s\n",
 		         _mesa != NULL ? mesa.device_name(_mesa) : why);
 		/* A command buffer is this driver's unit of completion (-commit), so a draw does
@@ -2434,14 +3274,66 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 		rw_print("%s\n", line);
 	}
 
+	/*
+	 * What is asked for again. A specification refused once is refused again, and whoever asked asks at every draw: VectorKit's
+	 * GlowAlpha and PatternedRibbon, framebuffer fetch at 4 samples, about 15 tries a frame at 0.6 ms each, on Maps' main thread,
+	 * up to 1.4 s in 5 s while a finger moves it (run 093635, the owner: 「不跟手」). So the sentence is kept and given again.
+	 * The same count for what was made says whether keeping those too is worth doing.
+	 */
+	static NSMutableDictionary *asked_before;
+	static int no_memo = -1;   /* (the file pipeline_no_memo in share/probes: the sentence not kept, only counted, to compare) */
+	NSString *memo;
+	{
+		struct rwa_render_shape plain = shape;
+
+		plain.vertex_constants = NULL;
+		plain.fragment_constants = NULL;
+		memo = [NSString stringWithFormat:@"%@ %@ %zu %zu %llx %llx %llx", [vertex name], [fragment name], (size_t)[vertex_air length],
+			(size_t)[fragment_air length], (unsigned long long)hk_bytes_hash(&plain, sizeof(plain)),
+			(unsigned long long)(shape.vertex_constants != NULL ? hk_bytes_hash(shape.vertex_constants, shape.vertex_constant_count * sizeof(*shape.vertex_constants)) : 0),
+			(unsigned long long)(shape.fragment_constants != NULL ? hk_bytes_hash(shape.fragment_constants, shape.fragment_constant_count * sizeof(*shape.fragment_constants)) : 0)];
+	}
+	atomic_fetch_add(&hk_live.asked, 1);
+	@synchronized([HKMetalDevice class]) {
+		NSString *before = [asked_before objectForKey:memo];
+
+		if (no_memo < 0) {
+			no_memo = access("/hackios/share/probes/pipeline_no_memo", F_OK) == 0;
+		}
+		if (before != nil && [before length] > 0) {
+			atomic_fetch_add(&hk_live.refused_again, 1);
+			if (!no_memo) {
+				return [self fail:error with:before];
+			}
+		}
+		if (before != nil && [before length] == 0) {
+			atomic_fetch_add(&hk_live.made_again, 1);
+		}
+	}
+
 	char why[512] = { 0 };
 	struct rwa_render_info info = { 0 };
+	const uint64_t made_began = hk_now_us();
 	struct rwa_render *render = mesa.render_create(_mesa,
 	    vertex_air != nil ? [vertex_air bytes] : NULL,
 	    vertex_air != nil ? [vertex_air length] : 0,
 	    vertex != nil ? [[vertex name] UTF8String] : NULL,
 	    [fragment_air bytes], [fragment_air length], [[fragment name] UTF8String],
 	    &shape, &info, why, sizeof(why));
+
+	const uint64_t made_took = hk_now_us() - made_began;
+
+	atomic_fetch_add(&hk_stat.made, 1);
+	atomic_fetch_add(&hk_stat.made_us, made_took);
+	/* which ones a window's "functions made" is (a stutter is one of these on whoever asked), with the file metal_stats */
+	if (made_took >= 20000 && hk_stats_on()) {
+		char slow[300];
+		const int said = snprintf(slow, sizeof(slow), "hk-slow[%s %d]: %llu ms for the render pipeline of %s and %s (%s)", getprogname(), getpid(),
+					  (unsigned long long)(made_took / 1000), vertex != nil ? [[vertex name] UTF8String] : "no vertex stage",
+					  [[fragment name] UTF8String], render != NULL ? "made" : "refused");
+
+		hk_console_line(slow, MIN((size_t)said, sizeof(slow) - 1));
+	}
 
 	if (render == NULL) {
 		/* PRINTED as well as returned, and RW_AGAIN because the same specification
@@ -2455,7 +3347,23 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 		RW_AGAIN("this render pipeline is refused (%s, %s, %u fragment constants): %s\n",
 			 [[vertex name] UTF8String] ?: "no vertex function", [[fragment name] UTF8String] ?: "?",
 			 shape.fragment_constant_count, why);
+		@synchronized([HKMetalDevice class]) {
+			if (asked_before == nil) {
+				asked_before = [[NSMutableDictionary alloc] init];
+			}
+			if ([asked_before count] < 1024) {
+				[asked_before setObject:[NSString stringWithUTF8String:why] forKey:memo];
+			}
+		}
 		return [self fail:error with:[NSString stringWithUTF8String:why]];
+	}
+	@synchronized([HKMetalDevice class]) {
+		if (asked_before == nil) {
+			asked_before = [[NSMutableDictionary alloc] init];
+		}
+		if ([asked_before count] < 1024) {
+			[asked_before setObject:@"" forKey:memo];
+		}
 	}
 	/* and what the library made of it, in GALLIUM's bits: for any mask but All, None,
 	 * green|blue and red|alpha these nibbles must DIFFER from the writeMask printed
@@ -2661,6 +3569,15 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 		.sample_count = (unsigned)[descriptor sampleCount],
 		.usage = (unsigned)[descriptor usage],
 	};
+	static unsigned multisampled_told;
+
+	if (shape.sample_count > 1 && multisampled_told < 6) {
+		multisampled_told++;
+		char told[160];     /* (to the console: an application's stdout goes nowhere, and Maps' is the one wanted) */
+		const int length = snprintf(told, sizeof(told), "hkmetal[%s]: a multisampled texture: %ux%u format %u, %u samples, storage mode %u, usage %#x\n", getprogname(), shape.width, shape.height, shape.pixel_format, shape.sample_count, (unsigned)[descriptor storageMode], shape.usage);
+
+		hk_console_line(told, MIN((size_t)length, sizeof(told) - 1));
+	}
 	hk_note_packed16("descriptor", shape.pixel_format, shape.usage, [descriptor swizzle], NULL, NULL);
 	struct rwa_texture *texture = mesa.texture_create(_mesa, &shape, why, sizeof(why));
 
@@ -3090,6 +4007,9 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 					     @"was not started (gpu=1) or libhackiosair.dylib "
 					     @"is missing"];
 	}
+	if ([function isKindOfClass:[HKStitchedFunction class]]) {
+		return [self pipelineForStitched:function descriptor:descriptor error:error];
+	}
 	if (![function respondsToSelector:bitcode]) {
 		return [self fail:error with:@"this function does not answer bitcodeData, so its "
 					     @"AIR cannot be read"];
@@ -3124,6 +4044,24 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 			rw_print("%s\n", line);
 		}
 	}
+	/*
+	 * The same function with the same constants is the same pipeline: VideoToolbox makes one per transfer and frees it after, where real
+	 * Metal's own cache answers (run 051210: 39-83 dispatches and as many pipelines in every 5 s). Kept for the process's life, and only these.
+	 */
+	static NSMutableDictionary *kept_pipelines;
+	NSString *kept_key = constants_given
+	    ? [NSString stringWithFormat:@"%@ %zu %llx %u %llx", [function name], (size_t)[air length], (unsigned long long)hk_bytes_hash([air bytes], [air length]), constant_count,
+				(unsigned long long)hk_bytes_hash(constants, constant_count * sizeof(*constants))] : nil;
+
+	if (kept_key != nil) {
+		@synchronized([NSObject class]) {
+			id kept = [kept_pipelines objectForKey:kept_key];
+
+			if (kept != nil) {
+				return [kept retain];
+			}
+		}
+	}
 	const CFAbsoluteTime compute_began = CFAbsoluteTimeGetCurrent();
 	struct rwa_compute *compute = constants_given
 	    ? mesa.compute_create_constants(_mesa, [air bytes], [air length],
@@ -3140,10 +4078,22 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 		 * which construct it refused, and an application can act on that. */
 		return [self fail:error with:[NSString stringWithUTF8String:why]];
 	}
-	return [[HKMetalComputePipeline alloc] initWithHKDevice:self
-								 compute:compute
-								    info:&info
-							      descriptor:descriptor];
+	id made = [[HKMetalComputePipeline alloc] initWithHKDevice:self
+							   compute:compute
+							      info:&info
+							descriptor:descriptor];
+
+	if (kept_key != nil && made != nil) {
+		@synchronized([NSObject class]) {
+			if (kept_pipelines == nil) {
+				kept_pipelines = [[NSMutableDictionary alloc] init];
+			}
+			if ([kept_pipelines count] < 256) {
+				[kept_pipelines setObject:made forKey:kept_key];
+			}
+		}
+	}
+	return made;
 }
 
 - (id)fail:(NSError **)error with:(NSString *)reason
@@ -3322,20 +4272,153 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
  * whose -texture is nil, and the application finds out later and somewhere else.
  */
 /* A surface as a texture of its own, which goes on being copied when the surface changes (hkFollowSurface). */
+/*
+ * DRAWN AND PUT BACK (M5g, the owner: 「applibrary這裡沒有bg」). A surface somebody made with rows this GPU cannot draw (a 1125x2436 of 4512 bytes a row, run 000352, not a multiple of
+ * 64: "no drawable", and what the App Library blurs stayed black). Its rows are its maker's: making them wider in the kernel sheared what its maker went on writing at the width it
+ * asked for (a 120x120 asked at 480 and given 512: Maps' Multi-Stop Routing icon, runs 002126 and 002349). So a texture of this process's own to draw into, and the same one, this surface's
+ * only one here, whatever this process asks of the surface and in whichever order (a read first was a second texture that never saw the draws once they stopped: App Library black, run 010556); and for anybody else what it holds goes into the surface, at the surface's rows, at once after a draw
+ * that follows a rest and a second after the last of a run of draws (hkPutBackSoon).
+ */
+- (id)hkDrawnBackTexture:(const struct rwa_texture_shape *)shape surface:(void *)s descriptor:(MTLTextureDescriptor *)d
+{
+	MTLTextureDescriptor *plain =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)shape->pixel_format
+							       width:shape->width height:shape->height
+							   mipmapped:NO];
+	[plain setUsage:shape->usage];
+	id made = [self newTextureWithDescriptor:plain];
+
+	if (made == nil) {
+		return nil;
+	}
+	[made hkDrawBackTo:s];
+	return hk_with_descriptor_swizzle(made, d);
+}
+
+/*
+ * A PLANE, BY ITS BYTES (hkdrawable.m), where the GPU cannot have it in place: a 16-byte texel wants rows of 256, and a
+ * surface's rows are its maker's. VideoToolbox makes such a texture for one transfer, and waits for it: so its bytes come
+ * over when it is made and go back before the work is said to be done (hkDrawBack), a CPU copy each way.
+ */
+- (id)hkPlaneTexture:(const struct rwa_texture_shape *)shape surface:(void *)s plane:(NSUInteger)p descriptor:(MTLTextureDescriptor *)d
+{
+	struct rwd_plane where;
+	unsigned bytes_per_pixel = 0;
+	char unused[256];
+
+	if (rwd_plane_of(s, p, &where) != 0 || shape->height != where.height || rwd_format_of_metal(shape->pixel_format, NULL, &bytes_per_pixel, unused, sizeof(unused)) != 0 ||
+	    (uint64_t)shape->width * bytes_per_pixel > where.row) {
+		return nil;
+	}
+	MTLTextureDescriptor *plain =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)shape->pixel_format
+							       width:shape->width height:shape->height
+							   mipmapped:NO];
+	[plain setUsage:shape->usage];
+	id made = [self newTextureWithDescriptor:plain];
+
+	if (made == nil) {
+		return nil;
+	}
+	[made hkStandInForPlane:p of:s];
+	return hk_with_descriptor_swizzle(made, d);
+}
+
 - (id)hkCopiedTexture:(const struct rwa_texture_shape *)shape surface:(void *)s descriptor:(MTLTextureDescriptor *)d
 {
 	MTLTextureDescriptor *plain =
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)shape->pixel_format
 							       width:shape->width height:shape->height
 							   mipmapped:NO];
-	[plain setUsage:MTLTextureUsageShaderRead];
+	/* (one that may yet be asked to be drawn into, if the format has it: DRAWN AND PUT BACK) */
+	[plain setUsage:MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget];
 	id made = [self newTextureWithDescriptor:plain];
 
+	if (made == nil) {
+		[plain setUsage:MTLTextureUsageShaderRead];
+		made = [self newTextureWithDescriptor:plain];
+	}
 	if (made == nil) {
 		return nil;
 	}
 	[made hkFollow:s];
+	[made hkStandInFor:s];
 	return hk_with_descriptor_swizzle(made, d);
+}
+
+/* A sample of a 420 surface's lines, to tell one picture from another; numbers only, no picture leaves the phone */
+static uint64_t
+hk_420_sum(const uint8_t *y, size_t ys, NSUInteger w, NSUInteger h)
+{
+	uint64_t sum = 1469598103934665603ULL;
+
+	for (NSUInteger j = 0; j < h; j += 8) {
+		const uint8_t *line = y + j * ys;
+
+		for (NSUInteger i = 0; i < w; i += 8) {
+			sum = (sum ^ line[i]) * 1099511628211ULL;
+		}
+	}
+	return sum;
+}
+
+/*
+ * One line of a 420 surface in RGBA, BT.601 as below, in 16-bit fixed point (6 bits of fraction): a picture of 1.7
+ * million pixels every frame, where the floats of the first copy took 51 ms. Chroma centred up and down only, 3/4 of
+ * the near row and 1/4 of the far.
+ */
+static void
+hk_420_line(const uint8_t *yl, const uint8_t *near, const uint8_t *far, NSUInteger w, bool video, uint8_t *out)
+{
+	NSUInteger i = 0;
+
+	for (; i + 16 <= w; i += 16) {
+		const uint8x8x2_t n = vld2_u8(near + i), f = vld2_u8(far + i);
+		int16x8_t cb = vreinterpretq_s16_u16(vmovl_u8(vrhadd_u8(n.val[0], vrhadd_u8(n.val[0], f.val[0]))));
+		int16x8_t cr = vreinterpretq_s16_u16(vmovl_u8(vrhadd_u8(n.val[1], vrhadd_u8(n.val[1], f.val[1]))));
+		const uint8x16_t yy = vld1q_u8(yl + i);
+		int16x8_t y0, y1;
+
+		cb = vsubq_s16(cb, vdupq_n_s16(128));
+		cr = vsubq_s16(cr, vdupq_n_s16(128));
+		if (video) {
+			const uint8x16_t over = vqsubq_u8(yy, vdupq_n_u8(16));
+
+			cb = vshrq_n_s16(vmulq_n_s16(cb, 73), 6);
+			cr = vshrq_n_s16(vmulq_n_s16(cr, 73), 6);
+			y0 = vreinterpretq_s16_u16(vmull_u8(vget_low_u8(over), vdup_n_u8(74)));
+			y1 = vreinterpretq_s16_u16(vmull_u8(vget_high_u8(over), vdup_n_u8(74)));
+		} else {
+			y0 = vreinterpretq_s16_u16(vshll_n_u8(vget_low_u8(yy), 6));
+			y1 = vreinterpretq_s16_u16(vshll_n_u8(vget_high_u8(yy), 6));
+		}
+		const int16x8_t ro = vmulq_n_s16(cr, 90), bo = vmulq_n_s16(cb, 113);
+		const int16x8_t go = vnegq_s16(vaddq_s16(vmulq_n_s16(cb, 22), vmulq_n_s16(cr, 46)));
+		const int16x8x2_t r2 = vzipq_s16(ro, ro), g2 = vzipq_s16(go, go), b2 = vzipq_s16(bo, bo);
+		uint8x16x4_t px;
+
+		px.val[0] = vcombine_u8(vqrshrun_n_s16(vqaddq_s16(y0, r2.val[0]), 6), vqrshrun_n_s16(vqaddq_s16(y1, r2.val[1]), 6));
+		px.val[1] = vcombine_u8(vqrshrun_n_s16(vqaddq_s16(y0, g2.val[0]), 6), vqrshrun_n_s16(vqaddq_s16(y1, g2.val[1]), 6));
+		px.val[2] = vcombine_u8(vqrshrun_n_s16(vqaddq_s16(y0, b2.val[0]), 6), vqrshrun_n_s16(vqaddq_s16(y1, b2.val[1]), 6));
+		px.val[3] = vdupq_n_u8(255);
+		vst4q_u8(out + i * 4, px);
+	}
+	for (; i < w; i++) {
+		const NSUInteger x = i / 2 * 2;
+		int cb = (3 * near[x] + far[x] + 2) / 4 - 128, cr = (3 * near[x + 1] + far[x + 1] + 2) / 4 - 128;
+		int l = video ? ((int)yl[i] > 16 ? (yl[i] - 16) * 74 : 0) : yl[i] * 64;
+
+		if (video) {
+			cb = cb * 73 / 64;
+			cr = cr * 73 / 64;
+		}
+		const int rgb[3] = { (l + 90 * cr + 32) >> 6, (l - 22 * cb - 46 * cr + 32) >> 6, (l + 113 * cb + 32) >> 6 };
+
+		for (unsigned k = 0; k < 3; k++) {
+			out[i * 4 + k] = rgb[k] < 0 ? 0 : rgb[k] > 255 ? 255 : (uint8_t)rgb[k];
+		}
+		out[i * 4 + 3] = 255;
+	}
 }
 
 /*
@@ -3343,8 +4426,10 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
  * the stock wallpaper's Head.HEIC decodes to one, and without it the layer's mask is what shows, as a
  * red shape. A texture of one format over two planes needs a VkSamplerYcbcrConversion in an immutable
  * sampler, which no pipeline here can know it needs when it is made. So this texture is a copy, made
- * once when the surface is asked for, with the chroma interpolated. A surface that goes on changing (a
- * video) does not go on changing here: that is the limit.
+ * when the surface is asked for, with the chroma interpolated, and made again when the surface's seed
+ * has moved and the texture is about to be drawn with (hkBiplanarLook). Once only, a pool's surfaces
+ * came round for ever as the pictures they first held: the camera's preview, a ring of four (K38,
+ * 「相机预览还是loop」). The file biplanar_once in share/probes puts that back, to compare.
  *
  * In RGB, not YCbCr: the pipeline CoreAnimation draws it with, PBGRABsapXm_TimgA2S1Xhf_Ixrg, has no matrix
  * in it (fc_has_ycbcr_matrix is not set), so sampling this format on Apple's GPU answers colours already.
@@ -3355,6 +4440,7 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
  */
 - (id)hkBiplanarTexture:(MTLTextureDescriptor *)d surface:(void *)s raw:(BOOL)raw
 {
+	const uint64_t biplanar_began = hk_now_us();
 	int (*lock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
 	int (*unlock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
 	size_t (*planes)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
@@ -3431,12 +4517,20 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 	free(rgba);
 	RW_ONCE("a 420 surface %lux%lu read into RGB: rows %zu and %zu, at the middle Y Cb Cr %u %u %u\n",
 		 (unsigned long)w, (unsigned long)h, ys, uvs, y[h / 2 * ys + w / 2], uv[h / 4 * uvs + w / 2], uv[h / 4 * uvs + w / 2 + 1]);
+	if (!raw) {
+		uint32_t (*seed_of)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetSeed");
+
+		[made hkBiplanarOf:s seed:seed_of != NULL ? seed_of(s) : 0 sum:hk_420_sum(y, ys, w, h)];
+	}
 	unlock(s, 1, NULL);
+	atomic_fetch_add(&hk_stat.biplanar, 1);
+	atomic_fetch_add(&hk_stat.biplanar_us, hk_now_us() - biplanar_began);
 	return made;
 }
 
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p
 {
+	const uint64_t import_began = hk_now_us();
 	char why[512] = { 0 };
 	struct rwd_surface took;
 	struct rwa_texture_shape shape;   /* this file's own declaration; rwd_texture_shape is the
@@ -3459,6 +4553,22 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 	shape.sample_count = (unsigned)[d sampleCount];
 	shape.usage = (unsigned)[d usage];
 	hk_note_packed16("iosurface", shape.pixel_format, shape.usage, [d swizzle], NULL, s);
+	if (p == 0) {
+		/* (DRAWN AND PUT BACK: this surface already has its one texture in this process, a copy that follows it or a stand-in) */
+		@synchronized([HKMetalTexture class]) {
+			for (unsigned i = 0; i < 64; i++) {
+				if (hk_stand_ins[i].surface == s && [hk_stand_ins[i].texture pixelFormat] == shape.pixel_format) {
+					if ((shape.usage & MTLTextureUsageRenderTarget) && ([hk_stand_ins[i].texture usage] & MTLTextureUsageRenderTarget)) {
+						[hk_stand_ins[i].texture hkStartDrawingBack];
+						return [hk_stand_ins[i].texture retain];
+					}
+					if (!(shape.usage & MTLTextureUsageRenderTarget)) {
+						return [hk_stand_ins[i].texture retain];
+					}
+				}
+			}
+		}
+	}
 	if (shape.pixel_format == 500 && p == 0) {
 		return [self hkBiplanarTexture:d surface:s raw:NO];
 	}
@@ -3516,7 +4626,7 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 				seen[count++].fourcc = fourcc;
 			}
 		}
-		if (is_new && hk_tracing()) {
+		if (is_new && (hk_tracing() || p != 0 || (shape.usage & MTLTextureUsageShaderWrite))) {
 			rw_print("iosurface import: format %u plane %lu %ux%u usage %#x fourcc %c%c%c%c\n",
 				 shape.pixel_format, p, shape.width, shape.height, shape.usage,
 				 (int)(fourcc >> 24 & 0xff), (int)(fourcc >> 16 & 0xff), (int)(fourcc >> 8 & 0xff),
@@ -3537,7 +4647,22 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 
 		if (copied != nil) {
 			RW_ONCE("a surface read as a copy: %s\n", why);
+			atomic_fetch_add(&hk_stat.copied, 1);
 			return copied;
+		}
+		id back = p == 0 && (shape.usage & MTLTextureUsageRenderTarget) && !(shape.usage & MTLTextureUsageShaderWrite) && shape.mip_levels <= 1 && shape.sample_count <= 1
+		    ? [self hkDrawnBackTexture:&shape surface:s descriptor:d] : nil;
+
+		if (back != nil) {
+			RW_ONCE("a surface drawn into through a texture of its own and put back: %s\n", why);
+			return back;
+		}
+		id plane_copy = shape.mip_levels <= 1 && shape.sample_count <= 1 && !(shape.usage & MTLTextureUsageRenderTarget)
+		    ? [self hkPlaneTexture:&shape surface:s plane:p descriptor:d] : nil;
+
+		if (plane_copy != nil) {
+			RW_ONCE("a plane read and written through a texture of its own: %s\n", why);
+			return plane_copy;
 		}
 		RW_AGAIN("no drawable: %s\n", why);
 		return nil;
@@ -3546,9 +4671,11 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 									   texture:texture
 									     shape:&shape];
 
-	if (hk_frame_dumping()) {
+	if (hk_frame_dumping() || access("/hackios/share/probes/census", F_OK) == 0) {
 		[over hkRememberSurface:s];
 	}
+	atomic_fetch_add(&hk_stat.imports, 1);
+	atomic_fetch_add(&hk_stat.import_us, hk_now_us() - import_began);
 	return hk_with_descriptor_swizzle(over, d);
 }
 - (id)newBufferWithIOSurface:(void *)surface        { (void)surface; return nil; }
@@ -3557,8 +4684,19 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 		       options:(NSUInteger)options
 		   deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-	(void)bytes; (void)length; (void)options; (void)deallocator;
-	return nil;   /* wrapping the caller's own pages needs the kernel to map them: not yet */
+	/*
+	 * The caller's own pages are not the GPU's here (the kernel would have to map them), so this is a buffer of ours with the caller's bytes copied in, and what
+	 * the GPU writes through a texture over it or as a compute buffer copied back before the work is said to be done (hkDrawBack). Nil was CoreImage's blank image
+	 * whenever a bitmap came to whole pages: it renders straight into such memory (128x128, 256x256, 512x512, 1024x768 empty and the others right, run 051210).
+	 */
+	HKMetalBuffer *buffer = [self newBufferWithLength:length options:options];
+
+	if (buffer == nil) {
+		return nil;
+	}
+	memcpy([buffer contents], bytes, length);
+	[buffer hkWrap:bytes deallocator:deallocator];
+	return buffer;
 }
 - (id)newIndirectCommandBufferWithDescriptor:(id)d
 			      maxCommandCount:(NSUInteger)count
@@ -3734,6 +4872,33 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 	return [[HKMetalBuffer alloc] initWithDevice:self gpu:_gpu length:length];
 }
 
+- (id)hkTakeBytesChunk
+{
+	id chunk = nil;
+
+	@synchronized (self) {
+		if ([_bytesChunks count] != 0) {
+			chunk = [[_bytesChunks lastObject] retain];
+			[_bytesChunks removeLastObject];
+		}
+	}
+	return chunk != nil ? chunk : [self newBufferWithLength:RW_BYTES_CHUNK options:0];
+}
+
+- (void)hkGiveBackBytesChunks:(NSArray *)chunks
+{
+	@synchronized (self) {
+		if (_bytesChunks == nil) {
+			_bytesChunks = [[NSMutableArray alloc] init];
+		}
+		for (id chunk in chunks) {
+			if ([_bytesChunks count] < RW_BYTES_CHUNKS_KEPT) {
+				[_bytesChunks addObject:chunk];
+			}
+		}
+	}
+}
+
 - (id)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(NSUInteger)options
 {
 	HKMetalBuffer *buffer = [self newBufferWithLength:length options:options];
@@ -3753,7 +4918,143 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 
 @end
 
+/*
+ * BUFFERS KEPT FOR THE NEXT ONE. Each buffer here is its own VkDeviceMemory, mapped: about 0.5 ms to make, and with a map's tiles
+ * coming in Maps makes up to 1900 in 5 s, about a second of its main thread, 70% of them let go again soon after (run 104515, K35;
+ * 「不跟手」). So small ones are kept by size, oldest first, and given again zeroed, as a new one is. A buffer let go of may
+ * still be in the GPU's hands, so the oldest is given again only when the library says the work that last named it has finished
+ * (rwa_buffer_busy: what it frees by), and otherwise a new one is made, with no waiting. Not one that has been an argument
+ * buffer: the library keeps records of those that only destroying forgets. A member of an argument buffer let go of stays in that
+ * record, alive; only a draw through a member the application has released could see the next user's bytes.
+ * The file buffer_no_pool in share/probes: none, to compare.
+ */
+#define HK_POOL_CLASSES 32
+#define HK_POOL_EACH    128
+#define HK_POOL_BYTES   (32u << 20)
+static struct rwa_buffer *hk_pool[HK_POOL_CLASSES][HK_POOL_EACH];
+static unsigned hk_pool_head[HK_POOL_CLASSES], hk_pool_count[HK_POOL_CLASSES];
+static size_t hk_pool_bytes;
+static void *hk_pool_device;
+static pthread_mutex_t hk_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Its class, and the size a buffer of that class has: to 64 KB by 4 KB, to 1 MB by 64 KB; -1: too big to keep */
+static int
+hk_pool_class(size_t length, size_t *rounded)
+{
+	if (length == 0 || length > (1u << 20)) {
+		return -1;
+	}
+	if (length <= (64u << 10)) {
+		*rounded = ((length - 1) / 4096 + 1) * 4096;
+		return (int)((length - 1) / 4096);
+	}
+	*rounded = ((length - 1) / 65536 + 1) * 65536;
+	return 16 + (int)((length - 1) / 65536);
+}
+
+static bool
+hk_pool_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		on = mesa.buffer_busy != NULL && access("/hackios/share/probes/buffer_no_pool", F_OK) != 0;
+	}
+	return on != 0;
+}
+
+static struct rwa_buffer *
+hk_pool_take(void *device, size_t length)
+{
+	struct rwa_buffer *found = NULL;
+	size_t rounded = 0;
+	const int c = hk_pool_class(length, &rounded);
+
+	if (c < 0 || !hk_pool_on()) {
+		return NULL;
+	}
+	pthread_mutex_lock(&hk_pool_lock);
+	if (device == hk_pool_device && hk_pool_count[c] != 0) {
+		found = hk_pool[c][hk_pool_head[c]];
+		hk_pool_head[c] = (hk_pool_head[c] + 1) % HK_POOL_EACH;
+		hk_pool_count[c]--;
+		hk_pool_bytes -= rounded;
+	}
+	pthread_mutex_unlock(&hk_pool_lock);
+	if (found != NULL && mesa.buffer_busy(found)) {
+		bool back = false;
+
+		/* (asked with the lock let go: the library may have to ask the kernel) */
+		pthread_mutex_lock(&hk_pool_lock);
+		if (hk_pool_count[c] < HK_POOL_EACH) {
+			hk_pool_head[c] = (hk_pool_head[c] + HK_POOL_EACH - 1) % HK_POOL_EACH;
+			hk_pool[c][hk_pool_head[c]] = found;
+			hk_pool_count[c]++;
+			hk_pool_bytes += rounded;
+			back = true;
+		}
+		pthread_mutex_unlock(&hk_pool_lock);
+		if (!back) {
+			mesa.buffer_destroy(found);
+		}
+		atomic_fetch_add(&hk_live.pool_busy, 1);
+		return NULL;
+	}
+	if (found != NULL) {
+		atomic_fetch_add(&hk_live.pool_taken, 1);
+	}
+	return found;
+}
+
+static bool
+hk_pool_put(void *device, struct rwa_buffer *buffer, size_t length)
+{
+	size_t rounded = 0;
+	const int c = hk_pool_class(length, &rounded);
+	bool kept = false;
+
+	if (c < 0 || !hk_pool_on()) {
+		return false;
+	}
+	pthread_mutex_lock(&hk_pool_lock);
+	if (hk_pool_device == NULL) {
+		hk_pool_device = device;
+	}
+	if (device == hk_pool_device && hk_pool_count[c] < HK_POOL_EACH && hk_pool_bytes + rounded <= HK_POOL_BYTES) {
+		const unsigned at = (hk_pool_head[c] + hk_pool_count[c]) % HK_POOL_EACH;
+
+		hk_pool[c][at] = buffer;
+		hk_pool_count[c]++;
+		hk_pool_bytes += rounded;
+		kept = true;
+	}
+	pthread_mutex_unlock(&hk_pool_lock);
+	if (kept) {
+		atomic_fetch_add(&hk_live.pool_kept, 1);
+	}
+	return kept;
+}
+
 @implementation HKMetalBuffer
+
+- (void)hkNeverKeep
+{
+	_neverKept = YES;
+}
+
+- (void)hkWrap:(void *)bytes deallocator:(void (^)(void *, NSUInteger))deallocator
+{
+	_wrapped = bytes;
+	_wrappedGone = [deallocator copy];
+	atomic_fetch_add(&hk_draw_backs, 1);
+}
+
+- (void)hkWrappedBack
+{
+	if (_wrapped != NULL) {
+		memcpy(_wrapped, [self contents], [self length]);
+	}
+}
 
 + (void)load
 {
@@ -3783,13 +5084,23 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 	if (mesa_available() && [device mesaDevice] != NULL) {
 		char why[256] = { 0 };
 
-		_mesa = mesa.buffer_create([device mesaDevice], length, why, sizeof(why));
+		size_t size = length;
+
+		_mesa = hk_pool_take([device mesaDevice], length);
+		if (_mesa != NULL) {
+			memset(mesa.buffer_map(_mesa), 0, length);
+		} else {
+			(void)hk_pool_class(length, &size);
+			_mesa = mesa.buffer_create([device mesaDevice], size, why, sizeof(why));
+		}
 		if (_mesa == NULL) {
 			rw_print("Mesa would not allocate %lu bytes: %s\n",
 			         (unsigned long)length, why);
 			[self release];
 			return nil;
 		}
+		atomic_fetch_add(&hk_live.buffers, 1);
+		atomic_fetch_add(&hk_live.buffer_bytes, (int64_t)length);
 		_owner = device;
 		_length = length;
 		_contents = mesa.buffer_map(_mesa);
@@ -3843,8 +5154,19 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 
 - (void)dealloc
 {
+	if (_wrapped != NULL) {
+		if (_wrappedGone != nil) {
+			_wrappedGone(_wrapped, _length);
+			[_wrappedGone release];
+		}
+		atomic_fetch_sub(&hk_draw_backs, 1);
+	}
 	if (_mesa != NULL) {
-		mesa.buffer_destroy(_mesa);
+		atomic_fetch_sub(&hk_live.buffers, 1);
+		atomic_fetch_sub(&hk_live.buffer_bytes, (int64_t)_length);
+		if (_wrapped != NULL || _neverKept || !hk_pool_put([_owner mesaDevice], _mesa, _length)) {
+			mesa.buffer_destroy(_mesa);
+		}
 		[super dealloc];
 		return;
 	}
@@ -3931,18 +5253,41 @@ hk_with_descriptor_swizzle(HKMetalTexture *made, MTLTextureDescriptor *descripto
 }
 - (void)setResponsibleProcess:(int)pid { _responsibleProcess = pid; }
 /*
- * A texture laid over this buffer's memory. Textures exist now -- the comment here used to say
- * they did not -- but the contract still has no call that lays one over a buffer we already own,
- * so this is nil with a reason rather than nil with a stale excuse.
+ * A texture laid over this buffer's memory (M5g, the owner: 「地圖在widget顯示黃色」). RenderBox lays each large image over a buffer of its own, and without a texture draws one
+ * yellow pixel instead (rwa_texture_over_buffer, air_vk.c). Where the library cannot, or the rows are not what this GPU reads, a copy of what the buffer holds now.
  */
 - (id)newTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
 		   bytesPerRow:(NSUInteger)bytesPerRow
 {
-	(void)descriptor; (void)offset; (void)bytesPerRow;
-	RW_ONCE("hkmetal: a texture over a buffer was asked for; the contract lays a texture "
-		"over an IOSurface and over memory of its own, but not over a buffer this driver "
-		"already holds\n");
-	return nil;
+	char why[320] = "the compiler library has no call for it";
+	struct rwa_texture_shape shape = {
+		.pixel_format = (unsigned)[descriptor pixelFormat],
+		.type = (unsigned)[descriptor textureType],
+		.width = (unsigned)[descriptor width],
+		.height = (unsigned)[descriptor height],
+		.depth = (unsigned)[descriptor depth],
+		.array_length = (unsigned)[descriptor arrayLength],
+		.mip_levels = (unsigned)[descriptor mipmapLevelCount],
+		.sample_count = (unsigned)[descriptor sampleCount],
+		.usage = (unsigned)[descriptor usage],
+	};
+	struct rwa_texture *texture = mesa.texture_over_buffer != NULL && _mesa != NULL
+	    ? mesa.texture_over_buffer(_mesa, &shape, offset, (unsigned)bytesPerRow, why, sizeof(why)) : NULL;
+
+	if (texture != NULL) {
+		HKMetalTexture *over = [[HKMetalTexture alloc] initWithHKDevice:_owner
+									texture:texture
+									  shape:&shape];
+
+		[over hkOverBuffer:self row:bytesPerRow];
+		return hk_with_descriptor_swizzle(over, descriptor);
+	}
+	RW_ONCE("a texture over a buffer, as a copy: %s\n", why);
+
+	id copied = [_owner newTextureWithDescriptor:descriptor];
+
+	[copied replaceRegion:MTLRegionMake2D(0, 0, shape.width, shape.height) mipmapLevel:0 withBytes:(const char *)[self contents] + offset bytesPerRow:bytesPerRow];
+	return copied;
 }
 
 - (id)newLinearTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
@@ -3996,6 +5341,9 @@ static _Atomic(uint64_t) hk_commits;
 	_owner = device;
 	_texture = texture;
 	_shape = *shape;
+	_liveBytes = (int64_t)shape->width * MAX(shape->height, 1) * MAX(shape->depth, 1) * MAX(shape->array_length, 1) * MAX(shape->sample_count, 1) * 4;
+	atomic_fetch_add(&hk_live.textures, 1);
+	atomic_fetch_add(&hk_live.texture_bytes, _liveBytes);
 	_swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
 						 MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
 	return self;
@@ -4014,10 +5362,292 @@ static _Atomic(uint64_t) hk_commits;
 	[self hkFollowSurface];
 }
 
+- (void)hkBiplanarOf:(void *)surface seed:(uint32_t)seed sum:(uint64_t)sum
+{
+	_biplanar = (void *)CFRetain(surface);
+	_biplanarSeed = seed;
+	_biplanarSum = sum;
+}
+
+/*
+ * Each time format 500's copy is about to be drawn with: made again if its surface's seed has moved. And with
+ * metal_stats, which of them came up in what order and whether what they show is what their surfaces hold: the
+ * test of a ring of pictures. Numbers only.
+ */
+- (void)hkBiplanarLook
+{
+	static int once = -1;
+	static HKMetalTexture *known[16];
+	static unsigned char order[64];
+	static unsigned drawn, moved, copied;
+	static uint32_t (*seed_of)(void *);
+	static int (*lock)(void *, uint32_t, uint32_t *);
+	static int (*unlock)(void *, uint32_t, uint32_t *);
+	static void *(*base)(void *, size_t);
+	static size_t (*row)(void *, size_t);
+	const uint64_t now = atomic_load(&hk_commits) + 1;
+
+	if (_followedLooked == now) {
+		return;
+	}
+	_followedLooked = now;
+	if (once < 0) {
+		*(void **)&seed_of = dlsym(RTLD_DEFAULT, "IOSurfaceGetSeed");
+		*(void **)&lock = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+		*(void **)&unlock = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+		*(void **)&base = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddressOfPlane");
+		*(void **)&row = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRowOfPlane");
+		once = access("/hackios/share/probes/biplanar_once", F_OK) == 0;
+	}
+	if (seed_of == NULL || lock == NULL || unlock == NULL || base == NULL || row == NULL) {
+		return;
+	}
+	const uint32_t seed = seed_of(_biplanar);
+	const NSUInteger w = _shape.width, h = _shape.height;
+	const bool changed = seed != _biplanarSeed;
+
+	moved += changed;
+	if (changed && !once && lock(_biplanar, 1, NULL) == 0) {
+		const uint64_t began = hk_now_us();
+		const uint8_t *y = base(_biplanar, 0), *uv = base(_biplanar, 1);
+		const size_t ys = row(_biplanar, 0), uvs = row(_biplanar, 1);
+		uint32_t (*pixel_format)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetPixelFormat");
+		const bool video = pixel_format != NULL && (pixel_format(_biplanar) & 0xff) == 'v';
+
+		if (_biplanarBytes == NULL) {
+			_biplanarBytes = malloc(w * h * 4);
+		}
+		if (_biplanarBytes != NULL) {
+			const NSUInteger ch = (h + 1) / 2;
+
+			for (NSUInteger j = 0; j < h; j++) {
+				const NSUInteger c0 = j / 2;
+				const NSUInteger c1 = (j & 1) ? MIN(c0 + 1, ch - 1) : (c0 > 0 ? c0 - 1 : 0);
+
+				hk_420_line(y + j * ys, uv + c0 * uvs, uv + c1 * uvs, w, video, _biplanarBytes + j * w * 4);
+			}
+			[self replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:_biplanarBytes bytesPerRow:w * 4];
+			_biplanarSeed = seed;
+			copied++;
+			if (hk_stats_on()) {
+				_biplanarSum = hk_420_sum(y, ys, w, h);
+			}
+		}
+		unlock(_biplanar, 1, NULL);
+		atomic_fetch_add(&hk_stat.biplanar, 1);
+		atomic_fetch_add(&hk_stat.biplanar_us, hk_now_us() - began);
+	}
+	if (!hk_stats_on()) {
+		return;
+	}
+	unsigned index = 0;
+
+	for (; index < 16 && known[index] != self; index++) {
+		if (known[index] == nil) {
+			known[index] = [self retain];   /* (only with metal_stats) */
+			break;
+		}
+	}
+	order[drawn % 64] = index < 16 ? (unsigned char)index : 16;
+	if (++drawn % 64 == 0) {
+		char line[1000], *at = line, *end = line + sizeof(line);
+		unsigned stale = 0, textures = 0;
+
+		at += snprintf(at, (size_t)(end - at), "hk-420: %u looks, last in order ", drawn);
+		for (unsigned i = 0; i < 64 && at < end - 2; i++) {
+			*at++ = "0123456789abcdefg"[order[i]];
+		}
+		*at = 0;
+		at += snprintf(at, (size_t)(end - at), "; seeds moved %u, copied %u;", moved, copied);
+		for (unsigned i = 0; i < 16 && known[i] != nil && at < end - 60; i++) {
+			HKMetalTexture *t = known[i];
+			uint64_t current = 0;
+
+			if (lock(t->_biplanar, 1, NULL) == 0) {
+				current = hk_420_sum(base(t->_biplanar, 0), row(t->_biplanar, 0), t->_shape.width, t->_shape.height);
+				unlock(t->_biplanar, 1, NULL);
+			}
+			stale += current != t->_biplanarSum;
+			textures++;
+			at += snprintf(at, (size_t)(end - at), " %u:%04x/%04x", i, (unsigned)(t->_biplanarSum & 0xffff), (unsigned)(current & 0xffff));
+		}
+		at += snprintf(at, (size_t)(end - at), "; %u of %u show other than their surfaces hold\n", stale, textures);
+		rw_print("%s", line);
+	}
+}
+
+- (void)hkStandInFor:(void *)surface
+{
+	@synchronized([HKMetalTexture class]) {
+		for (unsigned i = 0; i < 64; i++) {
+			if (hk_stand_ins[i].surface == NULL) {
+				hk_stand_ins[i].surface = surface;
+				hk_stand_ins[i].texture = self;
+				break;
+			}
+		}
+	}
+}
+
+/* (a copy that has followed the surface until now is asked to be drawn into: from now on what it holds is the surface's picture) */
+- (void)hkStartDrawingBack
+{
+	if (!_drawsBack) {
+		_followedInPlace = YES;
+		_drawsBack = YES;
+		atomic_fetch_add(&hk_draw_backs, 1);
+	}
+}
+
+- (void)hkStandInForPlane:(NSUInteger)plane of:(void *)surface
+{
+	int (*lock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+	int (*unlock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+	struct rwd_plane where;
+
+	_followed = (void *)CFRetain(surface);
+	_followedInPlace = YES;
+	_planeStandIn = YES;
+	_plane = plane;
+	atomic_fetch_add(&hk_draw_backs, 1);
+	if (rwd_plane_of(surface, plane, &where) == 0 && lock(surface, 1 /* kIOSurfaceLockReadOnly */, NULL) == 0) {
+		[self replaceRegion:MTLRegionMake2D(0, 0, _shape.width, _shape.height) mipmapLevel:0 withBytes:where.base bytesPerRow:where.row];
+		unlock(surface, 1, NULL);
+	}
+}
+
+- (BOOL)hkWritesPlaneBack { return _planeStandIn && (_shape.usage & MTLTextureUsageShaderWrite) != 0; }
+
+- (id)hkOverBuffer { return _parent != nil ? [(HKMetalTexture *)_parent hkOverBuffer] : _overBuffer; }
+
+- (void)hkDrawBackTo:(void *)surface
+{
+	size_t (*surface_row)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+	void *(*base_address)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+	int (*lock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+	int (*unlock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+
+	_followed = (void *)CFRetain(surface);
+	_followedInPlace = YES;
+	_drawsBack = YES;
+	atomic_fetch_add(&hk_draw_backs, 1);
+	[self hkStandInFor:surface];
+	uint32_t (*seed_of)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetSeed");
+
+	if (lock(surface, 1 /* kIOSurfaceLockReadOnly */, NULL) == 0) {
+		[self replaceRegion:MTLRegionMake2D(0, 0, _shape.width, _shape.height) mipmapLevel:0 withBytes:base_address(surface) bytesPerRow:surface_row(surface)];
+		unlock(surface, 1, NULL);
+		_followedSeed = seed_of != NULL ? seed_of(surface) : 0;
+	}
+}
+
+- (BOOL)hkDrawsBack { return _drawsBack; }
+
+/* (a second after the last draw: a whole surface a frame took 45 ms a frame, run 003149, and one every second held the GPU's queue for 180 ms, run 003605) */
+- (void)hkPutBackLater
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		if (hk_now_us() - atomic_load(&_lastDrawn) < 900000) {
+			[self hkPutBackLater];
+			return;
+		}
+		__atomic_store_n(&_putBackDue, NO, __ATOMIC_RELEASE);
+		[self hkPutBack];
+		[self release];
+	});
+}
+
+- (void)hkPutBackSoon
+{
+	const uint64_t now = hk_now_us(), before = atomic_exchange(&_lastDrawn, now);
+
+	/* (the first draw after a rest goes back at once, before the work is said to be done: a snapshot, whose maker reads it then. App Library held still, black without this, run 011117) */
+	if (now - before > 1000000) {
+		[self hkPutBack];
+		return;
+	}
+	if (__atomic_exchange_n(&_putBackDue, YES, __ATOMIC_ACQ_REL)) {
+		return;
+	}
+	[self retain];
+	[self hkPutBackLater];
+}
+
+- (void)hkPutBack
+{
+	size_t (*surface_row)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+	void *(*base_address)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+	int (*lock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+	int (*unlock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+
+	uint32_t (*seed_of)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetSeed");
+
+	if (_planeStandIn) {
+		struct rwd_plane where;
+
+		if (rwd_plane_of(_followed, _plane, &where) == 0 && lock(_followed, 0, NULL) == 0) {
+			[self getBytes:where.base bytesPerRow:where.row fromRegion:MTLRegionMake2D(0, 0, _shape.width, _shape.height) mipmapLevel:0];
+			unlock(_followed, 0, NULL);
+		}
+		return;
+	}
+	if (lock(_followed, 0, NULL) == 0) {
+		[self getBytes:base_address(_followed) bytesPerRow:surface_row(_followed) fromRegion:MTLRegionMake2D(0, 0, _shape.width, _shape.height) mipmapLevel:0];
+		unlock(_followed, 0, NULL);
+		_followedSeed = seed_of != NULL ? seed_of(_followed) : 0;
+	}
+}
+
+- (void)hkOverBuffer:(id)buffer row:(NSUInteger)row
+{
+	_overBuffer = [buffer retain];
+	_rowGiven = row;
+}
+
+- (size_t)hkCensus:(char *)out size:(size_t)size centre:(uint8_t *)centre
+{
+	uint32_t (*surface_format)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetPixelFormat");
+	HKMetalTexture *root = _parent != nil ? (HKMetalTexture *)_parent : self;
+	size_t (*surface_row)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+	const uint32_t fourcc = root->_followed != NULL && surface_format != NULL ? surface_format(root->_followed) : 0;
+	const size_t row = root->_followed != NULL && surface_row != NULL ? surface_row(root->_followed) : root->_rowGiven;
+	const unsigned format = _shape.pixel_format;
+
+	memset(centre, 0, 16);
+	if (format < 130 && _shape.sample_count <= 1 && _shape.type == 2) {
+		[self getBytes:centre bytesPerRow:16 fromRegion:MTLRegionMake2D(MAX(_shape.width, 1) / 2, MAX(_shape.height, 1) / 2, 1, 1) mipmapLevel:0];
+	}
+	/* (and over the whole of it, in numbers, for what a centre cannot say: K33, a gain map reads 0 0 0 0 there) */
+	unsigned top[4] = { 0 }, nonzero = 0;
+
+	if (format == 70 && _shape.width >= 256 && _shape.height >= 256 && _shape.sample_count <= 1 && _shape.type == 2) {
+		for (unsigned j = 0; j < 16; j++) {
+			for (unsigned i = 0; i < 16; i++) {
+				uint8_t p[4];
+
+				[self getBytes:p bytesPerRow:16 fromRegion:MTLRegionMake2D((_shape.width - 1) * i / 15, (_shape.height - 1) * j / 15, 1, 1) mipmapLevel:0];
+				for (unsigned k = 0; k < 4; k++) {
+					top[k] = p[k] > top[k] ? p[k] : top[k];
+				}
+				nonzero += (p[0] | p[1] | p[2] | p[3]) != 0;
+			}
+		}
+	}
+	return (size_t)snprintf(out, size, " [%s%s %ux%u format %u (of %u) swizzle %u%u%u%u row %zu fourcc %08x '%.4s' centre %u %u %u %u; of 256 points %u not zero, highest %u %u %u %u]", _parent != nil ? "view of " : "",
+				root->_overBuffer != nil ? "buffer" : root->_followedInPlace ? "surface" : root->_followed != NULL ? "copied surface" : "descriptor", _shape.width, _shape.height, format, root->_shape.pixel_format,
+				(unsigned)_swizzle.red, (unsigned)_swizzle.green, (unsigned)_swizzle.blue, (unsigned)_swizzle.alpha, row, fourcc, (const char *)&fourcc,
+				centre[0], centre[1], centre[2], centre[3], nonzero, top[0], top[1], top[2], top[3]);
+}
+
 - (void)hkRememberSurface:(void *)surface
 {
 	_followed = (void *)CFRetain(surface);
 	_followedInPlace = YES;
+	if (!_liveSurface) {
+		_liveSurface = YES;
+		atomic_fetch_add(&hk_live.surfaces, 1);
+		atomic_fetch_add(&hk_live.surface_bytes, _liveBytes);
+	}
 }
 
 /* Which surface, how it reaches the GPU, and a look at 25 of its pixels from this processor. */
@@ -4066,16 +5696,47 @@ static _Atomic(uint64_t) hk_commits;
 		[(HKMetalTexture *)_parent hkFollowSurface];
 		return;
 	}
-	if (_followed == NULL || _followedInPlace || _followedLooked == now) {
+	if (_biplanar != NULL) {
+		[self hkBiplanarLook];
+		return;
+	}
+	/* (DRAWN AND PUT BACK: a stand-in goes on following what others write into the surface: its seed moves, and not by hkPutBack) */
+	if (_followed == NULL || (_followedInPlace && !_drawsBack) || _followedLooked == now) {
 		return;
 	}
 	_followedLooked = now;
 
-	size_t (*bytes_per_row)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
-	size_t (*bytes_per_element)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerElement");
-	void *(*base_address)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
-	int (*lock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
-	int (*unlock)(void *, uint32_t, uint32_t *) = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+	static size_t (*bytes_per_row)(void *);
+	static size_t (*bytes_per_element)(void *);
+	static void *(*base_address)(void *);
+	static int (*lock)(void *, uint32_t, uint32_t *);
+	static int (*unlock)(void *, uint32_t, uint32_t *);
+	static uint32_t (*seed_of)(void *);
+
+	if (unlock == NULL) {
+		*(void **)&seed_of = dlsym(RTLD_DEFAULT, "IOSurfaceGetSeed");
+		*(void **)&bytes_per_row = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+		*(void **)&bytes_per_element = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerElement");
+		*(void **)&base_address = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+		*(void **)&lock = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+		*(void **)&unlock = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+	}
+	const uint64_t look_began = hk_now_us();
+	const uint32_t seed = seed_of != NULL ? seed_of(_followed) : 0;
+
+	/*
+	 * (M5g) Who writes a surface says so by locking it, which moves its seed. Adding up all of it at every commit was 650 MB
+	 * in 5 s in Maps, run 211412, for surfaces that had not changed, 5% of a core on the thread that draws. The sum stays, a
+	 * few times a second, for a writer that does not say.
+	 */
+	if (_followedSum != 0 && seed_of != NULL && seed == _followedSeed && look_began - _followedSummedAt < 250000) {
+		return;
+	}
+	if (_drawsBack && seed == _followedSeed) {
+		return;
+	}
+	_followedSeed = seed;
+	_followedSummedAt = look_began;
 
 	if (bytes_per_row == NULL || bytes_per_element == NULL || base_address == NULL || lock == NULL ||
 	    unlock == NULL || lock(_followed, 1, NULL) != 0) {
@@ -4111,16 +5772,43 @@ static _Atomic(uint64_t) hk_commits;
 		}
 	}
 	unlock(_followed, 1, NULL);
+	atomic_fetch_add(&hk_stat.looks, 1);
+	atomic_fetch_add(&hk_stat.look_bytes, size);
+	atomic_fetch_add(&hk_stat.look_us, hk_now_us() - look_began);
 }
 
 - (void)dealloc
 {
+	atomic_fetch_sub(&hk_live.textures, 1);
+	atomic_fetch_sub(&hk_live.texture_bytes, _liveBytes);
+	if (_liveSurface) {
+		atomic_fetch_sub(&hk_live.surfaces, 1);
+		atomic_fetch_sub(&hk_live.surface_bytes, _liveBytes);
+	}
 	if (_texture != NULL) {
 		mesa.texture_destroy(_texture);
 	}
 	[_parent release];
+	[_overBuffer release];
 	if (_followed != NULL) {
 		CFRelease(_followed);
+	}
+	if (_biplanar != NULL) {
+		CFRelease(_biplanar);
+		free(_biplanarBytes);
+	}
+	if (_drawsBack || _planeStandIn) {
+		atomic_fetch_sub(&hk_draw_backs, 1);
+	}
+	if (_followed != NULL) {
+		@synchronized([HKMetalTexture class]) {
+			for (unsigned i = 0; i < 64; i++) {
+				if (hk_stand_ins[i].texture == self) {
+					hk_stand_ins[i].surface = NULL;
+					hk_stand_ins[i].texture = nil;
+				}
+			}
+		}
 	}
 	[super dealloc];
 }
@@ -4181,6 +5869,8 @@ static _Atomic(uint64_t) hk_commits;
 								  shape:&shape];
 	if (made != nil) {
 		made->_parent = [self retain];
+		atomic_fetch_sub(&hk_live.texture_bytes, made->_liveBytes);   /* (a view: its bytes are its parent's) */
+		made->_liveBytes = 0;
 		made->_parentLevel = levels.location;
 		made->_parentSlice = slices.location;
 		made->_swizzle = swizzle;
@@ -4299,6 +5989,7 @@ rw_texture_read(struct rwa_texture *t, unsigned level, unsigned slice, const uns
 	unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
 			     (unsigned)region.size.depth };
 
+	_rowGiven = stride;
 	if ([self pixelFormat] == 115 && size[0] >= 64 && bytes != NULL) {
 		static unsigned said;
 
@@ -5011,6 +6702,8 @@ hk_note_dispatch(HKMetalWork *work)
 		[buffers[i] release];
 		[textures[i] release];
 		[samplers[i] release];
+		[vertexTextures[i] release];
+		[vertexSamplers[i] release];
 	}
 	[blitFrom release];
 	[blitTo release];
@@ -5390,6 +7083,10 @@ hk_fence_queue(void)
 	NSMutableArray *_hkWatched;     /* (trace: a dispatch's textures, read back when complete: hkWatchReport) */
 	NSCondition *_ran;              /* ... and whether all of it has run (-waitUntilCompleted waits for that) */
 	BOOL _hasRun;
+	NSMutableArray *_bytesChunks;   /* M5g: the chunks -hkBytes: used, the last one still filling */
+	NSUInteger _bytesUsed;
+	uint64_t _committedAt;          /* M5g: for hk_stats_say */
+	NSUInteger _preparedTo;         /* M5g: the work items -hkPrepareDrawsFrom: has been over */
 }
 
 /*
@@ -5481,12 +7178,46 @@ hk_fence_queue(void)
 	}
 }
 
+- (id)hkBytes:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset
+{
+	HKMetalDevice *device = [_queue device];
+
+	atomic_fetch_add(&hk_stat.bytes_calls, 1);
+	*offset = 0;
+	/* (a Gallium library, which is the one without the counts, takes no offset everywhere) */
+	if (length > RW_BYTES_MOST || mesa.stats_read == NULL) {
+		return [[device newBufferWithBytes:bytes length:length options:0] autorelease];
+	}
+	NSUInteger at = (_bytesUsed + RW_BYTES_ALIGN - 1) & ~(NSUInteger)(RW_BYTES_ALIGN - 1);
+
+	if ([_bytesChunks count] == 0 || at + length > RW_BYTES_CHUNK) {
+		id chunk = [device hkTakeBytesChunk];
+
+		if (chunk == nil) {
+			return nil;
+		}
+		if (_bytesChunks == nil) {
+			_bytesChunks = [[NSMutableArray alloc] init];
+		}
+		[_bytesChunks addObject:chunk];
+		[chunk release];
+		at = 0;
+	}
+	id chunk = [_bytesChunks lastObject];
+
+	memcpy((uint8_t *)[chunk contents] + at, bytes, length);
+	_bytesUsed = at + length;
+	*offset = at;
+	return chunk;
+}
+
 - (void)dealloc
 {
 	[self hkReturnSlot];
 	if (_fence != NULL) {
 		mesa.fence_release([[_queue device] mesaDevice], _fence);
 	}
+	[_bytesChunks release];    /* (given back at completion; if that was never asked, the library frees them when the GPU is done) */
 	[_work release];
 	[_signals release];
 	[_ran release];
@@ -5599,11 +7330,93 @@ rw_signal(HKMetalWork *work, NSMutableArray *ready, NSMutableArray *signals)
 	return ready;
 }
 
+/*
+ * (M5g, ONE PASS FOR MANY DRAWS in air_vk.c.) The draws from here that go on over the same attachments, with no load
+ * action and no barrier of the encoder's among them: what they sample is moved to where it can be sampled now, ahead of
+ * the pass. Met at the draw that first samples it, each of those barriers would end the pass and begin another (a third of
+ * the passes of Weather's frames, run 210414). What a draw does not in fact read costs a barrier, and nothing that
+ * follows relies on the layout.
+ */
+- (void)hkPrepareDrawsFrom:(NSUInteger)from
+{
+	HKMetalWork *first = [_work objectAtIndex:from];
+	struct rwa_texture *color[8] = { NULL };
+	struct rwa_texture *depth = [first->depth mesaTexture];
+	char why[256] = { 0 };
+
+	_preparedTo = from + 1;
+	if (mesa.texture_prepare == NULL) {
+		return;
+	}
+	for (unsigned i = 0; i < first->colorCount; i++) {
+		color[i] = [first->color[i] mesaTexture];
+	}
+	for (NSUInteger at = from; at < [_work count]; at++) {
+		HKMetalWork *w = [_work objectAtIndex:at];
+
+		if (w->render == nil || w->eventOp != 0 || w->blit != 0 || w->colorCount != first->colorCount ||
+		    w->depth != first->depth || w->depthLevel != first->depthLevel || w->depthSlice != first->depthSlice) {
+			break;
+		}
+		bool same = true;
+
+		for (unsigned i = 0; i < first->colorCount; i++) {
+			same = same && w->color[i] == first->color[i] && w->colorLevel[i] == first->colorLevel[i] &&
+			       w->colorSlice[i] == first->colorSlice[i];
+		}
+		if (!same || (at != from && (w->freshPass || w->clears || w->attachmentClearMask != 0 || w->clearsDepth || w->clearsStencil))) {
+			break;
+		}
+		for (unsigned i = 0; i < w->vertexTextureCount; i++) {
+			if (mesa.texture_prepare([w->vertexTextures[i] mesaTexture], color, first->colorCount, depth, why, sizeof(why)) != 0) {
+				return;
+			}
+		}
+		for (unsigned i = 0; i < w->textureCount; i++) {
+			if (mesa.texture_prepare([w->textures[i] mesaTexture], color, first->colorCount, depth, why, sizeof(why)) != 0) {
+				return;
+			}
+		}
+		_preparedTo = at + 1;
+	}
+}
+
 - (void)commit
 {
-	atomic_fetch_add(&hk_commits, 1);
+	/* (how long a process took to its first frame, from exec: what a shader built before the boot is to shorten, the owner's first open of an app) */
+	if (atomic_fetch_add(&hk_commits, 1) == 0 && hk_stats_on()) {
+		int name[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+		struct kinfo_proc info;
+		size_t size = sizeof(info);
+		struct timeval now;
+
+		gettimeofday(&now, NULL);
+		if (sysctl(name, 4, &info, &size, NULL, 0) == 0) {
+			rw_print("first commit %lld ms after the process began\n", ((long long)now.tv_sec - info.kp_proc.p_starttime.tv_sec) * 1000 + ((long long)now.tv_usec - info.kp_proc.p_starttime.tv_usec) / 1000);
+		}
+	}
 	_status = RW_CB_COMMITTED;
+	_committedAt = hk_now_us();
 	[self hkRun];
+	const uint64_t run = hk_now_us() - _committedAt;
+
+	/*
+	 * (M5g, a probe: the file commit_sync.) The window server's -commit does not come back until the GPU has finished what it
+	 * gave. If a frame reached the panel before the GPU was done with it, this is the boot where that cannot happen.
+	 */
+	static int commit_sync = -1;
+
+	if (commit_sync < 0) {
+		commit_sync = access("/hackios/share/probes/commit_sync", F_OK) == 0 && strcmp(getprogname(), "backboardd") == 0;
+	}
+	if (commit_sync) {
+		[self waitUntilCompleted];
+	}
+
+	atomic_fetch_add(&hk_stat.commits, 1);
+	atomic_fetch_add(&hk_stat.run_us, run);
+	hk_stat_most(&hk_stat.run_longest, run);
+	hk_stats_say();
 }
 
 - (void)hkRun
@@ -5636,6 +7449,9 @@ rw_signal(HKMetalWork *work, NSMutableArray *ready, NSMutableArray *signals)
 			continue;
 		}
 		if (work->render != nil) {
+			if (_next >= _preparedTo) {
+				[self hkPrepareDrawsFrom:_next];
+			}
 			if (![self runDraw:work why:why size:sizeof(why)]) {
 				goto done;
 			}
@@ -5766,6 +7582,8 @@ done:
 	struct rwa_buffer *fragment_buffers[RW_MAX_BUFFERS] = { NULL };
 	struct rwa_texture *fragment_textures[RW_MAX_BUFFERS] = { NULL };
 	struct rwa_sampler *fragment_samplers[RW_MAX_BUFFERS] = { NULL };
+	struct rwa_texture *vertex_textures[RW_MAX_BUFFERS] = { NULL };
+	struct rwa_sampler *vertex_samplers[RW_MAX_BUFFERS] = { NULL };
 	/* and Metal's own table for each stage: the same entries as the arrays above with
 	 * the OFFSET beside each, which rwa_bindings has nowhere to put. One array for
 	 * both of the things an offset means -- which encoding of an argument buffer, and
@@ -5847,6 +7665,12 @@ done:
 	for (unsigned i = 0; i < work->samplerCount; i++) {
 		fragment_samplers[i] = [work->samplers[i] mesaSampler];
 	}
+	for (unsigned i = 0; i < work->vertexTextureCount; i++) {
+		vertex_textures[i] = [work->vertexTextures[i] mesaTexture];
+	}
+	for (unsigned i = 0; i < work->vertexSamplerCount; i++) {
+		vertex_samplers[i] = [work->vertexSamplers[i] mesaSampler];
+	}
 	hk_note_draw(work);
 	hk_note_frame_draw(work);
 	struct rwa_draw draw = {
@@ -5864,7 +7688,11 @@ done:
 		.depth_stencil = [work->depthStencilState mesaDepthStencil],
 		.stencil_reference = { work->stencilReference[0], work->stencilReference[1] },
 		.depth_range = work->hasDepthRange ? work->depthRange : NULL,
-		.vertex = { .buffers = vertex_buffers, .buffer_count = work->vertexBufferCount },
+		.vertex = {
+			.buffers = vertex_buffers, .buffer_count = work->vertexBufferCount,
+			.textures = vertex_textures, .texture_count = work->vertexTextureCount,
+			.samplers = vertex_samplers, .sampler_count = work->vertexSamplerCount,
+		},
 		/* and the streams the layout fetches from, at Metal's own indices with
 		 * Metal's own offsets; the count is what the library needs covered, which
 		 * is the highest index the pipeline fetches from plus one. */
@@ -5913,6 +7741,9 @@ done:
 		.color_slice = work->colorSlice,
 		.depth_level = work->depthLevel,
 		.depth_slice = work->depthSlice,
+		/* one pass for many draws (M5g, air_metal.h) */
+		.fresh_pass = work->freshPass,
+		.dont_care_mask = work->dontCareMask,
 	};
 
 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
@@ -6098,8 +7929,13 @@ done:
 		[_ran unlock];
 	}
 	[self hkWaitFence];
+	[self hkDrawBack];
 	[self hkSignalsDone];
 	[self hkWatchReport];
+	if (hk_stats_on()) {
+		[self hkWatchFrame];
+		[self hkCensus];
+	}
 }
 
 /*
@@ -6165,6 +8001,494 @@ done:
 	[signals release];
 }
 
+/*
+ * (M5g, the owner's photos of run 213407: the blurred backdrop black over the upper left of the screen, along the diagonal, in
+ * steps as wide as a target of a sixteenth of the size.) With the file frame_watch, in the window server: after a frame with a
+ * small target, what its targets hold in the middle of each half of the diagonal. Where the upper left is black and the lower
+ * right is not, all of the frame's draws are said, a few times. A frame on the screen for 11 ms cannot be caught by a screenshot.
+ *
+ * (The owner: 「applibrary這裡沒有bg」, and the Maps widget in yellow.) With the file frame_map: what every target of a frame holds, as above, whatever its shape, and
+ * its colour: in the window server one frame in every 300, or, with a program's name in that file, all of that program's frames. A pixel is said as R G B A.
+ */
+/* (DRAWN AND PUT BACK) */
+- (void)hkDrawBack
+{
+	if (atomic_load(&hk_draw_backs) == 0) {
+		return;
+	}
+	id done[8];
+	unsigned count = 0;
+
+	for (HKMetalWork *work in _work) {
+		for (unsigned c = 0; work->render != nil && c < work->colorCount; c++) {
+			id t = work->color[c];
+			bool known = t == nil || ![t isKindOfClass:[HKMetalTexture class]] || ![t hkDrawsBack];
+
+			for (unsigned i = 0; !known && i < count; i++) {
+				known = done[i] == t;
+			}
+			if (!known && count < 8) {
+				done[count++] = t;
+				[t hkPutBackSoon];
+			}
+		}
+		/* (a plane through a texture of its own: back before the work is said to be done, whoever made it waits for that) */
+		for (unsigned t = 0; work->pipeline != nil && work->render == nil && t < work->textureCount; t++) {
+			id texture = work->textures[t];
+
+			if ([texture isKindOfClass:[HKMetalTexture class]] && [texture hkWritesPlaneBack]) {
+				[texture hkPutBack];
+			}
+			/* (newBufferWithBytesNoCopy's) */
+			id over = [texture isKindOfClass:[HKMetalTexture class]] ? [texture hkOverBuffer] : nil;
+
+			if ([over respondsToSelector:@selector(hkWrappedBack)]) {
+				[over hkWrappedBack];
+			}
+		}
+		for (unsigned b = 0; work->pipeline != nil && work->render == nil && b < work->count; b++) {
+			if ([work->buffers[b] respondsToSelector:@selector(hkWrappedBack)]) {
+				[work->buffers[b] hkWrappedBack];
+			}
+		}
+		for (unsigned c = 0; work->render != nil && c < work->colorCount; c++) {
+			id t = work->color[c];
+			id over = [t isKindOfClass:[HKMetalTexture class]] ? [t hkOverBuffer] : nil;
+
+			if ([over respondsToSelector:@selector(hkWrappedBack)]) {
+				[over hkWrappedBack];
+			}
+		}
+	}
+}
+
+- (void)hkCensus
+{
+	/*
+	 * (The owner: 「地圖在widget顯示黃色」, photo at 23:45: a flat yellow, in the Maps widget and in two bars of another.) With the file census, "XxY+XxY", in the window
+	 * server: for 120 frames after the Darwin notification com.hackios.census, once per pipeline, source and target, each draw that covers one of those points of a target
+	 * as wide as the screen or that reads anything but plain BGRA or something yellow: its label, where it is, each source (hkCensus:), and the first vertex past its position
+	 * and texture coordinates. And what the target holds at the points when the frame is done.
+	 */
+	enum { POINTS = 8, SEEN = 1024 };
+	static int on = -1, token;
+	static float points[POINTS][2];
+	static unsigned point_count, seen_count, numbered;
+	static struct { void *pipeline, *source, *target; } seen[SEEN];
+	static int left;
+
+	if (on < 0) {
+		char text[128] = "";
+		int file = open("/hackios/share/probes/census", O_RDONLY);
+
+		on = 0;
+		if (file >= 0 && strcmp(getprogname(), "backboardd") == 0) {
+			ssize_t got = read(file, text, sizeof(text) - 1);
+			const char *at = text;
+			int used = 0;
+
+			text[got > 0 ? got : 0] = 0;
+			while (point_count < POINTS && sscanf(at, "%fx%f%n", &points[point_count][0], &points[point_count][1], &used) == 2) {
+				point_count++;
+				at += used;
+				at += *at == '+';
+			}
+			on = notify_register_check("com.hackios.census", &token) == NOTIFY_STATUS_OK;
+		}
+		if (file >= 0) {
+			close(file);
+		}
+	}
+	if (!on) {
+		return;
+	}
+	int changed = 0;
+
+	notify_check(token, &changed);
+	if (changed && numbered > 0) {
+		left = 120;
+	}
+	numbered++;
+	if (left <= 0) {
+		return;
+	}
+	left--;
+	id screen = nil;
+	char line[900];
+
+	for (HKMetalWork *work in _work) {
+		if (work->render == nil || work->colorCount == 0) {
+			continue;
+		}
+		id target = work->color[0];
+		const bool wide = [target width] >= 1000;
+
+		screen = wide && [target height] >= 2000 ? target : screen;
+
+		float lo[2] = { 1e30f, 1e30f }, hi[2] = { -1e30f, -1e30f };
+		const float *v = work->vertexBufferCount > 1 && work->vertexBuffers[1] != nil
+		    ? (const float *)(const void *)((const char *)[work->vertexBuffers[1] contents] + work->vertexBufferOffsets[1]) : NULL;
+		const uint16_t *indices = work->indexBuffer != nil && work->indexType == 0
+		    ? (const uint16_t *)(const void *)((const char *)[work->indexBuffer contents] + work->indexBufferOffset) : NULL;
+
+		for (unsigned i = 0; v != NULL && i < work->vertexCount && i < 64; i++) {
+			const float *one = v + 12 * (indices != NULL ? (unsigned)((int)indices[i] + work->baseVertex) : i);
+			const float w = one[3] != 0 ? one[3] : 1;
+
+			lo[0] = MIN(lo[0], one[0] / w);
+			lo[1] = MIN(lo[1], one[1] / w);
+			hi[0] = MAX(hi[0], one[0] / w);
+			hi[1] = MAX(hi[1], one[1] / w);
+		}
+		int covers = -1;
+
+		for (unsigned p = 0; wide && covers < 0 && p < point_count; p++) {
+			const float x = points[p][0], y = points[p][1];
+			const bool in_scissor = !work->hasScissorRect || (x >= work->scissorRect[0] && x < work->scissorRect[0] + work->scissorRect[2] &&
+									  y >= work->scissorRect[1] && y < work->scissorRect[1] + work->scissorRect[3]);
+
+			if (in_scissor && x >= lo[0] && x <= hi[0] && y >= lo[1] && y <= hi[1]) {
+				covers = (int)p;
+			}
+		}
+		id first = nil;
+
+		for (unsigned i = 0; first == nil && i < work->textureCount; i++) {
+			first = i == 9 ? nil : work->textures[i];
+		}
+		bool known = false;
+
+		for (unsigned i = 0; i < seen_count && !known; i++) {
+			known = seen[i].pipeline == (__bridge void *)work->render && seen[i].source == (__bridge void *)first && seen[i].target == (__bridge void *)target;
+		}
+		if (known || seen_count >= SEEN) {
+			continue;
+		}
+		seen[seen_count].pipeline = (__bridge void *)work->render;
+		seen[seen_count].source = (__bridge void *)first;
+		seen[seen_count++].target = (__bridge void *)target;
+
+		NSString *label = [work->render label] ?: @"?";
+		size_t at = (size_t)snprintf(line, sizeof(line), "census %u %s -> %lux%lu at %.1f,%.1f..%.1f,%.1f", numbered,
+					     [label hasPrefix:@"com.apple.coreanimation."] ? [[label substringFromIndex:24] UTF8String] : [label UTF8String],
+					     (unsigned long)[target width], (unsigned long)[target height], (double)lo[0], (double)lo[1], (double)hi[0], (double)hi[1]);
+		bool odd = false;
+
+		for (unsigned i = 0; i < work->textureCount && at + 120 < sizeof(line); i++) {
+			id t = work->textures[i];
+
+			if (t != nil && i != 9 && [t isKindOfClass:[HKMetalTexture class]]) {
+				uint8_t centre[16];
+
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " t%u", i);
+				at += [t hkCensus:line + at size:sizeof(line) - at centre:centre];
+
+				const NSUInteger format = [t pixelFormat];
+				const bool bgra = format == 80 || format == 81;
+
+				odd = odd || !bgra || (centre[2] >= 200 && centre[1] >= 200 && centre[0] <= 60);
+			}
+		}
+		if (covers < 0 && !odd) {
+			continue;
+		}
+		if (covers >= 0 && at + 40 < sizeof(line)) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " COVERS %u", (unsigned)covers);
+		}
+		if (v != NULL && at + 90 < sizeof(line)) {
+			const float *one = v + 12 * (indices != NULL ? (unsigned)((int)indices[0] + work->baseVertex) : 0);
+
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " v %.3g %.3g %.3g %.3g %.3g %.3g", (double)one[6], (double)one[7], (double)one[8], (double)one[9], (double)one[10], (double)one[11]);
+		}
+		at += (size_t)snprintf(line + at, sizeof(line) - at, "\n");
+		hk_console_line(line, MIN(at, sizeof(line) - 1));
+	}
+	for (unsigned p = 0; screen != nil && p < point_count && numbered % 10 == 0; p++) {
+		uint8_t pixel[16] = { 0 };
+
+		[screen getBytes:pixel bytesPerRow:16 fromRegion:MTLRegionMake2D((NSUInteger)points[p][0], (NSUInteger)points[p][1], 1, 1) mipmapLevel:0];
+
+		const size_t at = (size_t)snprintf(line, sizeof(line), "census %u the screen's target %p at %.0f,%.0f holds %u %u %u %u (B G R A)\n", numbered, screen, (double)points[p][0],
+						   (double)points[p][1], pixel[0], pixel[1], pixel[2], pixel[3]);
+
+		hk_console_line(line, MIN(at, sizeof(line) - 1));
+	}
+}
+
+- (void)hkWatchFrame
+{
+	static int on = -1, mapping, every = 300;
+	static _Atomic(unsigned) dumps, checked, frames;
+
+	if (on < 0) {
+		char wanted[64] = "";
+		int file = open("/hackios/share/probes/frame_map", O_RDONLY);
+
+		if (file >= 0) {
+			ssize_t got = read(file, wanted, sizeof(wanted) - 1);
+
+			close(file);
+			while (got > 0 && (wanted[got - 1] == '\n' || wanted[got - 1] == ' ')) {
+				got--;
+			}
+			wanted[got > 0 ? got : 0] = 0;
+			mapping = strcmp(getprogname(), wanted[0] != 0 ? wanted : "backboardd") == 0;
+			every = wanted[0] != 0 ? 1 : 300;
+		}
+		on = mapping || (access("/hackios/share/probes/frame_watch", F_OK) == 0 && strcmp(getprogname(), "backboardd") == 0);
+	}
+	if (!on || (!mapping && atomic_load(&dumps) >= 10) || (mapping && (atomic_fetch_add(&frames, 1) % (unsigned)every != 0 || atomic_load(&dumps) >= 40))) {
+		return;
+	}
+	bool small = mapping;
+
+	for (HKMetalWork *work in _work) {
+		small = small || (work->render != nil && work->colorCount > 0 && [work->color[0] width] >> work->colorLevel[0] < 400);
+	}
+	if (!small) {
+		return;
+	}
+	char line[640];
+	id seen[24];
+	NSUInteger seen_level[24];
+	unsigned seen_count = 0;
+	unsigned hits = 0;
+	size_t at;
+
+	/*
+	 * Every target of the frame as it stands now, whole: the part of it that is not black, divided into 16 x 16, and whether
+	 * that is a triangle with a straight side along both edges of a corner. Runs 214642 and 215146 asked less of more places
+	 * and were set off by a hole for a detached wallpaper and by CoreAnimation rendering into a corner of its scratch targets:
+	 * this asks only about the shape, wherever it is in the target.
+	 */
+	for (HKMetalWork *work in _work) {
+		if (work->render == nil || work->colorCount == 0 || [work->color[0] pixelFormat] < 70 || [work->color[0] pixelFormat] > 81) {
+			continue;
+		}
+		id t = work->color[0];
+		const NSUInteger level = work->colorLevel[0];
+		bool known = false;
+
+		for (unsigned i = 0; i < seen_count; i++) {
+			known = known || (seen[i] == t && seen_level[i] == level);
+		}
+		if (known || seen_count >= 24) {
+			continue;
+		}
+		seen[seen_count] = t;
+		seen_level[seen_count++] = level;
+
+		const NSUInteger w = MAX([t width] >> level, 1), h = MAX([t height] >> level, 1);
+		uint8_t *pixels = malloc(w * h * 4);
+
+		if (pixels == NULL) {
+			continue;
+		}
+		[t getBytes:pixels bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level];
+
+		NSUInteger x0 = w, x1 = 0, y0 = h, y1 = 0;
+
+		for (NSUInteger y = 0; y < h; y++) {
+			const uint8_t *row = pixels + y * w * 4;
+
+			for (NSUInteger x = 0; x < w; x++) {
+				if (row[x * 4] >= 3 || row[x * 4 + 1] >= 3 || row[x * 4 + 2] >= 3) {
+					x0 = MIN(x0, x);
+					x1 = MAX(x1, x);
+					y0 = MIN(y0, y);
+					y1 = MAX(y1, y);
+				}
+			}
+		}
+		enum { G = 16 };
+		bool cell[G][G] = { { false } };
+		const char *which = NULL;
+		char colour[80] = "";
+
+		if (mapping && w > 0 && h > 0) {
+			const uint8_t *middle = pixels + (h / 2) * w * 4 + (w / 2) * 4, *corner = pixels;
+			const bool bgr = [t pixelFormat] == 80 || [t pixelFormat] == 81;
+
+			snprintf(colour, sizeof(colour), " format %lu middle %u %u %u %u corner %u %u %u %u", (unsigned long)[t pixelFormat], middle[bgr ? 2 : 0], middle[1], middle[bgr ? 0 : 2],
+				 middle[3], corner[bgr ? 2 : 0], corner[1], corner[bgr ? 0 : 2], corner[3]);
+		}
+
+		if (x1 > x0 + G && y1 > y0 + G) {
+			for (unsigned r = 0; r < G; r++) {
+				for (unsigned c = 0; c < G; c++) {
+					const uint8_t *q = pixels + (y0 + (y1 - y0) * (2 * r + 1) / (2 * G)) * w * 4 + (x0 + (x1 - x0) * (2 * c + 1) / (2 * G)) * 4;
+
+					cell[r][c] = q[0] >= 3 || q[1] >= 3 || q[2] >= 3;
+				}
+			}
+			static const char *const names[4] = { "lower-left triangle", "lower-right triangle", "upper-left triangle", "upper-right triangle" };
+
+			for (unsigned flip = 0; flip < 4 && which == NULL; flip++) {
+				unsigned last = 0, first_count = 0;
+				bool fits = true;
+
+				for (unsigned r = 0; r < G && fits; r++) {
+					unsigned count = 0, strays = 0;
+					const unsigned rr = (flip & 2) ? G - 1 - r : r;
+
+					for (unsigned c = 0; c < G; c++) {
+						const bool here = cell[rr][(flip & 1) ? G - 1 - c : c];
+
+						if (here && count == c) {
+							count++;
+						} else if (here) {
+							strays++;
+						}
+					}
+					fits = strays <= 1 && count + 1 >= last;
+					last = MAX(last, count);
+					first_count = r == 0 ? count : first_count;
+				}
+				if (fits && first_count <= 4 && last >= G - 4) {
+					which = names[flip];
+				}
+			}
+		}
+		free(pixels);
+		if (mapping && which == NULL) {
+			which = "map";
+		}
+		if (which != NULL) {
+			at = (size_t)snprintf(line, sizeof(line), "watch %u: %p %lux%lu[%lu] %s%s, the part at %lu,%lu %lux%lu:", atomic_load(&dumps), t, (unsigned long)w, (unsigned long)h,
+					      (unsigned long)level, which, colour, (unsigned long)x0, (unsigned long)y0, (unsigned long)(x1 - x0 + 1), (unsigned long)(y1 - y0 + 1));
+			for (unsigned r = 0; r < G && at + G + 4 < sizeof(line); r++) {
+				line[at++] = ' ';
+				for (unsigned c = 0; c < G; c++) {
+					line[at++] = cell[r][c] ? '#' : '.';
+				}
+			}
+			at += (size_t)snprintf(line + at, sizeof(line) - at, "\n");
+			hk_console_line(line, MIN(at, sizeof(line) - 1));
+			hits++;
+		}
+	}
+	atomic_fetch_add(&checked, 1);
+	if (hits == 0) {
+		return;
+	}
+	unsigned number = atomic_fetch_add(&dumps, 1), index = 0;
+
+	at = (size_t)snprintf(line, sizeof(line), "watch %u: %u targets of this shape, the %u'th frame looked at\n", number, hits, atomic_load(&checked));
+	hk_console_line(line, MIN(at, sizeof(line) - 1));
+	for (HKMetalWork *work in _work) {
+		index++;
+		if (work->blit != 0) {
+			at = (size_t)snprintf(line, sizeof(line), "watch %u/%u blit %u to %lux%lu\n", number, index, work->blit,
+					      (unsigned long)[work->blitTo width], (unsigned long)[work->blitTo height]);
+			hk_console_line(line, MIN(at, sizeof(line) - 1));
+			continue;
+		}
+		if (work->render == nil) {
+			continue;
+		}
+		NSString *label = [work->render label] ?: @"?";
+
+		at = (size_t)snprintf(line, sizeof(line), "watch %u/%u %s -> %lux%lu[%u] +%u %lux%lu prim %u v%u+%u i%u idx %d cull %u wind %u clear %u/%x dc %x fresh %d",
+				      number, index, [label hasPrefix:@"com.apple.coreanimation."] ? [[label substringFromIndex:24] UTF8String] : [label UTF8String],
+				      (unsigned long)[work->color[0] width], (unsigned long)[work->color[0] height], work->colorLevel[0], work->colorCount - 1,
+				      (unsigned long)[work->color[1] width], (unsigned long)[work->color[1] height],
+				      work->primitive, work->vertexStart, work->vertexCount, work->instanceCount, work->indexBuffer != nil,
+				      work->cullMode, work->frontWinding, work->clears, work->attachmentClearMask, work->dontCareMask, work->freshPass);
+		if (work->hasViewportRect && at + 50 < sizeof(line)) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " vp %g,%g %gx%g", (double)work->viewportRect[0], (double)work->viewportRect[1],
+					       (double)work->viewportRect[2], (double)work->viewportRect[3]);
+		}
+		if (work->hasScissorRect && at + 40 < sizeof(line)) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " sc %u,%u %ux%u", work->scissorRect[0], work->scissorRect[1],
+					       work->scissorRect[2], work->scissorRect[3]);
+		}
+		for (unsigned i = 0; i < work->textureCount && at + 40 < sizeof(line); i++) {
+			if (work->textures[i] != nil && mapping && [work->textures[i] isKindOfClass:[HKMetalTexture class]]) {
+				uint8_t centre[16];
+
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " t%u", i);
+				at += [work->textures[i] hkCensus:line + at size:sizeof(line) - at centre:centre];
+			} else if (work->textures[i] != nil) {
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " t%u %lux%lu/%lu", i, (unsigned long)[work->textures[i] width],
+						       (unsigned long)[work->textures[i] height], (unsigned long)[work->textures[i] mipmapLevelCount]);
+			}
+		}
+		if (mapping && work->clears && at + 60 < sizeof(line)) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " clears to %.3g %.3g %.3g %.3g", (double)work->clearColor[0], (double)work->clearColor[1],
+					       (double)work->clearColor[2], (double)work->clearColor[3]);
+		}
+		at += (size_t)snprintf(line + at, sizeof(line) - at, "\n");
+		hk_console_line(line, MIN(at, sizeof(line) - 1));
+		if (mapping && strcmp(getprogname(), "backboardd") != 0 && work->vertexBufferCount > 0 && work->vertexBuffers[0] != nil) {
+			/* (a program of its own vertex format: the first of what its draw reads, as it is) */
+			const float *f = (const float *)(const void *)((const char *)[work->vertexBuffers[0] contents] + work->vertexBufferOffsets[0]);
+
+			at = (size_t)snprintf(line, sizeof(line), "watch %u/%u   buffer 0:", number, index);
+			for (unsigned i = 0; i < 24 && at + 20 < sizeof(line); i++) {
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " %.4g", (double)f[i]);
+			}
+			at += (size_t)snprintf(line + at, sizeof(line) - at, "\n");
+			hk_console_line(line, MIN(at, sizeof(line) - 1));
+		}
+		if (work->vertexBufferCount > 1 && work->vertexBuffers[1] != nil && work->vertexCount <= 6) {
+			const float *v = (const float *)(const void *)((const char *)[work->vertexBuffers[1] contents] + work->vertexBufferOffsets[1]);
+			const uint16_t *indices = work->indexBuffer != nil && work->indexType == 0
+			    ? (const uint16_t *)(const void *)((const char *)[work->indexBuffer contents] + work->indexBufferOffset) : NULL;
+
+			at = (size_t)snprintf(line, sizeof(line), "watch %u/%u   at %zu ix %zu base %d:", number, index, work->vertexBufferOffsets[1],
+					      work->indexBufferOffset, work->baseVertex);
+			for (unsigned i = 0; indices != NULL && i < work->vertexCount; i++) {
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " %u", indices[i]);
+			}
+			for (unsigned i = 0; i < 4 && i < work->vertexCount && at + 60 < sizeof(line); i++) {
+				const float *one = v + 12 * (i + (indices != NULL ? work->baseVertex : 0));
+
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " (%.1f %.1f %.2f %.2f t %.3f %.3f)", (double)one[0], (double)one[1], (double)one[2],
+						       (double)one[3], (double)one[4], (double)one[5]);
+			}
+			at += (size_t)snprintf(line + at, sizeof(line) - at, "\n");
+			hk_console_line(line, MIN(at, sizeof(line) - 1));
+		}
+	}
+}
+
+/* (M5g) A command buffer that took long, from its commit to the GPU's end: it held up everybody on the one ring. What was in it. */
+- (void)hkSaySlow:(uint64_t)took
+{
+	static _Atomic(unsigned) said;
+	char line[420];
+	size_t at;
+	unsigned draws = 0, dispatches = 0, blits = 0, shown = 0;
+
+	if (atomic_fetch_add(&said, 1) >= 40) {
+		return;
+	}
+	for (HKMetalWork *work in _work) {
+		draws += work->render != nil;
+		blits += work->blit != 0;
+		dispatches += work->pipeline != nil && work->render == nil && work->blit == 0;
+	}
+	at = (size_t)snprintf(line, sizeof(line), "hkmetal[%s %d]: %llu us from commit to done: %u draws, %u dispatches, %u blits:", getprogname(), getpid(),
+			      (unsigned long long)took, draws, dispatches, blits);
+	for (HKMetalWork *work in _work) {
+		if (work->blit != 0 && at + 60 < sizeof(line)) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " blit kind %u to %lux%lu", work->blit, (unsigned long)[work->blitTo width],
+					       (unsigned long)[work->blitTo height]);
+		}
+		if (work->pipeline == nil || work->render != nil || work->blit != 0 || shown++ >= 3 || at + 100 >= sizeof(line)) {
+			continue;
+		}
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " %s groups %lux%lu", [[[work->pipeline label] description] UTF8String] ?: "(no label)",
+				       (unsigned long)work->groups[0], (unsigned long)work->groups[1]);
+		for (unsigned i = 0; i < work->textureCount && at + 40 < sizeof(line); i++) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " t%u %lux%lu/%lu", i, (unsigned long)[work->textures[i] width],
+					       (unsigned long)[work->textures[i] height], (unsigned long)[work->textures[i] pixelFormat]);
+		}
+	}
+	at += (size_t)snprintf(line + at, sizeof(line) - at, "\n");
+	hk_console_line(line, MIN(at, sizeof(line) - 1));
+}
+
 - (void)hkWaitFence
 {
 	@synchronized (self) {
@@ -6192,6 +8516,21 @@ done:
 			return;
 		}
 		_status = RW_CB_COMPLETED;   /* the fence has been paid, and only now */
+		if (_committedAt != 0) {
+			const uint64_t took = hk_now_us() - _committedAt;
+
+			atomic_fetch_add(&hk_stat.done, 1);
+			atomic_fetch_add(&hk_stat.done_us, took);
+			hk_stat_most(&hk_stat.done_longest, took);
+			if (took > 50000 && hk_stats_on()) {
+				[self hkSaySlow:took];
+			}
+		}
+		if (_bytesChunks != nil) {
+			[(HKMetalDevice *)[_queue device] hkGiveBackBytesChunks:_bytesChunks];
+			[_bytesChunks release];
+			_bytesChunks = nil;
+		}
 		/* ... and given back now, not at -dealloc. Nothing asks a completed buffer's fence
 		 * anything again (the test above returns first), and the back end keeps the
 		 * submission's command buffer with it: run 020900's --draw-all held 208 of each
@@ -6376,6 +8715,8 @@ done:
 	unsigned _resolveLevel[8], _resolveSlice[8];
 	unsigned _depthLevel, _depthSlice;
 	BOOL _drew;                     /* a draw has been recorded: it carried the pass's clears */
+	BOOL _barrierPending;           /* M5g: a barrier of this encoder's stands before the next draw */
+	unsigned _dontCare;             /* M5g: the load actions MTLLoadActionDontCare, for the first draw */
 	id _depth;
 	id _depthStencilState;
 	float _clearDepth;
@@ -6398,6 +8739,9 @@ done:
 	id _fragmentBuffers[RW_MAX_BUFFERS];
 	NSUInteger _fragmentBufferOffsets[RW_MAX_BUFFERS];
 	id _fragmentTextures[RW_MAX_BUFFERS];
+	id _vertexTextures[RW_MAX_BUFFERS];       /* the vertex stage's, as the library has always taken them */
+	id _vertexSamplers[RW_MAX_BUFFERS];
+	unsigned _vertexTextureCount, _vertexSamplerCount;
 	id _fragmentSamplers[RW_MAX_BUFFERS];
 	unsigned _vertexBufferCount, _fragmentBufferCount;
 	unsigned _fragmentTextureCount, _fragmentSamplerCount;
@@ -6457,6 +8801,9 @@ done:
 		    [attachment resolveTexture] != nil) {
 			_resolveTo[i] = [attachment resolveTexture];
 		}
+		if ([attachment loadAction] == MTLLoadActionDontCare) {
+			_dontCare |= 1u << i;
+		}
 		if ([attachment loadAction] == MTLLoadActionClear) {
 			MTLClearColor c = [attachment clearColor];
 
@@ -6507,6 +8854,12 @@ done:
 		} else if (stex != nil) {
 			_depthLevel = (unsigned)[sa level];
 			_depthSlice = (unsigned)([sa slice] + [sa depthPlane]);
+		}
+		if (ztex != nil && [za loadAction] == MTLLoadActionDontCare) {
+			_dontCare |= RWA_DONT_CARE_DEPTH;
+		}
+		if (stex != nil && [sa loadAction] == MTLLoadActionDontCare) {
+			_dontCare |= RWA_DONT_CARE_STENCIL;
 		}
 		if (ztex != nil && [za loadAction] == MTLLoadActionClear) {
 			_clearDepth = (float)[za clearDepth];
@@ -6586,19 +8939,21 @@ done:
 
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	id buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
+	NSUInteger offset = 0;
+	id buffer = [_commandBuffer hkBytes:bytes length:length offset:&offset];
 
 	if (buffer != nil) {
-		[self setVertexBuffer:[buffer autorelease] offset:0 atIndex:index];
+		[self setVertexBuffer:buffer offset:offset atIndex:index];
 	}
 }
 
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	id buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
+	NSUInteger offset = 0;
+	id buffer = [_commandBuffer hkBytes:bytes length:length offset:&offset];
 
 	if (buffer != nil) {
-		[self setFragmentBuffer:[buffer autorelease] offset:0 atIndex:index];
+		[self setFragmentBuffer:buffer offset:offset atIndex:index];
 	}
 }
 
@@ -6761,6 +9116,9 @@ done:
 	}
 	work->depthLevel = _depthLevel;
 	work->depthSlice = _depthSlice;
+	work->freshPass = _barrierPending;
+	work->dontCareMask = _drew ? 0 : _dontCare;
+	_barrierPending = NO;
 	work->clears = _clears;
 	for (unsigned i = 0; i < 4; i++) {
 		work->clearColor[i] = _clearColor[i];
@@ -6821,6 +9179,14 @@ done:
 	work->samplerCount = _fragmentSamplerCount;
 	for (unsigned i = 0; i < _fragmentSamplerCount; i++) {
 		work->samplers[i] = [_fragmentSamplers[i] retain];
+	}
+	work->vertexTextureCount = _vertexTextureCount;
+	for (unsigned i = 0; i < _vertexTextureCount; i++) {
+		work->vertexTextures[i] = [_vertexTextures[i] retain];
+	}
+	work->vertexSamplerCount = _vertexSamplerCount;
+	for (unsigned i = 0; i < _vertexSamplerCount; i++) {
+		work->vertexSamplers[i] = [_vertexSamplers[i] retain];
 	}
 	[_commandBuffer recordWork:work];
 	[work release];
@@ -6978,28 +9344,53 @@ done:
 	}
 }
 
+/*
+ * A vertex stage's textures. These were dropped here, and on a map with its tiles VectorKit's ground, icons and labels read
+ * theirs in the vertex stage: "the draw failed: DaVinci::ground_base_vertex reads texture 0 and 0 textures were bound", a
+ * failed command buffer and no frame (the owner on Maps: 「有時候還會黑色」; run 084652). A blank grid never drew those.
+ */
 - (void)setVertexTexture:(id)texture atIndex:(NSUInteger)index
 {
-	(void)texture; (void)index;   /* the contract binds textures to the fragment stage only */
+	if (index >= RW_MAX_BUFFERS) {
+		return;
+	}
+	if ([texture isKindOfClass:[HKMetalTexture class]]) {
+		[texture hkFollowSurface];
+	}
+	_vertexTextures[index] = texture;
+	if (index + 1 > _vertexTextureCount) {
+		_vertexTextureCount = (unsigned)index + 1;
+	}
 }
 - (void)setVertexTextures:(const id *)textures withRange:(NSRange)range
 {
-	(void)textures; (void)range;
+	for (NSUInteger i = 0; i < range.length; i++) {
+		[self setVertexTexture:textures[i] atIndex:range.location + i];
+	}
 }
 - (void)setVertexSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
-	(void)sampler; (void)index;
+	if (index >= RW_MAX_BUFFERS) {
+		return;
+	}
+	_vertexSamplers[index] = sampler;
+	if (index + 1 > _vertexSamplerCount) {
+		_vertexSamplerCount = (unsigned)index + 1;
+	}
 }
 - (void)setVertexSamplerState:(id)sampler
 		  lodMinClamp:(float)lodMin
 		  lodMaxClamp:(float)lodMax
 		      atIndex:(NSUInteger)index
 {
-	(void)sampler; (void)lodMin; (void)lodMax; (void)index;
+	(void)lodMin; (void)lodMax;
+	[self setVertexSamplerState:sampler atIndex:index];
 }
 - (void)setVertexSamplerStates:(const id *)samplers withRange:(NSRange)range
 {
-	(void)samplers; (void)range;
+	for (NSUInteger i = 0; i < range.length; i++) {
+		[self setVertexSamplerState:samplers[i] atIndex:range.location + i];
+	}
 }
 - (void)setFragmentTextures:(const id *)textures withRange:(NSRange)range
 {
@@ -7315,11 +9706,17 @@ done:
  * is. If that ever stops being true -- a second ring, or work submitted from -endEncoding
  * -- these stop being correct, which is why it is written down here and not assumed.
  */
+/*
+ * [M5g: and in the render encoder they are no longer nothing. The library's draws used to be a
+ * Vulkan pass each with a barrier of their own; now they share a pass (air_vk.c, ONE PASS FOR
+ * MANY DRAWS), and the next draw after one of these starts a new pass, which has the barrier.]
+ */
 - (void)memoryBarrierWithScope:(NSUInteger)scope
 		   afterStages:(NSUInteger)after
 		  beforeStages:(NSUInteger)before
 {
 	(void)scope; (void)after; (void)before;
+	_barrierPending = YES;
 }
 - (void)memoryBarrierWithResources:(const id *)resources
 			     count:(NSUInteger)count
@@ -7327,8 +9724,9 @@ done:
 		      beforeStages:(NSUInteger)before
 {
 	(void)resources; (void)count; (void)after; (void)before;
+	_barrierPending = YES;
 }
-- (void)textureBarrier { }
+- (void)textureBarrier { _barrierPending = YES; }
 - (void)updateFence:(id)fence afterStages:(NSUInteger)stages
 {
 	(void)fence; (void)stages;
@@ -8649,6 +11047,9 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
  */
 - (void)setArgumentBuffer:(id)buffer offset:(NSUInteger)offset
 {
+	if ([buffer isKindOfClass:[HKMetalBuffer class]]) {
+		[(HKMetalBuffer *)buffer hkNeverKeep];
+	}
 	if (buffer != nil && ![buffer isKindOfClass:[HKMetalBuffer class]]) {
 		rw_print("the argument buffer is a %s and not one of ours, so "
 		         "nothing can be encoded into it\n",

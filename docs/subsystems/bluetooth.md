@@ -3,6 +3,8 @@
 Status, 2026-10-26: **native BLE/GATT and classic headset pairing/encryption verified; audio playback and reconnection unfinished.**
 Opt-in only: kernel `bt=1`, userland `BLUETOOTH=1`. Installed boot bundle is unchanged.
 
+**2026-11-06: on by default in RAM kernels (`bt=1` in the board's defaults; the chip stays off with no `fw/htnv20.bin` in the small image: run 015855, with the shared root).** With Wi-Fi (up, not joined), camera, DSP and sound on (the amplifiers down), no `bt=` on the line: the chip up after the known first retry, iOS's CoreBluetooth state 5 (powered on), `bt_test=1`'s controller LE scan 449 reports in 4 s, classic inquiry 0 in 5 s (runs 011428, 012611, 013103). `tools/nf/mk_extra.sh bt` is what `BLUETOOTH=1` adds, for a test root. **Owner-confirmed (the owner, by eye on the combined build 「metal-一次看」, 2026-11-06: 「闪光灯和蓝牙OK了」; what was tried with it was not relayed).** **Not checked by this session on this kernel:** buds and A2DP, HFP, a GATT link (`bt_scan --link` needs the controlled peer; `tools/bt/mac_peer.swift` is one on a Mac, whose privacy check kills it until the host app is allowed Bluetooth), any of it with Wi-Fi traffic. Bonds across a reboot need a kept `/var`.
+
 ## Hardware and transport
 
 The live Android device tree identifies the Bluetooth half of QCA6390 on **QUP0 SE6 UART at

@@ -40,6 +40,7 @@ Start with the root [README](../README.md) for the overview and the QEMU quick s
 ## Research ([research/](research/README.md))
 iOS internals [ios-userland.md](research/ios-userland.md) · kernel stand-ins [kernel-standins.md](research/kernel-standins.md) · hardware rules [hardware-qualcomm.md](research/hardware-qualcomm.md) ·
 boot chain and recovery [boot-chain-and-recovery.md](research/boot-chain-and-recovery.md) · dead ends [failed-approaches.md](research/failed-approaches.md) · measurement pitfalls [checks.md](research/checks.md).
+- [research/ipa-install.md](research/ipa-install.md): an .ipa on the phone with no installd (T38 item 13).
 **Metal / AIR shader research** (userland repository, research not shipped functionality): [air.md](air.md), [air-report.md](air-report.md).
 
 ## Elsewhere

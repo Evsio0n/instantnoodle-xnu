@@ -56,6 +56,8 @@ void hk_ufs_report(const char *when); /* where reading the storage has spent its
 bool hk_ufs_dev(dev_t dev);           /* one of the storage's devices */
 void hk_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
 int hk_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
+int hk_battery_percent(void);      /* its charge, -1 while it is not known */
+int hk_battery_voltage_mv(void);   /* its voltage, -1 while it is not known */
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/hk_buttons.c) */
 void hk_spmi_lock(void);
 void hk_spmi_unlock(void);

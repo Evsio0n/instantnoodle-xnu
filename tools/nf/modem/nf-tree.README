@@ -1,0 +1,2 @@
+
+# xnu-src/nf-tree also has mhi_host.h = wifi/lx/src/mhi_host.h with MHI_HOST_CHANNELS 6 instead of 4 (the modem starts channels 10 and 11).

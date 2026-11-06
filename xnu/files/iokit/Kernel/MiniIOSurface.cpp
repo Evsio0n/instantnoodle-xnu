@@ -29,6 +29,7 @@
 #include <sys/proc.h>
 
 #include "MiniIOSurface.h"
+#include "../../bsd/dev/instantnoodle_mdp.h"
 
 static_assert(sizeof(struct minisurf_plane) == 0x80, "plane layout");
 static_assert(sizeof(struct minisurf_result) == 0x68, "result layout");
@@ -283,6 +284,9 @@ MiniIOSurface::free(void)
 		    "the middle %#010x\n", sid, info.width, info.height, nonzero, info.allocSize / 64, middle);
 	}
 
+	if (mdpAddress != 0) {
+		hk_mdp_range_free(mdpAddress, mdpPages);
+	}
 	OSSafeReleaseNULL(values);
 	OSSafeReleaseNULL(clientMap);
 	OSSafeReleaseNULL(scanoutMap);
@@ -610,6 +614,14 @@ surfaceCreate(OSDictionary * props, IOReturn * error, IOMemoryMap * scanout = NU
 	if (scanout != NULL) {
 		alloc = (uint32_t) needed;
 	} else if (wrapped == NULL) {
+		/*
+		 * Rows for the GPU past the last one. The blits between its tile memory and a surface go 16 x 4 at a time, so turnip lays the last level out with its
+		 * rows rounded up to 4 (fdl6_layout) and will not import a surface smaller than that (tu_knl_drm_msm.cc): the Dock's 1065 x 282 and a 281 x 609, 4
+		 * and 3 rows short, could not be drawn into, CoreAnimation's "no drawable" (runs 222000, 225658, 230102).
+		 */
+		if (planeCount == 0 && eh == 1 && (uint64_t) bpr * alignUp(height, 4) + offset > alloc && (uint64_t) bpr * alignUp(height, 4) + offset <= MINISURF_MAX_ALLOC) {
+			alloc = (uint32_t) ((uint64_t) bpr * alignUp(height, 4) + offset);
+		}
 		alloc = alignUp(alloc, (uint32_t) PAGE_SIZE);
 	} else {
 		/* (the memory is as big as its owner says, and not a byte of ours is added to it) */

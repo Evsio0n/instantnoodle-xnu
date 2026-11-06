@@ -42,8 +42,9 @@ phone itself: that needs a load that heats it past 95 C.
 
 ## Motion/light sensors (accelerometer, gyroscope, compass, light, proximity, barometer): not available
 
-On this phone they are not wired to the application processor: they hang off the audio DSP, behind its sensor
-framework (Qualcomm's "SEE"), reached through the QMI service 400 over QRTR. What is there and what is missing:
+They are not wired to the application processor: they hang off a DSP, behind its sensor framework (Qualcomm's "SEE"), reached through the QMI service 400 over QRTR. **On the
+OnePlus 8 that DSP is the SLPI (PAS 12, PID 3), not the audio DSP:** it boots here and service 400 answers, with an empty sensor list ([../research/next-features.md](../research/next-features.md) section 4; `hk_slpi_boot.c`, off by default).
+The table below is redwood's audio-DSP path. What is there and what is missing:
 
 | Step | State |
 |---|---|
@@ -60,5 +61,6 @@ run on a phone is not recorded.
 
 ## Location (GPS): not available
 
-The GNSS receiver belongs to the modem (`qcom,mss@4080000`), which this port does not start yet; location comes
-with the modem, through its QMI location service (16).
+The GNSS receiver belongs to the modem, which this port does not start yet. On redwood that is the in-SoC modem (`qcom,mss@4080000`); **the OnePlus 8 has none in the SoC:
+its modem is an external SDX55 on PCIe 2 (`mdm0: qcom,ext-sdx55m`, no `qcom,mss` node in its tree [observed])**, see [../research/next-features.md](../research/next-features.md) section 3. GNSS comes
+with the modem, through its QMI location service (16). Location by Wi-Fi does not need the modem: it is `locationd` and Apple's positioning service (same page, section 5).

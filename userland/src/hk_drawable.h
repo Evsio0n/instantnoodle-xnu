@@ -55,6 +55,15 @@ struct rwd_surface {
 
 #define RWD_DESCRIBE 0xffffffffu          /* kHKDescribe: answer, allocate nothing */
 
+/* A plane of a surface as this process's IOSurface knows it (A PLANE, BY ITS BYTES, hkdrawable.m) */
+struct rwd_plane {
+	uint8_t *base;                    /* where it is mapped here */
+	uint32_t offset, row, height;     /* from the surface's start, a row's length, how many rows */
+	uint32_t count;                   /* how many planes the surface has (one if it says none) */
+};
+
+int rwd_plane_of(void *iosurface, unsigned long plane, struct rwd_plane *out);
+
 /*
  * The shape, in the same fields and the same order as `struct rwa_texture_shape`
  * (tools/mesa/air/air_metal.h). Declared again under a name of this file's own for the

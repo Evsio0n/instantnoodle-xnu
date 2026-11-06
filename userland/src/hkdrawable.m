@@ -311,7 +311,7 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
 	 * is what the kernel's MINISURF_ROW_ALIGN also is, and the agreement between the two
 	 * trees is the whole reason this is expected to pass.
 	 */
-	const unsigned align = 64;
+	const unsigned align = bytes_per_pixel == 16 ? 256 : 64;   /* (16 texels when a texel is past 4 bytes: turnip's layout) */
 	uint64_t least;
 
 	if (surface == NULL || bytes_per_pixel == 0) {
@@ -413,6 +413,7 @@ static const struct rwd_format rwd_formats[] = {
 	{  91, 'R10k', 4, 0, "MTLPixelFormatRGB10A2Uint" },
 	{ 110, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Unorm" },
 	{ 113, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Uint" },
+	{ 123, 'BGRA', 16, 0, "MTLPixelFormatRGBA32Uint" },   /* (M5g: VideoToolbox, four BGRA pixels a texel) */
 	{ 550, 'b3a8', 4, 1, "a ten-bit XR format" },
 	{ 551, 'b3a8', 4, 1, "a ten-bit XR format" },
 	{ 552, 'w40a', 4, 1, "a ten-bit XR format" },
@@ -420,6 +421,51 @@ static const struct rwd_format rwd_formats[] = {
 	{ 554, 'w30r', 4, 1, "a ten-bit XR format" },
 	{ 555, 'w30r', 4, 1, "a ten-bit XR format" },
 };
+
+/*
+ * A PLANE, BY ITS BYTES (M5g). VideoToolbox's compute passes lay shapes of their own over a surface: one texel to four
+ * pixels (126x378 of RGBA8Uint over a plane of 504x378 bytes, 197x1706 of RGBA32Uint over BGRA), and each plane of a 420f
+ * by itself (run 022942). None of that reached a dispatch: refused, it fell to the CPU, and where the CPU may not (a turn
+ * with a scale, vtPixelRotation_IsValidForSoftware) that is CMPhoto's -12914. What has to agree is the rows and the bytes in
+ * a row. Where a plane lies is IOSurface's own knowledge in this process; the kernel reports the count only.
+ */
+int
+rwd_plane_of(void *iosurface, unsigned long plane, struct rwd_plane *out)
+{
+	static size_t (*count_of)(void *), (*row)(void *), (*height)(void *), (*row_of)(void *, size_t), (*height_of)(void *, size_t);
+	static void *(*base)(void *), *(*base_of)(void *, size_t);
+
+	if (base_of == NULL) {
+		*(void **)&count_of = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
+		*(void **)&row = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+		*(void **)&height = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeight");
+		*(void **)&row_of = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRowOfPlane");
+		*(void **)&height_of = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeightOfPlane");
+		*(void **)&base = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+		*(void **)&base_of = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddressOfPlane");
+	}
+	if (iosurface == NULL || count_of == NULL || row == NULL || height == NULL || row_of == NULL || height_of == NULL || base == NULL || base_of == NULL) {
+		return -1;
+	}
+	const size_t count = count_of(iosurface);
+
+	if (plane >= (count != 0 ? count : 1)) {
+		return -1;
+	}
+	out->count = count != 0 ? (uint32_t)count : 1;
+	if (count == 0) {
+		out->base = base(iosurface);
+		out->offset = 0;
+		out->row = (uint32_t)row(iosurface);
+		out->height = (uint32_t)height(iosurface);
+	} else {
+		out->base = base_of(iosurface, plane);
+		out->offset = (uint32_t)(out->base - (uint8_t *)base(iosurface));
+		out->row = (uint32_t)row_of(iosurface, plane);
+		out->height = (uint32_t)height_of(iosurface, plane);
+	}
+	return out->base != NULL ? 0 : -1;
+}
 
 int
 rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *bytes_per_pixel,
@@ -593,10 +639,11 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	 * plane of anything else is an application's own IOSurface and not a drawable's, and it
 	 * would need a per-plane geometry this driver does not read.
 	 */
-	if (plane != 0) {
-		rwd_say(why, why_size, "plane %lu of a surface was asked for; this driver "
-		    "imports plane 0 only, and CoreAnimation's drawables never ask for another",
-		    plane);
+	struct rwd_plane where;
+	const bool where_known = rwd_plane_of(iosurface, plane, &where) == 0;
+
+	if (plane != 0 && !where_known) {
+		rwd_say(why, why_size, "plane %lu of a surface was asked for, which has no such plane", plane);
 		return NULL;
 	}
 	id = rwd_surface_id(iosurface);
@@ -625,7 +672,11 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	if (rwd_surface_describe(connection, id, &surface, why, why_size) != 0) {
 		return NULL;
 	}
-	if (surface.width != want->width || surface.height != want->height) {
+	/* (A PLANE, BY ITS BYTES) */
+	const bool view = where_known && (where.count > 1 || surface.width != want->width) && want->height == where.height &&
+			  (uint64_t)want->width * bytes_per_pixel <= where.row && where.offset % 64 == 0;
+
+	if (!view && (surface.width != want->width || surface.height != want->height)) {
 		rwd_say(why, why_size, "surface %u is %ux%u and the descriptor asks for %ux%u",
 		    id, surface.width, surface.height, want->width, want->height);
 		return NULL;
@@ -636,9 +687,9 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 				want->pixel_format == 25 || want->pixel_format == 30 || want->pixel_format == 33 ||
 				want->pixel_format == 53 || want->pixel_format == 55 || want->pixel_format == 60 ||
 				want->pixel_format == 63 || want->pixel_format == 65 || want->pixel_format == 73 ||
-				want->pixel_format == 91 || want->pixel_format == 110 || want->pixel_format == 113;
+				want->pixel_format == 91 || want->pixel_format == 110 || want->pixel_format == 113 || want->pixel_format == 123;
 
-	if (!any_fourcc && surface.pixelFormat != fourcc) {
+	if (!any_fourcc && !view && surface.pixelFormat != fourcc) {
 		rwd_say(why, why_size, "surface %u is '%c%c%c%c' and Metal format %u is "
 		    "'%c%c%c%c'", id, (char)(surface.pixelFormat >> 24),
 		    (char)(surface.pixelFormat >> 16), (char)(surface.pixelFormat >> 8),
@@ -646,7 +697,16 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		    (char)(fourcc >> 16), (char)(fourcc >> 8), (char)fourcc);
 		return NULL;
 	}
-	if (rwd_surface_fits_adreno(&surface, bytes_per_pixel, why, why_size) != 0) {
+	struct rwd_surface laid = surface;
+
+	if (view) {
+		laid.width = want->width;
+		laid.height = want->height;
+		laid.rowBytes = where.row;
+		laid.offset += where.offset;
+		laid.planes = 1;
+	}
+	if (rwd_surface_fits_adreno(&laid, bytes_per_pixel, why, why_size) != 0) {
 		return NULL;
 	}
 	/*
@@ -673,7 +733,7 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	 * per user client -- and then there would be two owners of one surface and only one
 	 * release.
 	 */
-	texture = import(mesa_device, want, (int)id, surface.offset, surface.rowBytes, why,
+	texture = import(mesa_device, want, (int)id, laid.offset, laid.rowBytes, why,
 	    why_size);
 	if (texture == NULL) {
 		return NULL;    /* the library wrote the sentence; it names the GPU's own reason */

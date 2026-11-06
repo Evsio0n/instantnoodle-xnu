@@ -238,6 +238,76 @@ GenericARMPE::probe(IOService * provider, SInt32 * score)
 	return this;
 }
 
+/*
+ * What the board's defaults (pexpert/arm/pe_bootargs.c) say of the camera, in the device tree. The loader writes /arm-io/isp (MobileGestalt's
+ * still-camera and rear-facing-camera, by which SpringBoard shows Camera.app), /product/camera (its video-camera) and that node's "flash"
+ * (its camera-flash, Control Center's flashlight button) only for cam=5 and torch=N on its own command line, and the defaults are added
+ * after it has run: a boot whose line has neither word would show iOS no camera and no flash. So what the loader did not write is written
+ * here, with its values, and no line has to say it and no loader (the installed one is not to change) has to know. arg=0: not written.
+ */
+static IORegistryEntry *
+deviceTreeNode(const char * path, const char * parentPath, const char * name)
+{
+	IORegistryEntry * node = IORegistryEntry::fromPath(path, gIODTPlane), * parent;
+
+	if (node != NULL) {
+		return node;
+	}
+	parent = IORegistryEntry::fromPath(parentPath, gIODTPlane);
+	node = new IOService;
+	if (parent == NULL || node == NULL || !node->init()) {
+		OSSafeReleaseNULL(node);
+	} else {
+		node->setName(name);
+		node->attachToParent(parent, gIODTPlane);
+	}
+	OSSafeReleaseNULL(parent);
+	return node;
+}
+
+static void
+deviceTreeOne(IORegistryEntry * node, const char * key, bool * added)
+{
+	static const uint32_t one = 1;
+
+	if (node->getProperty(key) == NULL) {
+		OSData * data = OSData::withBytes(&one, sizeof(one));
+
+		if (data != NULL) {
+			node->setProperty(key, data);
+			data->release();
+			*added = true;
+		}
+	}
+}
+
+static void
+cameraNodes(void)
+{
+	uint32_t cam = 0, torch = 0;
+	IORegistryEntry * node;
+	bool rear = false, flash = false;
+
+	PE_parse_boot_argn("cam", &cam, sizeof(cam));
+	PE_parse_boot_argn("torch", &torch, sizeof(torch));
+	if (cam == 5 && (node = deviceTreeNode("/arm-io/isp", "/arm-io", "isp")) != NULL) {
+		deviceTreeOne(node, "camera-rear", &rear);
+		node->release();
+	}
+	if ((cam == 5 || torch != 0) && (node = deviceTreeNode("/product/camera", "/product", "camera")) != NULL) {
+		if (torch != 0) {
+			deviceTreeOne(node, "flash", &flash);
+		}
+		node->release();
+	}
+	if (rear || flash) {
+		char line[96];
+
+		snprintf(line, sizeof(line), "device tree: from the board's defaults:%s%s\n", rear ? " the camera" : "", flash ? " the flash" : "");
+		loader_log_line(line);
+	}
+}
+
 bool
 GenericARMPE::start(IOService * provider)
 {
@@ -407,6 +477,7 @@ GenericARMPE::start(IOService * provider)
 	MiniAppleARMBacklightStart();
 	MiniIONetworkStackStart();
 	HKBluetoothStart();
+	cameraNodes();
 	return true;
 }
 

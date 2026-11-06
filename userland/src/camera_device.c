@@ -24,7 +24,8 @@
  * are scaled from the sensor's frames to whatever size is asked for.
  *
  * The shutter: StillImageCaptureNow asks for one frame of the whole sensor on the StillImage output
- * (the time machine's TimeMachineSuspendNow/ResumeNow are taken and ignored). Focus, where there is
+ * (the time machine's TimeMachineSuspendNow/ResumeNow are taken and ignored), with the flash when FlashMode
+ * has been set to "ForceFlashOn" (flash_frame()). Focus, where there is
  * a lens motor (the wide camera's): by contrast, continuous, and on the window a tap gives (af_frame()).
  *
  * Everything asked of the device and the streams that is not answered here is said in mediaserverd's
@@ -47,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include "camera_gpu.h"
@@ -233,6 +235,33 @@ say_once(const char *what, CFStringRef key, CFTypeRef value)
 	}
 }
 
+/* a whole dictionary (what the shutter asks for), a line at a time */
+static void
+say_long(const char *what, CFTypeRef value)
+{
+	static char text[4000], tight[4000];
+	CFStringRef d = value != NULL ? CFCopyDescription(value) : NULL;
+	CFIndex used = 0;
+	size_t n = 0;
+
+	if (d != NULL) {
+		CFStringGetBytes(d, CFRangeMake(0, CFStringGetLength(d)), kCFStringEncodingUTF8, '?', false, (UInt8 *)text, sizeof(text) - 1, &used);
+		CFRelease(d);
+	}
+	for (CFIndex i = 0; i < used; i++) {
+		char c = text[i] == '\n' || text[i] == '\t' ? ' ' : text[i];
+
+		if (c != ' ' || (n > 0 && tight[n - 1] != ' ')) {
+			tight[n++] = c;
+		}
+	}
+	tight[n] = 0;
+	say("%s: %zu bytes", what, n);
+	for (size_t at = 0; at < n; at += 200) {
+		say("%s: %.200s", what, tight + at);
+	}
+}
+
 /* ---- numbers and dictionaries ---------------------------------------------------------------------- */
 
 static CFNumberRef
@@ -293,7 +322,7 @@ static const struct prop stream_props[] = {
 	{ "VideoOutputsEnabled", "Collection", "ReadWrite" }, { "VideoOutputHandlers", "Collection", "WriteOnly" },
 	{ "DeferAdditionOfAttachments", "Boolean", "ReadWrite" }, { "TorchLevel", "Number", "ReadWrite" },
 	{ "HighCurrentTorchEnabled", "Boolean", "ReadWrite" }, { "ColorSpace", "Number", "ReadWrite" }, { "ZoomFactor", "Number", "ReadWrite" },
-	{ "ExposureBias", "Number", "ReadWrite" }, { "DeviceOrientation", "Number", "ReadWrite" }, { "FlashMode", "Number", "ReadWrite" },
+	{ "ExposureBias", "Number", "ReadWrite" }, { "DeviceOrientation", "Number", "ReadWrite" }, { "FlashMode", "String", "ReadWrite" },
 	{ "StillImageCaptureNow", "Collection", "WriteOnly" }, { "LockAENow", "Boolean", "WriteOnly" }, { "UnlockAENow", "Boolean", "WriteOnly" },
 	{ "LockAWBNow", "Boolean", "WriteOnly" }, { "UnlockAWBNow", "Boolean", "WriteOnly" }, { "MaxIntegrationTime", "Number", "ReadWrite" },
 	{ "AEMaxGain", "Number", "ReadWrite" }, { "AEMinGain", "Number", "ReadWrite" }, { "FaceDetectionEnabled", "Boolean", "ReadWrite" },
@@ -528,6 +557,263 @@ on_instantnoodle(void)
 }
 
 /*
+ * Boot-arg cam_fast=1, a measurement: AE may not stretch a frame, so the rate holds and the dark stays darker
+ * (the preview at 15 a second in a dark room is that stretch, docs/KNOWN_ISSUES.md K38).
+ */
+static bool
+frames_kept_short(void)
+{
+	static int known = -1;
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+
+	if (known < 0) {
+		known = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "cam_fast=1") != NULL;
+	}
+	return known == 1;
+}
+
+/*
+ * cam_mem=1's other half: large blocks by who asked and how many are still out, through libmalloc's own logger, the one
+ * its stack logging uses (found by name, so a library without it only says so). No allocation in here, no lock; counts
+ * can lose a race, which is fine for finding the one that grows.
+ */
+#define ASKER_FRAMES    8
+#define ASKERS          32
+#define BLOCKS          (1 << 16)
+#define BLOCK_LEAST     (16 * 1024)
+static struct asker {
+	uint64_t        key;
+	uintptr_t       pc[ASKER_FRAMES];
+	uint64_t        times, bytes, live, last;
+} askers[ASKERS];
+static struct {
+	uintptr_t       block;
+	uint64_t        bytes;
+	int             asker;
+} blocks[BLOCKS];
+static uint64_t asked_of_size[64][2];   /* (by the bits of a size, every malloc: how many, how many bytes) */
+
+static void
+note_block(uint32_t type, uintptr_t zone, uintptr_t a, uintptr_t b, uintptr_t result, uint32_t skip)
+{
+	uintptr_t pc[ASKER_FRAMES] = { 0 }, top, low, fp = (uintptr_t)__builtin_frame_address(0), gone = 0;
+	uint64_t size = 0, key = 1469598103934665603ULL;
+	int n = 0, who = -1;
+
+	(void)zone;
+	(void)skip;
+	if (!(type & 8)) {                      /* (MALLOC_LOG_TYPE_HAS_ZONE: malloc's own) */
+		return;
+	}
+	if ((type & 6) == 6) {                  /* realloc: the old block in a, the new size in b */
+		gone = a;
+		size = b;
+	} else if (type & 2) {
+		size = a;
+	} else if (type & 4) {
+		gone = a;
+	}
+	if (gone != 0) {
+		for (uint32_t i = 0, at = (uint32_t)(gone >> 14) % BLOCKS; i < 64 && blocks[at].block != 0; i++, at = (at + 1) % BLOCKS) {
+			if (blocks[at].block == gone) {
+				__sync_fetch_and_sub(&askers[blocks[at].asker].live, blocks[at].bytes);
+				blocks[at].block = 1;
+				break;
+			}
+		}
+	}
+	if (size != 0 && result != 0) {
+		int bits = 64 - __builtin_clzll(size);
+
+		__sync_fetch_and_add(&asked_of_size[bits & 63][0], 1);
+		__sync_fetch_and_add(&asked_of_size[bits & 63][1], size);
+	}
+	if (size < BLOCK_LEAST || result == 0) {
+		return;
+	}
+	top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+	low = top - pthread_get_stacksize_np(pthread_self());
+	while (n < ASKER_FRAMES && fp > low && fp < top - 16 && (fp & 7) == 0) {
+		uintptr_t next = ((uintptr_t *)fp)[0];
+
+		pc[n] = ((uintptr_t *)fp)[1];
+		key = (key ^ pc[n]) * 1099511628211ULL;
+		n++;
+		if (next <= fp) {
+			break;
+		}
+		fp = next;
+	}
+	for (int i = 0; i < ASKERS && who < 0; i++) {
+		if (askers[i].key == key) {
+			who = i;
+		} else if (askers[i].key == 0 && __sync_bool_compare_and_swap(&askers[i].key, 0, key)) {
+			memcpy(askers[i].pc, pc, sizeof(pc));
+			who = i;
+		}
+	}
+	if (who < 0) {
+		return;
+	}
+	__sync_fetch_and_add(&askers[who].times, 1);
+	__sync_fetch_and_add(&askers[who].bytes, size);
+	__sync_fetch_and_add(&askers[who].live, size);
+	askers[who].last = size;
+	for (uint32_t i = 0, at = (uint32_t)(result >> 14) % BLOCKS; i < 64; i++, at = (at + 1) % BLOCKS) {
+		uintptr_t was = blocks[at].block;
+
+		if ((was == 0 || was == 1) && __sync_bool_compare_and_swap(&blocks[at].block, was, result)) {
+			blocks[at].bytes = size;
+			blocks[at].asker = who;
+			break;
+		}
+	}
+}
+
+static void
+say_askers(unsigned long long frames)
+{
+	static bool on;
+	bool said[ASKERS] = { false };
+
+	if (!on) {
+		void (**logger)(uint32_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uint32_t) = dlsym(RTLD_DEFAULT, "malloc_logger");
+
+		on = true;
+		say("memory %llu: libmalloc's logger %s", frames, logger != NULL ? "found: large blocks are counted from now" : "not found");
+		if (logger != NULL) {
+			*logger = note_block;
+		}
+		return;
+	}
+	for (int bits = 0; bits < 64; bits++) {
+		if (asked_of_size[bits][1] >> 20 >= 16) {
+			say("memory %llu: malloc asked for sizes to %llu bytes: %llu times, %llu MB", frames, 1ULL << bits,
+			    (unsigned long long)asked_of_size[bits][0], (unsigned long long)asked_of_size[bits][1] >> 20);
+		}
+	}
+	for (int rank = 0; rank < 5; rank++) {
+		int top = -1;
+		char line[512];
+		size_t used = 0;
+
+		for (int i = 0; i < ASKERS; i++) {
+			top = !said[i] && askers[i].key != 0 && (top < 0 || askers[i].live > askers[top].live) ? i : top;
+		}
+		if (top < 0) {
+			break;
+		}
+		said[top] = true;
+		line[0] = 0;
+		for (int i = 0; i < ASKER_FRAMES && askers[top].pc[i] != 0 && used < sizeof(line) - 64; i++) {
+			Dl_info where;
+			const char *image = "?";
+			uintptr_t base = 0;
+
+			if (dladdr((void *)askers[top].pc[i], &where) != 0 && where.dli_fname != NULL) {
+				image = strrchr(where.dli_fname, '/') != NULL ? strrchr(where.dli_fname, '/') + 1 : where.dli_fname;
+				base = (uintptr_t)where.dli_fbase;
+			}
+			used += (size_t)snprintf(line + used, sizeof(line) - used, " %.24s+%#lx", image, (unsigned long)(askers[top].pc[i] - base));
+		}
+		say("memory %llu: live %llu MB of %llu MB in %llu blocks (the last %llu bytes), asked by%s", frames,
+		    (unsigned long long)askers[top].live >> 20, (unsigned long long)askers[top].bytes >> 20,
+		    (unsigned long long)askers[top].times, (unsigned long long)askers[top].last, line);
+	}
+}
+
+/*
+ * Boot-arg cam_mem=1, a measurement: every 300 frames, the task's other counters beside its footprint, the phone's
+ * free pages (is the footprint's growth memory at all?) and the task's largest regions by VM tag (K38).
+ */
+static void
+say_memory(unsigned long long frames)
+{
+	static int known = -1;
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	task_vm_info_data_t vm;
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	vm_statistics64_data_t phone;
+	mach_msg_type_number_t phone_count = HOST_VM_INFO64_COUNT;
+	uint64_t tagged[256][2] = { { 0 } };    /* (each tag's bytes dirtied or swapped out, and its bytes in all) */
+	vm_address_t large_at = 0;
+	vm_size_t large_most = 0;
+	bool large_readable = false;
+	unsigned large_regions = 0;
+	vm_address_t address = 0;
+	natural_t depth = 0;
+
+	if (known < 0) {
+		known = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "cam_mem=1") != NULL;
+	}
+	if (known != 1) {
+		return;
+	}
+	if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS) {
+		say("memory %llu: bytes: footprint %llu, resident %llu, internal %llu, external %llu, reusable %llu, compressed %llu, "
+		    "virtual %llu", frames, (unsigned long long)vm.phys_footprint, (unsigned long long)vm.resident_size,
+		    (unsigned long long)vm.internal, (unsigned long long)vm.external, (unsigned long long)vm.reusable,
+		    (unsigned long long)vm.compressed, (unsigned long long)vm.virtual_size);
+	}
+	if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&phone, &phone_count) == KERN_SUCCESS) {
+		say("memory %llu: the phone in MB: free %llu, active %llu, inactive %llu, wired %llu, in the compressor %llu", frames,
+		    (unsigned long long)phone.free_count * vm_kernel_page_size >> 20,
+		    (unsigned long long)phone.active_count * vm_kernel_page_size >> 20,
+		    (unsigned long long)phone.inactive_count * vm_kernel_page_size >> 20,
+		    (unsigned long long)phone.wire_count * vm_kernel_page_size >> 20,
+		    (unsigned long long)phone.compressor_page_count * vm_kernel_page_size >> 20);
+	}
+	for (;;) {
+		vm_size_t bytes = 0;
+		struct vm_region_submap_info_64 info;
+		mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+		if (vm_region_recurse_64(mach_task_self(), &address, &bytes, &depth, (vm_region_recurse_info_t)&info,
+		    &info_count) != KERN_SUCCESS) {
+			break;
+		}
+		if (info.is_submap) {
+			depth++;
+			continue;
+		}
+		tagged[info.user_tag & 255][0] += (uint64_t)(info.pages_dirtied + info.pages_swapped_out) * vm_kernel_page_size;
+		tagged[info.user_tag & 255][1] += bytes;
+		if (info.user_tag == 3) {
+			large_regions++;
+			if (bytes >= large_most) {
+				large_most = bytes;
+				large_at = address;
+				large_readable = (info.protection & VM_PROT_READ) != 0;
+			}
+		}
+		address += bytes;
+	}
+	for (int rank = 0; rank < 6; rank++) {
+		int top = 0;
+
+		for (int tag = 1; tag < 256; tag++) {
+			top = tagged[tag][0] > tagged[top][0] ? tag : top;
+		}
+		if (tagged[top][0] == 0) {
+			break;
+		}
+		say("memory %llu: tag %d: %llu KB dirty of %llu KB", frames, top, (unsigned long long)tagged[top][0] >> 10,
+		    (unsigned long long)tagged[top][1] >> 10);
+		tagged[top][0] = 0;
+	}
+	if (large_at != 0) {
+		/* (the largest region of tag 3, and what its last page starts with: a few words, numbers only) */
+		const uint32_t *w = large_readable ? (const uint32_t *)(large_at + large_most - vm_kernel_page_size) : NULL;
+
+		say("memory %llu: tag 3: %u regions, the largest %llu KB at %#lx: %08x %08x %08x %08x", frames, large_regions,
+		    (unsigned long long)large_most >> 10, (unsigned long)large_at, w ? w[0] : 0, w ? w[1] : 0, w ? w[2] : 0, w ? w[3] : 0);
+	}
+	say_askers(frames);
+}
+
+/*
  * How much of a zoom a frame already is by the sensor's mode: the OnePlus 8's wide IMX586 in its mode 6 is the
  * middle half of the sensor each way, 2x (the rest of a zoom is the picture's: camera_isp.c's isp->zoom).
  */
@@ -555,6 +841,10 @@ struct stream {
 	CFDictionaryRef metadata;       /* the last frame's (frame_metadata()), for a buffer that has none of its own */
 	pthread_mutex_t metadata_lock;  /* (not `lock': AddAttachmentsToSampleBuffer may come while a frame is given out) */
 	unsigned        stills_wanted;  /* photographs asked for by StillImageCaptureNow, not yet given */
+	bool            flash_wanted;   /* FlashMode: the next photographs with the flash */
+	int             flash;          /* its part in the photograph being taken: 0, FLASH_SETTLING, FLASH_READY */
+	uint64_t        flash_since;    /* when it was asked for (mach_absolute_time) */
+	unsigned        flash_frames, flash_steady;
 	int             format_index;
 	double          min_fps, max_fps;
 	float           zoom;           /* ZoomFactor: the picture is the middle 1/zoom of the sensor each way */
@@ -682,7 +972,9 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 
 		value = CFArrayCreate(NULL, (const void **)&srgb, 1, &kCFTypeArrayCallBacks);
 		CFRelease(srgb);
-	} else if (key_is(key, "ColorSpace") || key_is(key, "DeviceOrientation") || key_is(key, "FlashMode")) {
+	} else if (key_is(key, "FlashMode")) {
+		value = s->flash_wanted ? CFSTR("ForceFlashOn") : CFSTR("ForceFlashOff");
+	} else if (key_is(key, "ColorSpace") || key_is(key, "DeviceOrientation")) {
 		value = number_i(0);
 	} else if (key_is(key, "HasAutoFocusPositionSensor") || key_is(key, "HighCurrentTorchEnabled") ||
 	    key_is(key, "DeferAdditionOfAttachments")) {
@@ -869,7 +1161,7 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		pthread_mutex_lock(&s->lock);
 		s->stills_wanted++;
 		pthread_mutex_unlock(&s->lock);
-		say_once("stream: a photograph asked for", key, value);
+		say_long("stream: a photograph asked for", value);
 		return 0;
 	}
 	if (key_is(key, "VideoOutputsColorInfo")) {
@@ -883,6 +1175,12 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 	}
 	if (key_is(key, "TorchLevel")) {
 		torch_set(s, value);
+		return 0;
+	}
+	if (key_is(key, "FlashMode")) {
+		/* (a string: "ForceFlashOn", "ForceFlashOff", set before the shutter's StillImageCaptureNow: run 010240) */
+		s->flash_wanted = value != NULL && CFEqual(value, CFSTR("ForceFlashOn"));
+		say_value("stream:", key, value);
 		return 0;
 	}
 	if (key_is(key, "AutoFocusNow") || key_is(key, "ContinuousAutoFocusNow") || key_is(key, "FocusNow") ||
@@ -933,6 +1231,68 @@ torch_set(struct stream *s, CFTypeRef value)
 	} else {
 		say("the flashlight at %u of 1000", thousandths);
 	}
+}
+
+/*
+ * The flash for a photograph, the part the iPhone's ISP firmware plays. Without a pre-flash and a jump of exposure computed from it: the LEDs light when
+ * the shutter is asked for, the usual AE and white balance bring the picture to that light over some frames, and the first frame after they have settled
+ * is the photograph, whole under the light (with the light on for frames already the rolling shutter asks for no timing). Then the LEDs go off, at most
+ * FLASH_SETTLE_MS after the ask for the picture to come, the kernel's limit a little beyond that. A flash the kernel refuses (bsd/dev/hk_torch.c: its rest,
+ * the battery's charge, the flashlight on) is a photograph without one, by the same path. What the LEDs may do is the kernel's to say.
+ */
+#define HK_TORCH_FLASH          _IOW('h', 1, struct hk_torch_flash)     /* (as in bsd/dev/hk_torch.c) */
+#define FLASH_MA                500             /* a channel: asked for; the kernel's torch_flash_ma limits it */
+#define FLASH_MS                1200            /* the module's own timer ends it there */
+#define FLASH_SETTLE_MS         800
+#define FLASH_LEAST_FRAMES      5               /* the light at the sensor and AE's first answer in the frames */
+#define FLASH_SETTLING          1
+#define FLASH_READY             2
+
+struct hk_torch_flash {
+	uint32_t ma, ms;
+};
+
+static void
+flash_ask(struct stream *s, uint32_t ma, uint32_t ms)
+{
+	struct hk_torch_flash f = { ma, ms };
+
+	if (s->torch < 0) {
+		s->torch = open("/dev/hk-torch", O_WRONLY);
+	}
+	if (s->torch < 0 || ioctl(s->torch, HK_TORCH_FLASH, &f) != 0) {
+		say("the flash (%u mA, %u ms) NOT TAKEN: %s", ma, ms, strerror(errno));
+	}
+}
+
+/* each frame, once its exposure has been looked at: `moving', AE has a change on its way */
+static void
+flash_frame(struct stream *s, bool moving)
+{
+	static mach_timebase_info_data_t timebase;
+
+	if (timebase.denom == 0) {
+		mach_timebase_info(&timebase);
+	}
+	pthread_mutex_lock(&s->lock);
+	if (s->flash == 0 && s->stills_wanted > 0 && s->flash_wanted) {
+		s->flash = FLASH_SETTLING;
+		s->flash_since = mach_absolute_time();
+		s->flash_frames = s->flash_steady = 0;
+		flash_ask(s, FLASH_MA, FLASH_MS);
+		say("the flash asked for: %u mA a channel, at most %u ms", FLASH_MA, FLASH_MS);
+	} else if (s->flash == FLASH_SETTLING) {
+		uint64_t ms = (mach_absolute_time() - s->flash_since) * timebase.numer / timebase.denom / 1000000;
+
+		s->flash_frames++;
+		s->flash_steady = moving ? 0 : s->flash_steady + 1;
+		if ((s->flash_frames >= FLASH_LEAST_FRAMES && s->flash_steady >= 2) || ms >= FLASH_SETTLE_MS) {
+			say("the flash: the photograph's frame after %llu ms, %u frames, %s", (unsigned long long)ms, s->flash_frames,
+			    s->flash_steady >= 2 ? "the exposure settled" : "the exposure not settled");
+			s->flash = FLASH_READY;
+		}
+	}
+	pthread_mutex_unlock(&s->lock);
 }
 
 /* ---- the frames ------------------------------------------------------------------------------------- */
@@ -1101,7 +1461,16 @@ frame_metadata(const struct isp *isp, const struct hk_camera_frame *f, const str
 	md_put(m, MD_ISO_BASE, number_f(32));
 	md_put(m, MD_FRAME_RATE, number_f(fps));
 	md_put(m, MD_LUX, number_i((int64_t)(lux + 0.5)));
-	md_put(m, MD_SNR, number_f(40 - 10 * log10(total < 1 ? 1 : total)));
+	/*
+	 * The picture's signal to noise, in dB: of the shot noise of what the sensor collected, about 6 electrons a count of the 10-bit level at 1x [assumption, not a
+	 * measurement]. Camera's flash on Auto goes by this against autoFlashNormalizedSNRThreshold (14-22 in D22/AVCaptureSession.plist), and its old
+	 * 40 - 10 log10(gain) said about 28 in a dark room: the flash stayed off (run 011428).
+	 */
+	{
+		double electrons = st->mean[1] * 6 / (analog > 1 ? analog : 1);
+
+		md_put(m, MD_SNR, number_f(electrons > 1 ? 10 * log10(electrons) : 0));
+	}
 	md_put(m, MD_AF_STATUS, number_i(0));
 	md_put(m, MD_FOCUSING, number_i(0));
 	md_put(m, MD_AE_STABLE, CFRetain(kCFBooleanTrue));
@@ -1571,6 +1940,7 @@ worker(void *context)
 		struct hk_camera_command c;
 
 		mark = mach_absolute_time();
+		isp.max_frame_lines = frames_kept_short() ? f->frame_lines_min : 0;
 		/* the lens shading's grid over the part of the sensor the frame is (mode 6: the middle half) */
 		isp.lsc_window[0] = isp.lsc_window[1] = (1 - 1 / mode_zoom(f)) / 2;
 		isp.lsc_window[2] = isp.lsc_window[3] = 1 / mode_zoom(f);
@@ -1625,8 +1995,13 @@ worker(void *context)
 		}
 		isp.zoom = s->zoom / mode_zoom(f);
 		isp.turned = s->camera->turned;
-		if (isp_ae(&isp, f, &st, &c)) {
-			(void)write(device, &c, sizeof(c));
+		{
+			bool moving = isp_ae(&isp, f, &st, &c);
+
+			if (moving) {
+				(void)write(device, &c, sizeof(c));
+			}
+			flash_frame(s, moving || (isp.asked && (f->exposure_lines != isp.asked_lines || f->gain != isp.asked_gain)));
 		}
 		if (s->af_now) {
 			s->af_now = false;
@@ -1693,8 +2068,13 @@ worker(void *context)
 			if (!still && hot && (s->frames & 1) == 0) {
 				continue;
 			}
-			if (still && s->stills_wanted == 0) {
+			if (still && (s->stills_wanted == 0 || s->flash == FLASH_SETTLING)) {
 				continue;
+			}
+			if (still && s->flash != 0) {
+				/* (this frame has been read whole: the picture made from it takes 376 ms more, run 010240, in the dark) */
+				flash_ask(s, 0, 0);
+				s->flash = 0;
 			}
 			deliver(s, out, &isp, f, raw, metadata);
 			if (still) {
@@ -1731,10 +2111,11 @@ worker(void *context)
 				mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
 
 				if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS) {
-					/* (in KB as shifted here: the figures grew to 56116 and stayed, run 125906 -- 55 MB, not GB) */
-					say("frames %llu: mediaserverd's footprint %llu KB (at the most %llu KB)", (unsigned long long)s->frames,
+					/* (56116 MB in run 125906 was real, the audio source's silence: audio_source_no_filling, inject_media.c) */
+					say("frames %llu: mediaserverd's footprint %llu MB (at the most %llu MB)", (unsigned long long)s->frames,
 					    (unsigned long long)(vm.phys_footprint >> 20), (unsigned long long)(vm.ledger_phys_footprint_peak >> 20));
 				}
+				say_memory((unsigned long long)s->frames);
 			}
 			for (int i = 0; i < OUTPUTS; i++) {
 				struct output *o = &s->out[i];
@@ -1755,6 +2136,10 @@ worker(void *context)
 	free(buffer);
 	close(device);
 	say("the frames stopped (%llu)", s->frames);
+	if (s->flash != 0) {
+		flash_ask(s, 0, 0);     /* (the stream stopped in the middle of a photograph) */
+		s->flash = 0;
+	}
 	return NULL;
 }
 

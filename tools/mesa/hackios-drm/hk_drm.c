@@ -105,11 +105,155 @@ call(unsigned number, void *data, size_t size)
 	}
 }
 
+/*
+ * WHICH SURFACES A SUBMISSION NAMES (M5g). Turnip gives every submission the list of every buffer the
+ * device has, which costs Linux's driver little. This kernel does two things for each one
+ * (HKGPU.cpp, submit()) that freedreno, naming only what a batch uses, never paid for on this scale: an
+ * IOSurface is pushed out of the processor's cache, whole, if 4 ms have gone by since the last time; and
+ * it is marked as being drawn until this submission is done, which is what the display waits for
+ * before it shows one. So in the window server, with every layer's surface imported, each frame
+ * flushed every surface (3.1 ms a submission at 30 a second by the end of run 211412, 85% of the time
+ * to record a frame, and growing with the surfaces) and marked all of them.
+ *
+ * air_vk.c knows what a recording uses, and says so before its vkQueueSubmit. The surfaces it did not
+ * name are left out of the list that goes to the kernel; every other buffer stays, and the kernel's
+ * record of use for those is as it was. A destroy of a texture waits for the fence of the work that
+ * used it in air_vk.c (when_done), so a buffer left out cannot be taken from under the GPU.
+ */
+#define HK_DRM_HANDLES 8193
+#define HK_DRM_NAMES   256
+
+static int surface_of_handle[HK_DRM_HANDLES];   /* the IOSurface a handle is, or 0 */
+static pthread_mutex_t names_lock = PTHREAD_MUTEX_INITIALIZER;
+static int names[HK_DRM_NAMES];
+static unsigned name_count;
+static bool names_given;
+/* Of those, what the submission writes. A surface it only reads goes to the kernel without MSM_SUBMIT_BO_WRITE, which is how the kernel
+ * knows it need not wait for the panel to finish fetching it (HKGPU.cpp, submit(), and FETCHED WHILE DRAWN in MiniIOMobileFramebuffer.cpp). */
+static int writes[HK_DRM_NAMES];
+static unsigned write_count;
+static bool writes_given;
+
+void hk_drm_name_surfaces(const int *first, unsigned first_count, const int *second, unsigned second_count);
+
+void
+hk_drm_name_surfaces(const int *first, unsigned first_count, const int *second, unsigned second_count)
+{
+	pthread_mutex_lock(&names_lock);
+	name_count = 0;
+	/* more than the table holds is every surface, as it was */
+	names_given = first_count + second_count <= HK_DRM_NAMES;
+	for (unsigned i = 0; names_given && i < first_count; i++) {
+		names[name_count++] = first[i];
+	}
+	for (unsigned i = 0; names_given && i < second_count; i++) {
+		names[name_count++] = second[i];
+	}
+	pthread_mutex_unlock(&names_lock);
+}
+
+void hk_drm_written_surfaces(const int *first, unsigned first_count, const int *second, unsigned second_count);
+
+void
+hk_drm_written_surfaces(const int *first, unsigned first_count, const int *second, unsigned second_count)
+{
+	pthread_mutex_lock(&names_lock);
+	write_count = 0;
+	writes_given = first_count + second_count <= HK_DRM_NAMES;
+	for (unsigned i = 0; writes_given && i < first_count; i++) {
+		writes[write_count++] = first[i];
+	}
+	for (unsigned i = 0; writes_given && i < second_count; i++) {
+		writes[write_count++] = second[i];
+	}
+	pthread_mutex_unlock(&names_lock);
+}
+
+/* The call of a submission with the unnamed surfaces left out of its list. Turnip's own list stays as it is. */
+static int
+submit_named(struct drm_msm_gem_submit *submit)
+{
+	static struct drm_msm_gem_submit_bo *bos;
+	static struct drm_msm_gem_submit_cmd *cmds;
+	static uint32_t *moved;
+	static uint32_t bos_room, cmds_room;
+	const struct drm_msm_gem_submit_bo *from = (const void *)(uintptr_t)submit->bos;
+	struct drm_msm_gem_submit plain = *submit;
+	uint32_t kept = 0;
+
+	pthread_mutex_lock(&names_lock);
+	if (!names_given || submit->nr_cmds == 0) {
+		names_given = false;
+		pthread_mutex_unlock(&names_lock);
+		return call((unsigned)(DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT), submit, sizeof(*submit));
+	}
+	names_given = false;
+	if (submit->nr_bos > bos_room) {
+		free(bos);
+		free(moved);
+		bos = malloc(submit->nr_bos * sizeof(*bos));
+		moved = malloc(submit->nr_bos * sizeof(*moved));
+		bos_room = bos != NULL && moved != NULL ? submit->nr_bos : 0;
+	}
+	if (submit->nr_cmds > cmds_room) {
+		free(cmds);
+		cmds = malloc(submit->nr_cmds * sizeof(*cmds));
+		cmds_room = cmds != NULL ? submit->nr_cmds : 0;
+	}
+	if (submit->nr_bos > bos_room || submit->nr_cmds > cmds_room) {
+		pthread_mutex_unlock(&names_lock);
+		return call((unsigned)(DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT), submit, sizeof(*submit));
+	}
+	for (uint32_t i = 0; i < submit->nr_bos; i++) {
+		const int surface = from[i].handle < HK_DRM_HANDLES ? surface_of_handle[from[i].handle] : 0;
+		bool keep = surface == 0;
+
+		for (unsigned n = 0; !keep && n < name_count; n++) {
+			keep = names[n] == surface;
+		}
+		moved[i] = kept;
+		if (keep) {
+			bos[kept] = from[i];
+			if (surface != 0 && writes_given) {
+				bool written = false;
+
+				for (unsigned n = 0; !written && n < write_count; n++) {
+					written = writes[n] == surface;
+				}
+				if (!written) {
+					bos[kept].flags &= ~(uint32_t)MSM_SUBMIT_BO_WRITE;
+				}
+			}
+			kept++;
+		}
+	}
+	memcpy(cmds, (const void *)(uintptr_t)submit->cmds, submit->nr_cmds * sizeof(*cmds));
+	for (uint32_t i = 0; i < submit->nr_cmds; i++) {
+		cmds[i].submit_idx = moved[cmds[i].submit_idx];
+	}
+	plain.bos = (uint64_t)(uintptr_t)bos;
+	plain.cmds = (uint64_t)(uintptr_t)cmds;
+	plain.nr_bos = kept;
+
+	writes_given = false;
+
+	const int error = call((unsigned)(DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT), &plain, sizeof(plain));
+
+	pthread_mutex_unlock(&names_lock);
+	submit->fence = plain.fence;
+	submit->fence_fd = plain.fence_fd;
+	return error;
+}
+
 int
 drmIoctl(int fd, unsigned long request, void *arg)
 {
 	int error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
 
+	/* DRM_IOCTL_GEM_CLOSE: that number may be another kind of buffer next */
+	if (error == 0 && (request & 0xff) == 0x09 && ((const uint32_t *)arg)[0] < HK_DRM_HANDLES) {
+		surface_of_handle[((const uint32_t *)arg)[0]] = 0;
+	}
 	(void)fd;
 	if (error != 0) {
 		errno = error;
@@ -134,6 +278,9 @@ drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size)
 	if (index == DRM_MSM_GEM_SUBMIT && size >= sizeof(struct drm_msm_gem_submit) &&
 	    (((struct drm_msm_gem_submit *)data)->flags & (MSM_SUBMIT_SYNCOBJ_IN | MSM_SUBMIT_SYNCOBJ_OUT)) != 0) {
 		return submit_with_syncobjs(data);
+	}
+	if (index == DRM_MSM_GEM_SUBMIT && size >= sizeof(struct drm_msm_gem_submit)) {
+		return -submit_named(data);
 	}
 	return -call((unsigned)(DRM_COMMAND_BASE + index), data, size);
 }
@@ -305,6 +452,9 @@ drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 		return -1;
 	}
 	*handle = request.handle;
+	if (request.handle < HK_DRM_HANDLES) {
+		surface_of_handle[request.handle] = surface;
+	}
 	return 0;
 }
 
@@ -642,7 +792,7 @@ submit_with_syncobjs(struct drm_msm_gem_submit *submit)
 	plain.flags &= ~(uint32_t)(MSM_SUBMIT_SYNCOBJ_IN | MSM_SUBMIT_SYNCOBJ_OUT);
 	plain.in_syncobjs = plain.out_syncobjs = 0;
 	plain.nr_in_syncobjs = plain.nr_out_syncobjs = plain.syncobj_stride = 0;
-	error = call(DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT, &plain, sizeof(plain));
+	error = submit_named(&plain);
 	if (error != 0) {
 		return -error;
 	}

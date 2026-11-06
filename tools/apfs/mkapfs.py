@@ -910,6 +910,11 @@ def main():
     ap.add_argument('volumes', nargs='+', help='NAME=DIR[,manifest=FILE]')
     args = ap.parse_args()
     vols = []
+    # the owner's network (fw/network: the passphrase, in the clear under --plain fw) makes the image as private as the file
+    if any(os.path.exists(os.path.join(v.split('=', 1)[1].split(',')[0], 'fw', 'network')) for v in args.volumes):
+        os.umask(0o077)
+        if os.path.exists(args.output):
+            os.chmod(args.output, 0o600)
     spool = open(args.output + '.spool', 'w+b') if args.compress else None
     for i, spec in enumerate(args.volumes):
         name, _, rest = spec.partition('=')

@@ -61,6 +61,7 @@ extern void hk_cpufreq_sleep(bool asleep);
 extern void hk_gpu_speed_kick(void);
 /* bsd/dev/hk_sound.c */
 extern void hk_sound_park(void);
+extern void hk_torch_sleep(void);
 extern int hk_gpu_power_bits(void);
 extern void hk_gpu_sleep_begin(void);           /* iokit/Kernel/HKGPU.cpp: the GPU block given back, its lock held */
 extern void hk_gpu_sleep_end(void);
@@ -241,6 +242,7 @@ hk_power_will_sleep(void)
 		return;
 	}
 	hk_sound_park();
+	hk_torch_sleep();
 	hk_wifi_sleep();
 	sleep_lit = hk_display_on();
 	if (sleep_lit) {

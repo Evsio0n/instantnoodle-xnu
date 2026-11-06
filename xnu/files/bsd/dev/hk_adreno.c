@@ -2358,6 +2358,28 @@ static struct block gpu = { "gpu", 0x03d00000, 0x40000 };
 static uint32_t core_khz;               /* the 3D core's speed, as asked of the GMU */
 
 /*
+ * gpu_top=587, the owner's word (2026-11-06), off by default: the fourth speed of this chip's table, above the three this driver
+ * gives the GMU. Only on kona and only for speed bin 0: that bin's top in the phone's device tree (qcom,gpu-pwrlevels-0) is 587 MHz,
+ * and Linux's sm8250.dtsi has it at supply level NOM. It is one more row: the GMU sets the clock and RPMh the voltage, as for the
+ * others. Anything else asked for, or another bin, stays as it was and says so. Nothing slows the GPU with gpu_dcvs=0 (gpu_hot is DCVS's).
+ */
+static bool
+gpu_top_587(void)
+{
+	static int on = -1;
+	uint32_t top = 0;
+
+	if (on < 0) {
+		on = 0;
+		if (kona && PE_parse_boot_argn("gpu_top", &top, sizeof(top))) {
+			on = top == 587 && speed_bin == 0;
+			printf("adreno: gpu_top=%u: %s (speed bin %u)\n", top, on ? "587 MHz above the three" : "refused, 525 MHz stays the top", speed_bin);
+		}
+	}
+	return on != 0;
+}
+
+/*
  * What the vendor's driver sends at this point (a6xx_hfi_start; Linux the same with fewer
  * levels): the table of speeds of the 3D core with the supply level each needs -- the phone's
  * three lowest (dt: qcom,gpu-pwrlevels: 315, 450, 550 MHz at "levels" 64, 128, 192) -- and of the
@@ -2372,7 +2394,7 @@ step_core_power(void)
 		uint32_t khz, level;
 	} yupik[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } },
 	/* kona: the three lowest of OnePlus's kona-v2-gpu.dtsi, 305 MHz LOW_SVS, 400 MHz SVS, 525 MHz SVS_L2 */
-	  sm8250[] = { { 0, 0 }, { 305000, 64 }, { 400000, 128 }, { 525000, 224 } };
+	  sm8250[] = { { 0, 0 }, { 305000, 64 }, { 400000, 128 }, { 525000, 224 }, { 587000, 256 } };
 	const __typeof__(yupik[0]) *speeds = kona ? sm8250 : yupik;
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
@@ -2388,7 +2410,7 @@ step_core_power(void)
 		printf("adreno: %u: RPMh's list lacks one of the rails\n", step);
 		return false;
 	}
-	perf.gpu_levels = sizeof(yupik) / sizeof(yupik[0]);       /* (as many in either) */
+	perf.gpu_levels = sizeof(yupik) / sizeof(yupik[0]) + (gpu_top_587() ? 1 : 0);       /* (as many in either, gpu_top apart) */
 	for (unsigned i = 0; i < perf.gpu_levels; i++) {
 		perf.gpu[i].khz = speeds[i].khz;
 		perf.gpu[i].acd = 0xffffffff;           /* no adaptive clocking */
@@ -2405,6 +2427,10 @@ step_core_power(void)
 	}
 	printf("adreno: %u: votes: 3D core %#x %#x %#x %#x, GMU %#x %#x\n", step, perf.gpu[0].vote, perf.gpu[1].vote,
 	    perf.gpu[2].vote, perf.gpu[3].vote, perf.gmu[0].vote, perf.gmu[1].vote);
+	if (gpu_top_587()) {
+		printf("adreno: %u: votes: 3D core at 587 MHz %#x\n", step, perf.gpu[4].vote);
+		vote[2] = 4;
+	}
 
 	bw.levels = 1;
 	bw.ddr_commands = 3;
@@ -4408,15 +4434,15 @@ hk_gpu_resume(void)
 uint32_t
 hk_gpu_level_count(void)
 {
-	return 4;
+	return gpu_top_587() ? 5 : 4;
 }
 
 uint32_t
 hk_gpu_level_khz(uint32_t level)
 {
-	static const uint32_t sm8250[] = { 0, 305000, 400000, 525000 }, yupik[] = { 0, 315000, 450000, 550000 };
+	static const uint32_t sm8250[] = { 0, 305000, 400000, 525000, 587000 }, yupik[] = { 0, 315000, 450000, 550000 };
 
-	return level < 4 ? (kona ? sm8250 : yupik)[level] : 0;
+	return level < hk_gpu_level_count() ? (kona ? sm8250 : yupik)[level] : 0;
 }
 
 bool

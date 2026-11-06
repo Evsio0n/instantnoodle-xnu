@@ -58,6 +58,7 @@ extern void hk_sound_quiesce(void);   /* bsd/dev/hk_sound.c: the speakers' ampli
 extern void hk_ddr_quiesce(void);
 extern void hk_haptic_quiesce(void);
 extern void hk_torch_quiesce(void);
+extern void hk_modem_quiesce(void);    /* bsd/dev/instantnoodle_modem.c: the SDX55 held in reset, if it was let out */
 extern void hk_camera_quiesce(void);
 extern void hk_mic_quiesce(void);
 extern void hk_ufs_quiesce(void);
@@ -409,6 +410,7 @@ loader_return(void)
 	 */
 	psci_smp_stop_others();
 #endif
+	hk_modem_quiesce();        /* (first: nothing of the modem's may reach memory that is about to be reused) */
 	hk_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hk_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	hk_sound_quiesce();        /* the amplifiers first: hk_wifi_quiesce() may halt here for good (2026-11-04) */

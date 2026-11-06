@@ -1265,6 +1265,32 @@ timed_prefs(void)
 	    "timed's \"Set Automatically\" on a kept data volume (" TIMED_PREFS ")");
 }
 
+/*
+ * Location Services' switch (the owner: 「定位沒開」, 2026-11-06): locationd's preferences say it is on, and Settings has no row
+ * for it here, so nothing on the phone could turn it on. A new volume gets them from the skeleton (tools/nf/mk_extra.sh loc); a kept
+ * one is not given the skeleton, so it gets them here, once: locationd may have left a file of its own with the switch off, so
+ * that is written over, and the stamp says it was done. A root without locationd's files is left alone.
+ */
+#define LOCATION_PREFS  "/var/db/locationd-prefs/com.apple.locationd.plist"
+#define LOCATION_STAMP  "/private/var/.hackios-location"
+
+static void
+location_prefs(void)
+{
+	struct stat st;
+
+	if (data_volume != 1 || stat(LOCATION_STAMP, &st) == 0 || stat(in_image(LOCATION_PREFS), &st) != 0) {
+		return;
+	}
+	const int ok = copy_file(in_image(LOCATION_PREFS), "/private/var/root/Library/Preferences/com.apple.locationd.plist", 0644, 0, 0) &&
+	    copy_file(in_image(LOCATION_PREFS), "/private/var/mobile/Library/Preferences/com.apple.locationd.plist", 0644, 501, 501);
+
+	check(ok, "Location Services' switch on a kept data volume");
+	if (ok) {
+		close(open(LOCATION_STAMP, O_WRONLY | O_CREAT, 0600));
+	}
+}
+
 static int
 count_entries(const char *path)
 {
@@ -1709,6 +1735,7 @@ main(int argc, char **argv, char **envp)
 	restore_var();
 	camera_answers();
 	timed_prefs();
+	location_prefs();
 	test_files();
 	test_writable();
 	test_memory();

@@ -78,6 +78,8 @@ void hk_gpu_to_memory(void * start, uint64_t size);
 uint32_t hk_gpu_submit(struct gpu_space * space, const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool hk_gpu_done(uint32_t fence);
+void hk_fb_named(MiniIOSurface * surface, bool writes);      /* (mdp_overlap, MiniIOMobileFramebuffer.cpp) */
+void hk_fb_will_write(MiniIOSurface * surface); /* (fb_fetch_wait: FETCHED WHILE DRAWN, there) */
 bool hk_gpu_interrupts(void);
 uint32_t hk_gpu_level_count(void);
 uint32_t hk_gpu_level_khz(uint32_t level);
@@ -146,6 +148,9 @@ struct msm_gem_submit_bo {
 	uint32_t flags, handle;
 	uint64_t presumed;
 };
+#ifndef MSM_SUBMIT_BO_WRITE
+#define MSM_SUBMIT_BO_WRITE 0x0002
+#endif
 struct msm_gem_submit {
 	uint32_t flags, fence, nr_bos, nr_cmds;
 	uint64_t bos, cmds;
@@ -350,6 +355,22 @@ hk_gpu_speed_boost(void)
 	if (gSpeedLevel < hk_gpu_level_count() - 1) {
 		thread_call_enter(gSpeedCall);
 	}
+}
+
+/* What the GPU has worked since this was last asked, in ticks of 19.2 MHz (the display's statistics, boot-arg mdp=: not with gpu_dcvs, whose reader takes the same count) */
+extern "C" uint64_t
+hk_gpu_busy_ticks(void)
+{
+	uint64_t ticks = 0;
+
+	if (gGPULock != NULL) {
+		IOLockLock(gGPULock);
+		if (hk_gpu_ready()) {
+			ticks = hk_gpu_load();
+		}
+		IOLockUnlock(gGPULock);
+	}
+	return ticks;
 }
 
 static void
@@ -1190,6 +1211,20 @@ HKGPUUserClient::submit(struct msm_gem_submit * request)
 		ret = kIOReturnVMError;
 		goto out;
 	}
+	/* (what the panel is being sent is not drawn into: outside the lock, for a few milliseconds at most) */
+	for (uint32_t i = 0; i < request->nr_bos; i++) {
+		if (bos[i].flags & MSM_SUBMIT_BO_WRITE) {
+			IOLockLock(gGPULock);
+
+			struct gpu_buffer * b = buffer(bos[i].handle);
+			MiniIOSurface * written = b != NULL && b->surface != NULL && b->surface->fetching != 0 ? b->surface : NULL;
+
+			IOLockUnlock(gGPULock);
+			if (written != NULL) {
+				hk_fb_will_write(written);
+			}
+		}
+	}
 	IOLockLock(gGPULock);
 	/*
 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
@@ -1209,6 +1244,9 @@ HKGPUUserClient::submit(struct msm_gem_submit * request)
 
 		if (b == NULL) {
 			continue;
+		}
+		if (b->surface != NULL) {
+			hk_fb_named(b->surface, bos[i].flags & MSM_SUBMIT_BO_WRITE);
 		}
 		if (b->surface != NULL && b->surface->scanout != NULL) {
 			continue;                       /* (write-combined: never in this processor's cache) */

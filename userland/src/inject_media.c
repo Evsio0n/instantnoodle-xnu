@@ -269,13 +269,41 @@ video_stabilization_type(id self, SEL selector)
 
 static IMP original_audio_source_start;
 
+/*
+ * ... and its filling of silence off. The node's render callback compares each time stamp with the one it expected
+ * and fills a gap with silence; here it finds about 468 s missing at every round, why is not known (the HAL's clock,
+ * audio_plugin.c, is the first place to look). So a buffer of 20 million samples, 39 MB, about 23 times a second, which
+ * the nodes after it hold on to: about 1 GB a second in mediaserverd for as long as a camera runs, up to 58.8 GB, the
+ * phone's free memory at 3 MB (OnePlus 8 runs 064622, 070021, 071235; docs/KNOWN_ISSUES.md K38). The node has its own
+ * switch for this, read by both the callback and -_generateSilenceIfNeeded. The cost: no silence for a real gap, were
+ * a working microphone to have one. A microphone giving nothing says so itself (audio_plugin.c: "the microphone...").
+ */
+static void
+audio_source_no_filling(id self)
+{
+	Ivar disabled = class_getInstanceVariable(object_getClass(self), "_silenceFramesFillingDisabled");
+	static bool said;
+
+	if (disabled != NULL) {
+		*((BOOL *)((char *)self + ivar_getOffset(disabled))) = YES;
+	}
+	if (!said) {
+		said = true;
+		say("redwood: mediaserverd: the audio source's filling of silence %s; a video's sound comes from the microphone alone\n",
+		    disabled != NULL ? "off" : "not found, left on");
+	}
+}
+
 static BOOL
 audio_source_start(id self, SEL selector, id *error)
 {
-	BOOL started = ((BOOL (*)(id, SEL, id *))original_audio_source_start)(self, selector, error);
-	id made = error != NULL ? *error : NULL;
+	BOOL started;
+	id made;
 	static bool said;
 
+	audio_source_no_filling(self);
+	started = ((BOOL (*)(id, SEL, id *))original_audio_source_start)(self, selector, error);
+	made = error != NULL ? *error : NULL;
 	if (started || made == NULL || ((long (*)(id, SEL))objc_msgSend)(made, sel_registerName("code")) != ERROR_NO_SUCH_THING) {
 		return started;
 	}
@@ -387,10 +415,70 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  */
 static IMP original_emit_sample_buffer;
 
+/*
+ * Boot-arg cam_mem=1, a measurement (K38): what the audio buffers are at each node they pass, the first of each and the
+ * hundredth, and whether anyone is still holding them when the emit returns.
+ */
+static void
+say_audio_buffer(id output, CMSampleBufferRef buffer, long held_before)
+{
+	static int measuring = -1;
+	static Class seen[12];
+	static long times[12];
+	CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(buffer);
+	const AudioStreamBasicDescription *d;
+	Class node;
+	int i;
+
+	if (measuring < 0) {
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		measuring = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "cam_mem=1") != NULL;
+	}
+	if (!measuring || format == NULL || CMFormatDescriptionGetMediaType(format) != kCMMediaType_Audio) {
+		return;
+	}
+	d = CMAudioFormatDescriptionGetStreamBasicDescription(format);
+	node = object_getClass(((id (*)(id, SEL))objc_msgSend)(output, sel_registerName("node")));
+	for (i = 0; i < 12 && seen[i] != NULL && seen[i] != node; i++) {
+	}
+	if (i == 12) {
+		return;
+	}
+	seen[i] = node;
+	times[i]++;
+	if (times[i] == 1 || times[i] == 100) {
+		say("redwood: mediaserverd: audio out of %s, #%ld: %ld samples, %lu bytes, %.0f Hz, %u bytes a frame, %u channels, held %ld "
+		    "before the emit and %ld after\n", class_getName(node), times[i], (long)CMSampleBufferGetNumSamples(buffer),
+		    (unsigned long)CMSampleBufferGetTotalSampleSize(buffer), d != NULL ? d->mSampleRate : 0, d != NULL ? d->mBytesPerFrame : 0,
+		    d != NULL ? d->mChannelsPerFrame : 0, held_before, (long)CFGetRetainCount(buffer));
+	}
+	if (strcmp(class_getName(node), "BWAudioSourceNode") == 0 && (times[i] <= 4 || times[i] % 200 == 0)) {
+		/* (what the node's render callback compares each time stamp with: the 468 s of audio_source_no_filling) */
+		id source = ((id (*)(id, SEL))objc_msgSend)(output, sel_registerName("node"));
+		Ivar host = class_getInstanceVariable(node, "_nextExpectedHostTime");
+		Ivar limit = class_getInstanceVariable(node, "_ioprocTimeStampDeltaLimit");
+		CMTime when = CMSampleBufferGetPresentationTimeStamp(buffer);
+		mach_timebase_info_data_t timebase;
+
+		mach_timebase_info(&timebase);
+		if (host != NULL && limit != NULL) {
+			uint64_t next = *(uint64_t *)((char *)source + ivar_getOffset(host)), now = mach_absolute_time();
+			CMTime most = *(CMTime *)((char *)source + ivar_getOffset(limit));
+
+			say("redwood: mediaserverd: audio #%ld: next host time %lld ticks from now (%llu), its time %lld/%d, limit %lld/%d, "
+			    "timebase %u/%u\n", times[i], (long long)(next - now), (unsigned long long)now, (long long)when.value, when.timescale,
+			    (long long)most.value, most.timescale, timebase.numer, timebase.denom);
+		}
+	}
+}
+
 static void
 emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 {
 	static bool said;
+	long held;
 
 	if (sample_buffer == NULL) {
 		if (!said) {
@@ -400,7 +488,9 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		return;
 	}
 	time_photo_encoder(self, sample_buffer);
+	held = (long)CFGetRetainCount(sample_buffer);
 	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);
+	say_audio_buffer(self, sample_buffer, held);
 }
 
 /*

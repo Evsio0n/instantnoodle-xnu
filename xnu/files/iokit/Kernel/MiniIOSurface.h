@@ -126,6 +126,9 @@ public:
 	IOMemoryMap *                   scanoutMap;
 	task_t                          scanoutOwner;   /* (not held: only compared) */
 	uint32_t                        drawn;          /* the GPU's last submission that names the pixels (0: none; HKGPU.cpp) */
+	uint32_t        fetching;       /* (mdp_overlap) the swap whose push is fetching it, or 0 */
+	uint32_t                        mdpAddress;     /* where the pixel memory is for the display's pipes (0: not mapped; MiniIOMobileFramebuffer.cpp) */
+	uint32_t                        mdpPages;       /* ... so many of 4K */
 	struct minisurf_result          info;           /* addresses not filled in */
 	struct minisurf_plane           planes[MINISURF_MAX_PLANES];
 	OSDictionary *                  values;

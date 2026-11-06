@@ -12,6 +12,7 @@ behaviour only. Add to these pages when you learn something (see [../../AGENTS.m
 | [hardware-qualcomm.md](hardware-qualcomm.md) | what crashes the phone, SMEM/SMP2P/GLINK/QRTR/AOP/TZ, SMMU, PMIC arbiter, pins, display/GPU register facts, bring-up method |
 | [boot-chain-and-recovery.md](boot-chain-and-recovery.md) | XBL/ABL/UEFI/loader, XNUP container, memory, stock ABL quirks, OnePlus 8 recovery, UEFI port notes |
 | [mdp-driver-plan.md](mdp-driver-plan.md) | our own MDP driver for the OnePlus 8: SMMU options, the pipes and mixers, the steps `mdp=1..8`, risks |
+| [next-features.md](next-features.md) | what to build next on the OnePlus 8: Bluetooth, flash, modem (SDX55), sensors, GPS and the rest; state, Android's path, iOS's side, effort, the first boots, the order |
 | [failed-approaches.md](failed-approaches.md) | dead ends and costly mistakes, one line each |
 | [bluetooth-ios.md](bluetooth-ios.md) | QCA6390 UART/firmware and native iOS command-family/vendor integration findings |
 | [checks.md](checks.md) | "how our own checks lie": eleven measurement pitfalls |

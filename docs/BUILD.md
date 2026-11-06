@@ -151,6 +151,7 @@ Reading what the phone's compiler made of a shader: `air_metal_test_vk --gpu --i
 A frontend check needs no phone and no libdrm: in the container `meson setup /tmp/hf <mesa tree> --buildtype=release -Db_ndebug=true -Dplatforms= -Dgallium-drivers=softpipe -Dvulkan-drivers= -Dllvm=disabled` and the rest of tools/air/mk-host.sh's options, `ninja src/compiler/air/air2nir`, `air2nir [--not-defined | --constants I=HEX,...] [--report] FILE`. `--not-defined` translates as a specialized function given no values does, every function constant unset, which is the reading to use for what a system process will be refused.
 `libvulkan_freedreno.dylib` exports 51 since M5c (`rwa_compute_create_constants`, `rwa_module_function_constants`), and 49 symbols since M5b (three `vk_icd*`, 46 `rwa_*`): `rwa_texture_view_create` went into
 `tu_hackios_exports.txt` and `tools/mesa/turnip-darwin.patch`, by hand, one line in the patch's hunk for that new file.
+Since 33ee0e40 it exports `rwa_buffer_busy` and `rwa_vk_memory` too, through `tools/mesa/turnip-hk-bos.patch` (made with `diff -u`, applied after `turnip-darwin.patch`), which also keeps turnip's BO table on without its print.
 
 ## Vendor firmware (never in the repository)
 
@@ -178,3 +179,15 @@ Prebuilt files lag the source: `prebuilt/mach.development.bcm2837` predates `too
 
 `xnu/` is a derivative of XNU (APSL 2.0); the kernel also contains ath11k (BSD-3-Clause-Clear) and FreeBSD LinuxKPI code (BSD-2-Clause);
 libzbitmap (Corellium, MIT), libdeflate 1.24 (MIT). Apple's HFS+ is fetched at build time. See [../prebuilt/NOTICES.md](../prebuilt/NOTICES.md).
+
+## The kernel's other object directories
+
+Several sessions share `xnu-src`, each with its own objects: `OBJROOT=$R/obj SYMROOT=$R/sym DSTROOT=$R/dst ./xnu-build.sh -j8 -k` in the container, `THEOS=/build/local-theos`, with `R=/build/xnu-src/xnu-8796.121.2/BUILD_MDP` (or `BUILD_CAM`). **`xnu/export.sh` as it stands would pull those directories into `xnu/files`** (its pattern skips only `BUILD/`, and it replaces the whole of `xnu/files`). Do not run it before that is fixed.
+
+## Shaders built before the boot (`/hackios/share/air-cache`)
+
+A translated shader and a compute pipeline are kept in `/var/tmp/hk-air` (`air_to_nir.c`, `air_vk.c`), which is empty at each RAM boot. `air_cache_read` also looks in `/hackios/share/air-cache` in the root. The key holds libvulkan's Mach-O UUID, not its file time, so a rebuilt root keeps its entries, and **any new build of libvulkan misses them all and translates as a first boot does**: refresh after every change that rebuilds it. There is no way to generate them on the Mac yet: function constants' values are known only at run time.
+
+To refresh: a root with `CACHEDUMP=1` and a job that walks the screens and ends in `/hackios/bin/cache_dump` (`out/rc.jobs.harvest`), one boot; then `python3 tools/metal/loop/cache_take.py RUN out/air-cache/LIB`, where RUN is the run's name and LIB a name for this library (its SHA's start). The phone has no file channel, so `cache_dump` prints each file deflated, in base64 with a CRC per line, slowly enough for the kept log copies (`XL_FOLLOW_KEEP`) to miss nothing. Then `AIRCACHE=out/air-cache/LIB bash tools/metal/loop/mk_root.sh NAME`. A later dump adds what that boot still missed.
+
+Other `mk_root.sh` switches: `VKLIB=FILE` and `MEDIALIB=FILE` a library in place of the shared one; `NOMEMO=1` and `NOPOOL=1` a refused pipeline tried again at each asking and no buffers kept, to compare; `MEMACCOUNT=1` hkmetal's lines of what a process's memory is made of (K40, not for a row); `MEMLOG=1` `userland/src/memlog.c` for a job's line; `BIPLANAR_ONCE=1` the camera's old copy, to compare; `NF=1` next-features' media library, Bluetooth, locationd, and no fairplayd.H2 job; `NOPROBES=1` nothing of ours watching; `PHOTOS=1` the owner's two photos (the root comes out 0600, and it goes nowhere); `SAMPLEOF=PROGRAM`, `CENSUS=XxY`, `METALTRACE=1`, `FIGERR="PROGRAM ..."`, `GAINMAP="PROGRAM ..."` for diagnostics.

@@ -351,4 +351,5 @@ hk_audio_init(void)
 	hk_haptic_init();
 	hk_torch_init();
 	hk_camera_init();
+	hk_modem_init();
 }

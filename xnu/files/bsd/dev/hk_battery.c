@@ -50,6 +50,19 @@ hk_battery_temperature(void)
 	return battery_temperature_c;
 }
 
+/* (the camera's flash: its supply) -1 while they are not known */
+int
+hk_battery_percent(void)
+{
+	return battery_soc_percent;
+}
+
+int
+hk_battery_voltage_mv(void)
+{
+	return battery_voltage_mv;
+}
+
 SYSCTL_NODE(_kern, OID_AUTO, hackios, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "redwood phone bits");
 SYSCTL_INT(_kern_hackios, OID_AUTO, battery_soc, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_soc_percent, 0, "battery state of charge, 0..100 percent, or -1 if unknown");

@@ -65,7 +65,8 @@ All of this is the default on `board=instantnoodle`. Measurements are from 2026-
 `fb_probe=1` dumps it. A DSI command-mode panel driven by CTL0: VIG0 and VIG1 (the two 540-pixel halves) both
 fetch the boot framebuffer at `0x9c000000` (stride 4320). They feed LM0/LM1, then dual DSC, then INTF1. INTF1's
 tear check is on and **autorefresh is on** (`0x80000001`): the MDP re-fetches that memory on every TE, which is
-why copying into it from the CPU tears. The MDP fetches through apps-SMMU context bank 4. **Reading that
+why copying into it from the CPU tears. The MDP fetches through an apps-SMMU context bank the boot chain set up
+(number 4 in October, 5 now: found by stream `0x820`). **Reading that
 context bank or its page tables sends the phone to Qualcomm CrashDump mode**, and the hypervisor's SMMU has no
 ATOS, so a mapping can only be found by trying. Only the global SMMU registers (SCR0, IDR, SMR, S2CR) are safe.
 A second framebuffer at `0x9ca00000`, inside the firmware's `cont_splash_region@9c000000` (0x2300000 bytes),
@@ -123,6 +124,17 @@ snapshot:** the loader reads that framebuffer while the kernel keeps drawing (on
 some 60 frames at 90 Hz), so whatever moves comes out cut by horizontal seams into pieces of different frames -- the
 OnePlus 8's camera preview showed 2-3 of them per screenshot, also with a test pattern (`campattern=1`, run 113902), while
 the owner saw none on the panel (2026-11-04). Judge motion by eye or a recording (`rec_secs`), not by screenshots.
+
+### Our own MDP layers (boot-arg `mdp`, default 8 on this board; 2026-11-05, RAM)
+
+`bsd/dev/instantnoodle_mdp.c`, with [the plan and results](../research/mdp-driver-plan.md). What follows replaces the GPU scale below and comes before it in `show()`; `mdp=0` is that older path, unchanged.
+
+- **The display's own context bank.** At the first frame the MDP's S2CR is pointed at a free bank with our tables: the display's region identity-mapped, and a window for surfaces. A push and a DCS through it must come through clean, or it goes back. Pointing it back is the way home (`hk_mdp_restore()`, at the top of `pushStop()`, so also on three failed pushes and a panic).
+- **Frames straight from their surfaces.** `mdpPrepare()` maps each surface into the window when first seen (until `MiniIOSurface::free()`), and `hk_mdp_commit()` programs the pipes. VIG0 and VIG1 scale 1125 x 2436 to the panel, one pipe a mixer, with x in the pair's coordinates and the right pipe's phase carried across x = 540. Nothing is copied, and selector 200 says not ready, so `eagl.c` does not scale. `mdpPush()` goes on once the push has started, as with a framebuffer; `mdpFrameGone()` gives the surfaces back to the window server when it has ended (before the next frame, or after 25 ms with none).
+- **Layers.** CoreAnimation's composite on top (swap layer 1, premultiplied), a detached surface below it (layer 0 or 2) in the next pipes. A swap names only the layers that change: one neither set nor cleared keeps its surface and rectangles (`fMdpHeld`, `fMdpKeep`), which also stays in use until a swap replaces it. The limits are published in `start()`. CoreAnimation refuses to detach under 20 nits, and it knows the nits only from CoreBrightness's new architecture, so `edr=1` is the board's default with `mdp=8`.
+- **What cannot go through** (a swap with no layer, a flip or turn, a format other than BGRA, RGBA, 420v, 420f) goes the old way through a framebuffer, on the CPU; the reason is logged (`mdp: swap N not through the pipes`), the first 32 times.
+- **`xl screenshot` reads memory, and no framebuffer holds the frame now.** In a run from the computer (`loader_return_after=`) the latest frame is also scaled into one on the CPU at most every 2 s, and once when the frames stop (`mdp_shots`; each costs the presenter 10 to 25 ms). It shows the frame, not the panel; of two layers only the composite, with its hole. Dark, it is black. An installed boot does none of this.
+- **Evidence for what the panel shows:** `mdp: N frames through the pipes ...; U underruns, F SMMU faults` every 900 frames, `mdp: GPU busy` every 5 s, and the owner's eye (2026-11-05: no wrong colours, line at the middle or stutter while using it). `mdp=2` and `mdp=3` are the checksum proofs of a solid fill and of fetches (LM MISR).
 
 ### Numbers (ms, median / p95; 2026-10-23)
 

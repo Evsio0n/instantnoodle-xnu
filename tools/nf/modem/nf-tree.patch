@@ -1,0 +1,148 @@
+--- xnu-8796.121.2/bsd/dev/instantnoodle_modem.c	2026-11-06 03:54:31
++++ nf-tree/xnu-8796.121.2/bsd/dev/instantnoodle_modem.c	2026-11-06 07:41:44
+@@ -30,7 +30,9 @@
+  *                       status 0xa14, power-down 0xa40. Target 5 GT/s, as the Wi-Fi's: Android's asks for nothing, and Gen 3 wants more of CX (qcom,bw-scale).
+  *                       A register of PCIe 2 is touched only after the domain and the clocks are on.
+  *
+- * The modem's firmware (modem=3 and up) is not touched by these. At the run's end, and on a panic's way out, PERST goes low (hk_modem_quiesce()).
++ *   modem=3    ... and its firmware, to its mission: modem_boot.inc says how.
++ *
++ * The modem's firmware is not touched by modem=1 and modem=2. At the run's end, and on a panic's way out, PERST goes low (hk_modem_quiesce()).
+  */
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -740,24 +742,59 @@
+ 
+ static uint32_t modem_level;
+ 
++/*
++ * What stops its firmware. PERST low stops the link and not the chip: MDM2AP status is still 1 after it (run 073746). Android's sdx55m_power_down() is this same warm reset ("cold reset
++ * is not supported", esoc-mdm-pon.c); status falls within 150 ms, and the chip waits in its primary boot loader for a host. Spins only: this is on a panic's way out as well.
++ */
++static bool
++modem_stop(void)
++{
++	if (pon_write_channel == 0 || !pon_put(PON_SW_RST_S2_CTL2, 0, true)) {
++		return false;
++	}
++	spin_us(500);
++	if (!pon_put(PON_SW_RST_S2_CTL, PON_RESET_TYPE_WARM, true) || !pon_put(PON_SW_RST_S2_CTL2, PON_RESET_EN, true)) {
++		return false;
++	}
++	spin_us(500);
++	if (!pon_put(PON_SW_RST_GO, PON_SW_RST_GO_VAL, false)) {
++		return false;
++	}
++	instantnoodle_gpio_output(PIN_AP2MDM_STATUS, false, INSTANTNOODLE_PULL_NONE, 16);
++	return true;
++}
++
++#include "modem_boot.inc"
++
+ static void
+ modem_thread(__unused void *parameter, __unused wait_result_t result)
+ {
+ 	look();
+-	if (modem_level >= 2) {
++	if (modem_level >= 3) {
++		level3();
++	} else if (modem_level >= 2) {
+ 		level2();
+ 	}
+ 	thread_terminate(current_thread());
+ }
+ 
+-/* At the run's end and on a panic's way out: the device held in reset before the memory it may reach is reused. */
++/* At the run's end and on a panic's way out: the link down before the memory it may reach is reused, and the firmware stopped. A kernel that hangs never comes here: the firmware then goes on. */
+ void
+ hk_modem_quiesce(void)
+ {
+ 	if (pcie.clocked && !pcie.quiesced) {
+ 		pcie.quiesced = true;
++		mdm_polling = false;
++		uint32_t before;
++		bool stopped;
++
+ 		pcie_off(false);
+-		say("modem: at the run's end: PERST low, the PHY down\n");
++		mdm_smmu_off();
++		before = instantnoodle_gpio_level(PIN_MDM2AP_STATUS);
++		stopped = modem_stop();
++		spin_us(150000);
++		say("modem: at the run's end: PERST low, the PHY down, the stream given back; THE WARM RESET %s; MDM2AP status %u before it, %u 150 ms after\n", stopped ? "IS DONE" : "FAILED", before,
++		    instantnoodle_gpio_level(PIN_MDM2AP_STATUS));
+ 	}
+ }
+ 
+--- xnu-8796.121.2/bsd/dev/hk_adsp.c	2026-11-04 18:40:04
++++ nf-tree/xnu-8796.121.2/bsd/dev/hk_adsp.c	2026-11-06 08:11:04
+@@ -977,7 +977,7 @@
+ /*
+  * dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000. The OnePlus 8 (SM8250) has everything
+  * else of this file where redwood has it (SMEM, its items, the mutex, IPCC, the AOP's mailbox, RPMh) but its DSP's
+- * memory: pil_adsp_region@8fe00000, 0x2500000 bytes, of qcom,lpass@17300000 (set in hk_adsp_init()).
++ * memory: pil_adsp_mem, 0x91b00000, 0x2500000 bytes, of qcom,lpass@17300000 (set in hk_adsp_init()).
+  */
+ static uint32_t adsp_memory = 0x86700000u, adsp_memory_size = 0x04000000u;
+ #define ADSP_MEMORY             adsp_memory
+@@ -3471,7 +3471,7 @@
+ 		return;
+ 	}
+ 	if (instantnoodle_board()) {
+-		adsp_memory = 0x8fe00000u;      /* dt: pil_adsp_region@8fe00000 (in the UEFI's "PIL Reserved") */
++		adsp_memory = 0x91b00000u;      /* dt: pil_adsp_mem's reg, which its node's name does not say, directly after the SLPI's 0x90600000 + 0x1500000 (in the UEFI's "PIL Reserved"). Was 0x8fe00000, which lies over all of the SLPI's. */
+ 		adsp_memory_size = 0x02500000u;
+ 	}
+ 	if (last_step == 0) {
+--- xnu-8796.121.2/bsd/dev/hk_thermal.c	2026-11-04 20:31:01
++++ nf-tree/xnu-8796.121.2/bsd/dev/hk_thermal.c	2026-11-06 08:11:13
+@@ -235,6 +235,7 @@
+ {
+ 	uint64_t ticks = 0;
+ 	bool was_blind = false;
++	int peak_temp = -1000, peak_zone = -1;  /* (tenths of a degree, as the governor's) */
+ 
+ 	for (;;) {
+ 		int battery = hk_battery_temperature();
+@@ -267,11 +268,16 @@
+ 			panic("thermal: %s at %s C for %d ms with every core at its lowest speed: the run ends here to protect the phone",
+ 			    hk_thermal_zones[gov.hottest].name, tenths_text(gov.hottest_temp, a, sizeof(a)),
+ 			    THERMAL_EMERGENCY_TICKS * THERMAL_TICK_MS);
++		}
++		if (gov.hottest >= 0 && gov.hottest_temp > peak_temp) {
++			peak_temp = gov.hottest_temp;
++			peak_zone = gov.hottest;
+ 		}
+ 		if (++ticks % (60000 / THERMAL_TICK_MS) == 0) {
+ 			tell("thermal: a minute: %s, hottest %s at %s C, slowed %u times so far\n", thermal_level_name(gov.level),
+ 			    gov.hottest >= 0 ? hk_thermal_zones[gov.hottest].name : "-", tenths_text(gov.hottest_temp, a, sizeof(a)),
+ 			    gov.throttles);
++			tell("thermal: the peak since the run began: %s at %s C\n", peak_zone >= 0 ? hk_thermal_zones[peak_zone].name : "-", tenths_text(peak_temp, a, sizeof(a)));
+ 		}
+ 		delay_for_interval(THERMAL_TICK_MS, NSEC_PER_MSEC);
+ 	}
+--- xnu-8796.121.2/bsd/dev/hk_slpi_boot.c	2026-11-04 00:06:17
++++ nf-tree/xnu-8796.121.2/bsd/dev/hk_slpi_boot.c	2026-11-06 10:57:29
+@@ -1428,7 +1428,9 @@
+  PE_parse_boot_argn("slpi_glink_probe",&link_probe_enabled,sizeof(link_probe_enabled));if(link_probe_enabled>3)return;
+  PE_parse_boot_argn("slpi_cold_provenance",&cold,sizeof(cold));PE_parse_boot_argn("slpi_hold_proxy",&hold_votes,sizeof(hold_votes));
+  if(!instantnoodle_board()||pe_arm_get_soc_base_phys()!=HK_SOC_BASE||cold!=1||hold_votes!=1){tell("slpi: refused missing board/cold-provenance/held-proxy diagnostic contract\n");return;}
+- PE_parse_boot_argn("adsp",&legacy,sizeof(legacy));if(legacy)return;PE_parse_boot_argn("adsp_step",&legacy,sizeof(legacy));if(legacy)return;
++ /* slpi_beside_adsp=1: the audio DSP no longer lies over this memory (hk_adsp.c, 0x91b00000; a kernel with the old address must not take this). Not yet run. */
++ uint32_t beside=0;PE_parse_boot_argn("slpi_beside_adsp",&beside,sizeof(beside));
++ if(beside!=1){PE_parse_boot_argn("adsp",&legacy,sizeof(legacy));if(legacy)return;PE_parse_boot_argn("adsp_step",&legacy,sizeof(legacy));if(legacy)return;}
+  new_from=~0u;pause_ms=0;step=7;
+  if(kernel_thread_start(slpi_boot_thread,NULL,&thread)!=KERN_SUCCESS){tell("slpi: no thread; no mutation\n");return;}thread_deallocate(thread);
+ }
+--- xnu-8796.121.2/bsd/conf/files	2026-11-06 00:58:35
++++ nf-tree/xnu-8796.121.2/bsd/conf/files	2026-11-06 04:11:26
+@@ -121,6 +121,9 @@
+ bsd/dev/instantnoodle_camera.c	standard
+ bsd/dev/instantnoodle_mdp.c	standard
+ bsd/dev/instantnoodle_modem.c	standard
++bsd/dev/modem_mhi.c		standard
++bsd/dev/modem_fat.c		standard
++bsd/dev/modem_sahara.c		standard
+ bsd/dev/instantnoodle_wifi.c	standard
+ bsd/dev/instantnoodle_bt.c	standard
+ bsd/dev/hk_battery.c	standard

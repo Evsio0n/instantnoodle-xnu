@@ -122,6 +122,8 @@ those, one function folded to NaN where softpipe produced `+inf` — and under t
 answers are permitted, so the disagreement said nothing about either side. A shader has a domain,
 and a check that leaves it measures the check.
 
+**Since 2026-11-06 stitching is implemented (KNOWN_ISSUES K37), and the ABI below turned out not to be needed for it.** `air_stitch_to_nir` makes one `main` and calls each node's function as an ordinary function, in its own module, with its arguments as values: what Metal's own inlining comes to. Real graphs as measured: nodes in order; an argument is a builtin, a buffer address that may be dereferenced to the type the function takes, a texture, a sampler or an earlier node. On iOS 16.5 an early return is a function's node with a flag (`MTLFunctionStitchingFunctionNodeSPI isEarlyReturn`), on a Mac today a nameless node of its own class over another. A texture's direction is read from whether its module calls `air.write_texture`.
+
 **What a library function's measurement is not: evidence about Metal's stitching.** Metal links
 these into a caller at pipeline time through the ABI their own metadata describes
 (`air.stitching_info`, with the four functions that do it and each argument's size and
