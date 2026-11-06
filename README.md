@@ -21,8 +21,9 @@ setup the upstream documentation describes (`common/setup.sh`, `common/ugit`) is
 
 ## Status
 
-Verified on **one** unit (IN2010, panel AMB655UV01) as of **2026-11-05**. "Installed" means it boots from the phone's
-own flash with no computer attached. "RAM" means it works in a test boot from RAM and is not yet in an installed build.
+Verified on **one** unit (IN2010, panel AMB655UV01) as of **2026-11-06**. "Installed" means it is in the build that boots
+from the phone's own flash with no computer attached. "RAM" means it has only run in a test boot from RAM. Most checks
+were made on RAM boots of the same kernel and libraries as the installed build; the notes say where that matters.
 
 ### Works
 
@@ -30,41 +31,40 @@ own flash with no computer attached. "RAM" means it works in a test boot from RA
 |---|---|---|
 | Boot to the home screen, standalone | ✅ installed | Boot menu with a USB developer mode; falls back to the previous version after 3 failed boots |
 | Storage (UFS), user data on HFS+ | ✅ installed | Data survives reboots |
-| Display, 90 Hz panel mode, no tearing | ✅ installed | Real frame rate is often ~45 fps (see Known issues) |
-| GPU compositing (Adreno 650, Mesa freedreno) | ✅ installed | Through OpenGL ES; Metal is below |
+| Metal over Vulkan (Mesa turnip), whole system | ✅ installed | The default now: compositor, home screen, Settings, Safari, Photos, Maps, Camera. Stutter and memory growth remain, see Known issues |
+| Own display driver (MDP layers), 90 Hz | ✅ installed | Hardware planes instead of GPU composition where possible; no tearing triangles; 0 underruns and 0 SMMU faults in the runs read |
 | Touch, power key, volume down | ✅ installed | |
-| Manual brightness | ✅ installed | No auto-brightness yet |
-| Wi-Fi 2.4/5 GHz (QCA6390), Safari | ✅ installed | WPA2 verified |
-| Front camera (IMX471) in Camera.app | ✅ installed | 30 fps preview, image processing on the GPU |
-| Main camera (IMX586, 48 MP) as 1x, with autofocus | ✅ installed | Colour tuning from the phone's own calibration |
-| 2x (IMX586 sensor crop; digital zoom in low light) | ✅ installed | Switching 1x ↔ 2x takes ~0.3 s |
-| Ultra-wide (IMX481) as 0.5x, with autofocus | ✅ installed | The .5 / 1 / 2 buttons as on an iPhone 11 Pro; no lens-distortion correction yet |
-| Speakers, iOS sounds, main microphone, vibration | 🧪 RAM | Touch to the DSP's queue about 108 ms, computed |
-| Metal over Vulkan (Mesa turnip), whole system | 🧪 RAM | Compositor, home screen, wallpaper, Settings, Safari, Clock, Photos and Maps' first screens; not the default |
-| Display brightness, EDR and HBM | 🧪 RAM | HDR on the panel; HDR photos are not there yet, see below |
-| Wi-Fi list, signal bars, automatic time, screenshots, Bold Text | 🧪 RAM | Fixes waiting for the next install |
+| Manual brightness, EDR and HBM | ✅ installed | No auto-brightness yet |
+| HDR photos | ✅ installed | Gain maps through real CoreImage on Metal; checked by eye in RAM boots |
+| Maps | ✅ installed | Real map data draws correctly; gestures lag. Checked by eye in RAM boots |
+| Wi-Fi 2.4/5 GHz (QCA6390), Safari | ✅ installed | WPA2; joins a network saved in the build's `fw-wifi/network` by itself. That file is yours and is not in this repository |
+| All three back cameras' and the front camera's preview | ✅ installed | The preview's repeating frames are fixed. Preview is 15 fps in the dark |
+| Flashlight and camera flash | ✅ installed | On by default |
+| Bluetooth | ✅ installed | On by default; the controller comes up. Audio to a device not rechecked on this build |
+| Speakers, main microphone, vibration | 🧪 installed, not rechecked | Worked in earlier RAM boots. On this build the microphone has been seen with signal, the speakers only as samples reaching the driver |
+| Wi-Fi location | 🧪 RAM | Maps located correctly in a RAM boot. On a kept `/var` the switch was set once by hand; not confirmed on the installed build. Needs Wi-Fi: no GPS |
 
 ### Not working yet
 
 | Feature | Notes |
 |---|---|
-| HDR photos | Photos opens them in colour through Metal, but not as HDR: CMPhoto still fails (-12914), the screen is too dim there |
-| VideoToolbox on Metal | Scaling works, and HEICs decode; 420f destinations still fall back to the CPU |
-| Own display driver (MDP/DPU) | Started: hardware planes and scaler instead of the GPU, read-only so far |
-| Bluetooth | Partial |
-| Sensors, auto-brightness, GPS | In progress / not started |
-| Cellular | Not started |
+| System sleep | **Off in the installed build**, so the power key only locks the screen and battery drain is higher. With Wi-Fi off, sleep and wake work in RAM. With Wi-Fi on, its firmware crashes on resume and the phone must be restarted by hand |
+| GPS | The modem's firmware runs and stops cleanly, QRTR lists its services and QMI LOC answers. Starting the engine crashes the modem after about 70 s (`remotefs_sahara.c:850`); no satellites seen yet |
+| Sensors, auto-brightness | Need the sensor DSP (SLPI) and its whole stack. Not started beyond the DSP coming up |
+| Cellular | Not started; the modem is never registered |
+| Third-party apps | First steps: an unencrypted app can be fetched, registered and its icon shown, and it has been seen to start. It has not been seen to draw. Encrypted (FairPlay) apps will not run |
 | App Store, Apple ID, iCloud, push, FairPlay | Blocked (needs Secure Enclave behaviour) |
 | Macro camera (GC2375) | Detected only |
 | Portrait mode depth | Needs two cameras streaming at once |
 
 ### Known issues
 
-- Real frame rate often ~45 fps instead of 90
-- Camera: switching lenses takes 0.5–1 s; Portrait is listed but has no depth effect
+- **The compositor's memory grows and does not come back**, about 2.5 GB in 12 minutes of heavy use. After about 10 minutes of that, background apps get killed, and the screen can restart once
+- **Gestures in Maps do not follow the finger closely.** A GPU frame of Maps and the compositor together takes about 15 ms against 90 Hz's 11 ms, and first use of a screen stalls while pipelines are built
+- Heat: the first minutes after boot read up to about 87 °C on the CPU sensors, and heavy use has throttled once or twice at about 95 °C
+- Camera: 15 fps in the dark, autofocus can walk out of range in the dark, Portrait has no depth effect
 - Setting a wallpaper does not work
-- On Metal: Safari's sticky headers are missing and scrolled content can go missing; video does not update
-- In installed builds, until the next install: no sound or vibration, clock about 2 s behind, Bold Text freezes, no screenshots, Wi-Fi list incomplete on refresh, no signal bars
+- Two of Maps' pipelines (`GlowAlpha`, `PatternedRibbon`) are refused, so those effects do not draw
 
 ---
 
@@ -80,8 +80,8 @@ phone's `userdata` and removes Android.
 
 ## Roadmap
 
-1. HEIC and HDR photos through Metal, as on an iPhone
-2. Our own MDP/DPU display driver, then the frame rate
-3. Sound delay through the audio DSP's low-latency path, camera start-up speed
-4. Sensors, GPS, installing third-party apps, an installed build with all of the above
-5. TrustZone-dependent services, the Titan 480 hardware ISP
+1. The compositor's memory growth, then Maps' stutter
+2. Wi-Fi across system sleep, so the installed build can sleep
+3. GPS: serving or refusing the modem's file sync, then the engine
+4. Sensors and auto-brightness through the SLPI
+5. Third-party apps; then TrustZone-dependent services and the Titan 480 hardware ISP
