@@ -280,6 +280,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/HKTriangle src/triangle_app.m &&
 			{ ${LDID:-ldid} -Ssrc/triangle_app.entitlements obj/HKTriangle 2>/dev/null ||
 			  echo "build.sh: no ldid: HKTriangle is unsigned, which still runs (AMFI here accepts everything) but holds no entitlements"; }
+		# A small on-phone GNSS status screen.  It reads only the kernel's
+		# privacy-safe counters; it is useful for an outdoor RAM-only run.
+		$DYN -framework Foundation -framework UIKit -framework CoreLocation \
+			-o obj/GNSSMonitor src/gnss_monitor.m
 		# what the device ANSWERS when an application asks what it supports
 		# (src/metal_caps.m). It takes the device from MTLCreateSystemDefaultDevice() so
 		# that the ivars behind Apple's inherited answers are filled by the registration
@@ -436,6 +440,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# process whose output is certainly in the log, because the job list runs it. An
 	# application launched by SpringBoard is a process this file cannot promise that about.
 	[ -f obj/HKTriangle ] && cp obj/HKTriangle root/bin/triangle_app
+	[ -f obj/GNSSMonitor ] && cp obj/GNSSMonitor root/bin/gnss_monitor
 	for f in $EXTRA; do cp "$f" root/bin/; done
 	#
 	# ... and the application bundle itself, staged in obj/ and copied into
@@ -480,6 +485,15 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# config_enforce_signed_code. What a signature would still buy is entitlements,
 		# and this application asks the system for nothing that needs one.
 		echo "  HKTriangle.app: $(du -sk obj/HKTriangle.app | cut -f1) KB for /Applications"
+	fi
+	if [ -f obj/GNSSMonitor ]; then
+		rm -rf obj/GNSSMonitor.app
+		mkdir -p obj/GNSSMonitor.app
+		cp obj/GNSSMonitor obj/GNSSMonitor.app/
+		cp src/gnss_monitor.plist obj/GNSSMonitor.app/Info.plist
+		cp -R src/gnss_monitor_resources/*.lproj src/gnss_monitor_resources/Settings.bundle obj/GNSSMonitor.app/
+		printf 'APPL????' > obj/GNSSMonitor.app/PkgInfo
+		cp -a obj/GNSSMonitor.app sysroot/Applications/
 	fi
 	# /dev and /private/var exist so that this image can also be the root on its own:
 	# devfs is mounted on /dev, and init puts a ramfs on /private/var

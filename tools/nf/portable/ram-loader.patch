@@ -1,0 +1,187 @@
+--- a/loader.c
++++ b/loader.c
+@@ -354,53 +354,12 @@
+ static void hc_print_state(const char *when);
+ static void hc_take_back(const char *when);
+ 
++/* This USB-only diagnostic keeps the composed result in RAM until reset.
++ * The loader's ordinary logdump flushes are independent of XNU's ufs_write.
++ * No command can replace the staged buffer after the one kernel returns. */
+ static void
+ write_logs(const char *klog, uint64_t klog_len)
+ {
+-	efi_block_io *bio = find_log_partition();
+-
+-	compose_logs(klog, klog_len);
+-	if (bio == NULL) {
+-		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
+-		if (klog != NULL) {
+-			print("\n== KERNEL LOG ==\n");
+-			for (uint64_t i = 0; i < klog_len; i++) {
+-				put_char(klog[i]);
+-			}
+-			print("\n== END OF LOG ==\n");
+-		}
+-		return;
+-	}
+-	uint64_t bs = bio->media->block_size;
+-	uint64_t len = (staged_len + 1 + bs - 1) / bs * bs;
+-	efi_status ws, rs = 0;
+-	int same = 0;
+-
+-	/* only through UEFI's own transfer list (see hc_take_back) */
+-	if (!hc_list_is_uefis()) {
+-		if (hc_log_skips++ < 2) {
+-			hc_print_state("log not written");
+-			print("log: NOT WRITTEN to logdump: UEFI's transfer list is not the one in the controller\n");
+-		}
+-		compose_logs(klog, klog_len);
+-		return;
+-	}
+-	ws = bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf);
+-
+-	if (!EFI_ERROR(ws)) {
+-		bio->flush_blocks(bio);
+-		/*
+-		 * And read back: that the log is in the partition is what a run of the kernel's own UFS
+-		 * driver must leave possible (the controller is shared with this one). The line goes into
+-		 * the copy the host fetches over USB, not into the partition, which already has the rest.
+-		 */
+-		if (len <= sizeof(block_buffer)) {
+-			rs = bio->read_blocks(bio, bio->media->media_id, 0, len, block_buffer);
+-			same = !EFI_ERROR(rs) && memcmp(block_buffer, out_buf, len) == 0;
+-		}
+-	}
+-	print("log: %d bytes written to logdump (%x), read back %s (%x)\n", len, ws,
+-	    EFI_ERROR(ws) ? "not tried" : same ? "the same" : "DIFFERENT", rs);
+ 	compose_logs(klog, klog_len);
+ }
+ 
+@@ -1295,6 +1254,8 @@
+ 	uint64_t magic3;                /* "XNULIVE3": the kernel is new enough to have what follows */
+ 	uint64_t screen;                /* (a virtual address too) { physical address, bytes a row } of what the panel shows; 0: SCREEN */
+ 	uint64_t magic4, log_total, agent; /* XNULIVE4: iphont mailbox */
++	uint64_t portable_magic;
++	volatile uint64_t portable_usb;
+ };
+ 
+ /*
+@@ -1379,6 +1340,21 @@
+  */
+ static const struct kernel_live *running_live;
+ static uint64_t running_slide;
++static int usb_connected;
++
++/* USB state from the existing UEFI event pump. The kernel takes only an
++ * atomic snapshot of the generation and cable state published by this core. */
++static void portable_usb_update(void)
++{
++	if (running_live && running_live->portable_magic == 0x3154524f504b4848ULL) {
++		struct kernel_live *live = (struct kernel_live *)(uintptr_t)running_live;
++		uint64_t previous = live->portable_usb;
++		if (previous == 0 || (previous & 1) != (unsigned)usb_connected)
++			__atomic_store_n(&live->portable_usb,
++			    ((previous & ~1ULL) + 2) | (unsigned)usb_connected, __ATOMIC_RELEASE);
++	}
++}
++
+ static void usb_poll_command(void);
+ 
+ static uint64_t
+@@ -2723,6 +2699,7 @@
+ 	int arrived = 0, watching_only = 0;
+ 
+ 	running_live = live;
++	portable_usb_update();
+ 	running_slide = slide;
+ 	other_cpu_start.entry = entry;
+ 	other_cpu_start.boot_args = boot_args_pa;
+@@ -3390,10 +3367,8 @@
+ 			ufs_requested = c[4] - '0';
+ 		}
+ 		block_probe_requested |= starts_with(c, "ufs_probe=1") && (c == pi.cmdline || c[-1] == ' ');
+-		block_write_requested |= starts_with(c, "ufs_write=1") && (c == pi.cmdline || c[-1] == ' ') &&
+-		    (c[11] == 0 || c[11] == ' ');
+-		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
+-		    c[11] <= '9';
++		/* Portable images never expose writable storage or native UFS list ownership. */
++
+ 	}
+ 	if (battery_requested) {
+ 		charger_start();
+@@ -4106,6 +4081,7 @@
+ 		USB->handle_event(&msg, &size, &data);
+ 		if (msg == UsbDeviceEventDeviceStateChange) {
+ 			usb_connected = (data.device_state == UsbDeviceStateConnected);
++		portable_usb_update();
+ 			return -1;
+ 		}
+ 		/* with a kernel running, a host that went away must not keep this core from watching it */
+@@ -4250,6 +4226,30 @@
+ fb_command(char *cmd)
+ {
+ 	int busy = running_live != NULL;
++	static int ran;
++
++	if (str_eq(cmd, "getvar:portable")) {
++		fb_reply("OKAY", "ram-log-v1");
++		return;
++	}
++	if (str_eq(cmd, "oem portable-log")) {
++		if (busy) {
++			compose_live_log(running_live, running_slide);
++		} else if (!ran) {
++			fb_reply("FAIL", "no portable run");
++			return;
++		}
++		fb_reply("OKAY", "");
++		return;
++	}
++	/* All operations here refer only to the one RAM boot and its current log. */
++	if (!(starts_with(cmd, "getvar:") || str_eq(cmd, "upload") ||
++	    (!ran && !busy && (starts_with(cmd, "download:") || str_eq(cmd, "oem ramdisk") ||
++	    str_eq(cmd, "oem run"))) || (busy && str_eq(cmd, "oem stop")) || (!busy && str_eq(cmd, "reboot-bootloader")))) {
++		fb_reply("FAIL", "unavailable on portable loader");
++		return;
++	}
++	if (str_eq(cmd, "oem run")) ran = 1;
+ 
+ 	if (starts_with(cmd, "oem fwinfo") || starts_with(cmd, "oem fwread")) {
+ 		fw_command(cmd, busy);
+@@ -4537,6 +4537,7 @@
+ 	USB->handle_event(&msg, &size, &data);
+ 	if (msg == UsbDeviceEventDeviceStateChange) {
+ 		usb_connected = (data.device_state == UsbDeviceStateConnected);
++		portable_usb_update();
+ 		/* (the cable out or in: nothing queued before it is anyone's any more -- see usb_wait()) */
+ 		USB->abort_xfer(USB_EP_OUT);
+ 		USB->abort_xfer(USB_EP_IN);
+@@ -4705,7 +4706,7 @@
+ 			ramfb_phone_screen();
+ 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
+ 	}
+-	read_last_log();
++	/* No retained logdump or data from previous sessions. */
+ 	print("platform %s\n", PLAT->name);
+ 	pon_report();
+ 	charger_icl_save();
+@@ -4719,16 +4720,6 @@
+ 		usb_command_loop();
+ 	}
+ 
+-	/*
+-	 * One-shot mode: run the kernel that came with the image, then reset. A payload with the loader alone
+-	 * (an installed device's boot partition: common/flash/install.sh) has no kernel: that is the menu's.
+-	 */
+-	if (have_payload && pi.kernel != NULL) {
+-		run_kernel(0, 0);
+-		reboot();
+-	}
+-	/* No kernel: an installed device booting on its own -- the menu, the bundle from darwin, Android */
+-	fb_standalone();
+-	reboot();
+-	return 0;
+-}
++	/* Failed USB initialization: return to stock, never boot an installed image. */
++	reboot_to_fastboot(); for (;;) { BS->stall(100000); }
++}

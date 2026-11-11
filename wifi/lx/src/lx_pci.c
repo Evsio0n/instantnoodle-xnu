@@ -839,6 +839,12 @@ lx_pci_probe(void)
 void
 lx_pci_remove(void)
 {
+	/* driver_up(), lx_stop() and diagnostic cleanup all come through here.
+	 * A failed wake must retain the probed object and its DMA/SMMU owner. */
+	if (!mhi_ownership_clean()) {
+		lx_tell("lx: pci: removal held until MHI recovery completes\n");
+		return;
+	}
 	if (radio_probed && radio_driver->remove != NULL) {
 		radio_driver->remove(&radio);
 	}

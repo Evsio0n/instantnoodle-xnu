@@ -37,6 +37,7 @@ struct modem_sahara {
 	void *current;
 	uint64_t current_size;
 	bool have_current;
+	bool memory_debug_offered;      /* SBL crash offer, never read; distinguish from a wire failure */
 	uint32_t ids[MODEM_SAHARA_IMAGES];
 	uint64_t sent[MODEM_SAHARA_IMAGES];
 	unsigned images;

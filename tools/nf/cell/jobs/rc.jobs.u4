@@ -1,0 +1,4 @@
+# Commands run by the launchd job com.hackios.demo: the daily system with the modem (cell=1), Wi-Fi and the stand-in for CommCenter.
+# The modem's session as iOS's second network; everything else (unlocking, Settings, screenshots) is done from the computer through the agent.
+/hackios/bin/mg_test HasBaseband cellular-data telephony
+/hackios/bin/net_test wait 50 dhcp en1 waitaddr en1 40

@@ -21,7 +21,7 @@ setup the upstream documentation describes (`common/setup.sh`, `common/ugit`) is
 
 ## Status
 
-Verified on **one** unit (IN2010, panel AMB655UV01) as of **2026-11-06**. "Installed" means it is in the build that boots
+Verified on **one** unit (IN2010, panel AMB655UV01) as of **2026-11-11**. "Installed" means it is in the build that boots
 from the phone's own flash with no computer attached. "RAM" means it has only run in a test boot from RAM. Most checks
 were made on RAM boots of the same kernel and libraries as the installed build; the notes say where that matters.
 
@@ -41,7 +41,10 @@ were made on RAM boots of the same kernel and libraries as the installed build; 
 | All three back cameras' and the front camera's preview | ✅ installed | The preview's repeating frames are fixed. Preview is 15 fps in the dark |
 | Flashlight and camera flash | ✅ installed | On by default |
 | Bluetooth | ✅ installed | On by default; the controller comes up. Audio to a device not rechecked on this build |
-| Speakers, main microphone, vibration | 🧪 installed, not rechecked | Worked in earlier RAM boots. On this build the microphone has been seen with signal, the speakers only as samples reaching the driver |
+| Cellular: carrier, signal, mobile data | ✅ installed | Snapdragon X55 modem. The driver is the OnePlus 8 Pro port's ([dekefake/hackios-op8pro](https://github.com/dekefake/hackios-op8pro)), moved to this phone: [tools/nf/cell](tools/nf/cell/README.md). Data works beside Wi-Fi |
+| SMS | ✅ installed | Both ways in Messages: Chinese, emoji, long messages, the lock-screen notification. No MMS |
+| Phone calls (VoLTE) | ✅ installed | Both ways from iOS's own Phone app, with sound at the earpiece. The call volume cannot be changed yet; the speaker button and mute are not confirmed by ear |
+| Speakers, main microphone, vibration | 🧪 installed, partly rechecked | The microphone and the earpiece carry real calls on this build. iOS's own sounds through the speakers worked in earlier RAM boots and were not rechecked |
 | Wi-Fi location | 🧪 RAM | Maps located correctly in a RAM boot. On a kept `/var` the switch was set once by hand; not confirmed on the installed build. Needs Wi-Fi: no GPS |
 
 ### Not working yet
@@ -49,22 +52,25 @@ were made on RAM boots of the same kernel and libraries as the installed build; 
 | Feature | Notes |
 |---|---|
 | System sleep | **Off in the installed build**, so the power key only locks the screen and battery drain is higher. With Wi-Fi off, sleep and wake work in RAM. With Wi-Fi on, its firmware crashes on resume and the phone must be restarted by hand |
-| GPS | The modem's firmware runs and stops cleanly, QRTR lists its services and QMI LOC answers. Starting the engine crashes the modem after about 70 s (`remotefs_sahara.c:850`); no satellites seen yet |
-| Sensors, auto-brightness | Need the sensor DSP (SLPI) and its whole stack. Not started beyond the DSP coming up |
-| Cellular | Not started; the modem is never registered |
+| GPS | The modem's location service answers and reports, but there has been no fix outdoors and nothing feeds iOS's location service yet |
+| Sensors, auto-brightness | Need the sensor DSP (SLPI) and its whole stack; the DSP comes up and is being probed, no sensor data yet. With no proximity sensor **the screen stays on at the ear during a call**; no rotation either |
+| The rest of telephony | Hold, call waiting, keypad tones, MMS, voicemail and Personal Hotspot are not done. A call over a Bluetooth headset and emergency calls have not been tried |
 | Third-party apps | First steps: an unencrypted app can be fetched, registered and its icon shown, and it has been seen to start. It has not been seen to draw. Encrypted (FairPlay) apps will not run |
-| App Store, Apple ID, iCloud, push, FairPlay | Blocked (needs Secure Enclave behaviour) |
+| App Store, Apple ID, iCloud, push, FairPlay | Blocked: Apple's servers want a signature made with keys inside a real iPhone's Secure Enclave, and this project does not forge a device's identity. So no iMessage or FaceTime, and an app gets no notifications while it is closed. Calls, SMS and the phone's own notifications do not depend on it |
 | Macro camera (GC2375) | Detected only |
 | Portrait mode depth | Needs two cameras streaming at once |
 
 ### Known issues
 
 - **The compositor's memory grows and does not come back**, about 2.5 GB in 12 minutes of heavy use. After about 10 minutes of that, background apps get killed, and the screen can restart once
+- **About 1 frame in 10 is late in daily use** (90 Hz panel), and it was so before the cellular build too. The GPU is mostly idle (busy 3% at the median); the best lead is render pipelines compiled while drawing, with no cache on disk. Analysed from logs, not fixed: [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) K35, plan in [docs/TODO.md](docs/TODO.md) T40
 - **Gestures in Maps do not follow the finger closely.** A GPU frame of Maps and the compositor together takes about 15 ms against 90 Hz's 11 ms, and first use of a screen stalls while pipelines are built
 - Heat: the first minutes after boot read up to about 87 °C on the CPU sensors, and heavy use has throttled once or twice at about 95 °C
 - Camera: 15 fps in the dark, autofocus can walk out of range in the dark, Portrait has no depth effect
-- Setting a wallpaper does not work
-- Two of Maps' pipelines (`GlowAlpha`, `PatternedRibbon`) are refused, so those effects do not draw
+- Setting a wallpaper does not work. The lock screen's own wallpaper draws, but its long-press picker is turned off by this port: it came out black before the move to Metal and has not been tried since
+- Two of Maps' pipelines (`GlowAlpha`, `PatternedRibbon`) and Siri's orb are refused (framebuffer fetch at 4 samples), so those effects do not draw. What else Metal refuses or stands in for: K42
+- The cellular kernel is not made by the normal build yet. It is an overlay build that needs objects from the developer's own build container ([tools/nf/cell/README.md](tools/nf/cell/README.md))
+- The keychain protects nothing (no Secure Enclave, stand-ins instead): do not keep important accounts on this phone
 
 ---
 
@@ -80,8 +86,9 @@ phone's `userdata` and removes Android.
 
 ## Roadmap
 
-1. The compositor's memory growth, then Maps' stutter
+1. Metal: the stutter of daily use and the compositor's memory growth (pipeline cache first; measurement before any fix)
 2. Wi-Fi across system sleep, so the installed build can sleep
-3. GPS: serving or refusing the modem's file sync, then the engine
-4. Sensors and auto-brightness through the SLPI
-5. Third-party apps; then TrustZone-dependent services and the Titan 480 hardware ISP
+3. Sensors through the SLPI: proximity first now that calls work, then auto-brightness and rotation
+4. Cellular: the driver into the normal build; call volume, hold, keypad tones, MMS
+5. GPS: a fix outdoors, then iOS's location service
+6. Third-party apps; then a TrustZone-backed keychain and the Titan 480 hardware ISP

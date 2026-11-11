@@ -6,7 +6,6 @@ complete transfer, so that it runs only for a ticket and does not stay listening
 """
 import http.server
 import os
-import shutil
 import sys
 import threading
 
@@ -25,8 +24,15 @@ def main():
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(size))
             self.end_headers()
-            with open(path, "rb") as source:
-                shutil.copyfileobj(source, self.wfile, 1 << 20)
+            sent = 0
+            try:
+                with open(path, "rb") as source:
+                    while piece := source.read(1 << 20):
+                        self.wfile.write(piece)
+                        sent += len(piece)
+            except OSError as error:
+                print("a transfer ended early:", sent, "bytes handed to the network,", type(error).__name__, flush=True)
+                return
             print("served", size, "bytes", flush=True)
             threading.Thread(target=self.server.shutdown).start()
 

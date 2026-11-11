@@ -1016,6 +1016,10 @@ lx_dma_free(void *memory, size_t size)
 	if (memory == NULL || !in_pool(memory, 1) || (uint8_t *)memory >= pool.memory + pool.rings) {
 		return;
 	}
+	/* A reset can fail inside upstream's void remove/power-down callbacks,
+	 * after the entrance gate was checked. Never recycle that device's DMA
+	 * storage on the way out: its owner cannot recover after memory reuse. */
+	if (!mhi_ownership_clean()) lx_os_panic("lx: DMA free while MHI ownership is dirty");
 	lx_os_lock();
 	pool_give((uint32_t)((uint8_t *)memory - pool.memory), (uint32_t)roundup2(size, POOL_GRAIN));
 	lx_os_unlock();
@@ -1142,6 +1146,7 @@ linuxkpi_kfree_skb(struct sk_buff *skb)
 		return;
 	}
 	if (in_pool(skb->head, 1) && skb->head >= pool.memory + pool.rings) {
+		if (!mhi_ownership_clean()) lx_os_panic("lx: DMA packet free while MHI ownership is dirty");
 		lx_os_lock();
 		pool.free_slots[pool.free_count++] = (uint32_t)((skb->head - (pool.memory + pool.rings)) / POOL_SLOT);
 		lx_os_unlock();

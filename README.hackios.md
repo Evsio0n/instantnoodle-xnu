@@ -39,14 +39,16 @@ Per-device detail and evidence: [docs/devices/](docs/devices/README.md). In shor
 
 - Boot to SpringBoard, lock screen, home screen, system gestures, Control Center, Settings, Safari and the stock apps; 8 cores, prime core at 2.84 GHz.
 - 90 Hz display without tearing; touch screen, power and volume keys, alert slider (ring/silent and Do Not Disturb); battery level and charging.
-- Adreno 650 drawing through Mesa/freedreno (OpenGL ES) for CoreAnimation; an experimental Metal driver (off by default, see [gpu.md](docs/subsystems/gpu.md)).
+- Adreno 650 drawing through Mesa/freedreno (OpenGL ES) for CoreAnimation; a Metal driver over Vulkan (Mesa's Turnip) that the installed system has run on wholly since 2026-11-06. It is off in the kernel's defaults and still stutters ([gpu.md](docs/subsystems/gpu.md), KNOWN_ISSUES K35, K42).
+- Cellular (Snapdragon X55) since 2026-11-11: carrier and signal, mobile data, SMS both ways, VoLTE calls both ways with sound ([cellular.md](docs/subsystems/cellular.md)).
+- Bluetooth (earbuds, BLE); the back and front cameras with HEIC photos and the flash.
 - Wi-Fi (QCA6390): scan, join from Settings (WPA2, WPA2/TKIP, WPA3), DHCP, Safari. Speakers, iOS sounds and the main microphone; haptics; flashlight.
 - Display off/on, system sleep and wake (not the SoC's deepest state), GPU powered down in sleep.
 - Boots from the phone's flash with a boot menu and rollback guard; iOS's `/private/var` persists on an HFS+ volume.
 - Sileo + Procursus (dpkg, apt), tweaks, SSH.
 
-**Does not work yet:** cellular and calls, Bluetooth, cameras (OnePlus 8), sensors (rotation, light, proximity), headphones, fingerprint, location, App Store content and Apple ID sign-in
-(no Secure Enclave), fast charging, video recording, Metal for apps. Several power paths (off-mode charging, empty-battery shutdown, wall-charger limit) are built but not yet observed on the phone.
+**Does not work yet:** sensors (rotation, light, proximity: the screen stays on at the ear in a call), wired headphones, fingerprint, GPS, App Store content, Apple ID sign-in and push
+(no Secure Enclave), fast charging, video recording, Metal for apps; of telephony: hold, DTMF, MMS, hotspot. Several power paths (off-mode charging, empty-battery shutdown, wall-charger limit) are built but not yet observed on the phone.
 Full list with causes: [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 
 On the **POCO X5 Pro** (as last documented; not re-verified recently): lock/home screen, touch, 8 cores, GPU, Wi-Fi (WCN6750), sound, cameras with HEIC photos, charging with `adsp=1`, 120 Hz without tearing, dual boot.

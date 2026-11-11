@@ -95,3 +95,10 @@ __pycache__/
 !/xnu-deps/build/lzbitmap/libzbitmap.c
 !/xnu-deps/build/lzbitmap/libzbitmap.h
 /tools/android/f2fs-resize
+
+# a checkout's own: the phone's serial (tools/sensors/cold_recover.py), the Pro port's files fetched by tools/nf/cell/fetch-ref.sh,
+# and what tools/wifi-sleep/run.py leaves behind
+*.local
+/tools/nf/cell/ref-pro/
+/tools/wifi-sleep/run-*/
+/tools/wifi-sleep/control-host-*/

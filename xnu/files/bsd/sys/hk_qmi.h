@@ -117,6 +117,7 @@ struct sockaddr_qrtr {
 struct qmi_handle;
 struct qmi_txn;
 struct socket;                          /* (only ever a pointer here: what a handle's `sock` is called in Linux) */
+struct hk_qrtr_ops;                     /* transport selected for one handle */
 
 /* A server of a service that was looked up. */
 struct qmi_service {
@@ -159,6 +160,11 @@ struct qmi_txn {
 	void *dest;                     /* ... the structure it goes into */
 	struct qmi_txn *next;           /* the helpers' */
 	bool done, waiting;
+	/* Bound by qmi_send_request() before the transport may deliver a reply. */
+	bool bound;
+	uint32_t peer_node, peer_port;
+	uint16_t message;
+	int (*validate)(const void *data, size_t length);
 };
 
 /*
@@ -166,12 +172,34 @@ struct qmi_txn {
  * errno: -ENXIO where there is no router (hk_qmi_set_transport() has not been called).
  */
 int qmi_handle_init(struct qmi_handle *qmi, size_t largest, const struct qmi_ops *ops, const struct qmi_msg_handler *handlers);
+/*
+ * The explicit-transport form is for handles that do not use the process-wide
+ * compatibility setting.  The transport object must remain valid until
+ * qmi_handle_release() returns.  Passing NULL has the same effect as having no
+ * transport selected and returns -ENXIO.
+ */
+int qmi_handle_init_transport(struct qmi_handle *qmi, size_t largest, const struct qmi_ops *ops,
+    const struct qmi_msg_handler *handlers, const struct hk_qrtr_ops *transport);
 void qmi_handle_release(struct qmi_handle *qmi);
 /* Ask for a service: ops->new_server is called for every server of it there is and will be. */
 int qmi_add_lookup(struct qmi_handle *qmi, unsigned int service, unsigned int version, unsigned int instance);
 
 /* A transaction: its number (not negative), or a negative errno. The reply will be decoded by `ei` into `structure`. */
 int qmi_txn_init(struct qmi_handle *qmi, struct qmi_txn *txn, const struct qmi_elem_info *ei, void *structure);
+/* Optional schema validation before decoding a matching response. Return zero
+ * or a negative errno. Called with the QMI lock held: do not sleep or call QMI.
+ * The legacy initializer above supplies no validator. */
+int qmi_txn_init_checked(struct qmi_handle *qmi, struct qmi_txn *txn,
+    const struct qmi_elem_info *ei, void *structure,
+    int (*validate)(const void *data, size_t length));
+/* A matching response may instead be decoded directly into a small summary.
+ * The caller owns this descriptor and its output through cancellation or wait.
+ * The decoder runs under the QMI lock and must not block. */
+struct hk_qmi_projection {
+	int (*decode)(const void *packet, size_t length, void *output);
+	void *output;
+};
+int hk_qmi_txn_init_projected(struct qmi_handle *, struct qmi_txn *, struct hk_qmi_projection *);
 /*
  * Send the request of that transaction to `sq`, or with sq NULL to the server the handle was
  * connected to. `largest`: the most the encoded message may take, header not counted.
@@ -185,6 +213,9 @@ void qmi_txn_cancel(struct qmi_txn *txn);
  * the error of a reply that could not be decoded. The transaction is over either way.
  */
 int hk_qmi_txn_wait_ms(struct qmi_txn *txn, uint64_t milliseconds);
+/* Single-owner nonblocking collector: 0 pending (still armed), 1 consumed,
+ * negative errno if this is not a live transaction. Do not concurrently wait. */
+int hk_qmi_txn_poll(struct qmi_txn *txn, int *decoded_result);
 
 /*
  * Linux's qmi_txn_wait() takes the time in "jiffies", of which the caller's Linux has HZ a second.

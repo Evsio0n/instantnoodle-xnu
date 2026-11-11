@@ -29,6 +29,9 @@
 #define HK_BUTTON_HOME     4
 #define HK_SLIDER          6       /* a three-position switch (the OnePlus 8's alert slider) is now at `finger` (HK_SLIDER_*) */
 
+/* Physical, hardware-recognized dark-screen tap. No coordinate/press record. */
+#define HK_TOUCH_WAKE     7
+
 #define HK_SLIDER_DOWN     1       /* ring */
 #define HK_SLIDER_MIDDLE   2       /* silent */
 #define HK_SLIDER_UP       3       /* Do Not Disturb */

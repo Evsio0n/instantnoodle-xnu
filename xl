@@ -231,7 +231,14 @@ run() { # run <oem command> <label>
 	*hung*|*no-such-core*)
 		# (bootcpu=N) the kernel is stuck on the core it was given and nothing can take the core back
 		echo "xl: the kernel did not come back from its core; restarting the phone"
-		fb reboot >/dev/null
+		if [ "${DEVICE:-}" = instantnoodle ]; then
+			# The IN2010 loader hard-resets through PON in both modes. Selecting
+			# ABL keeps the USB recovery endpoint available for the next ticket.
+			# A reset request is not proof of a new USB session or safe DMA reuse.
+			fb -s xnuloader reboot bootloader || echo "xl: reset request unconfirmed; verify stock FASTBOOT"
+		else
+			fb reboot >/dev/null
+		fi
 		return 2 ;;
 	esac
 }

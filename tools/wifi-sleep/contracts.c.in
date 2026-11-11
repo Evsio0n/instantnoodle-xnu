@@ -1,0 +1,130 @@
+/* Real source bodies inserted by run.py; dependencies mocked, NOT a real driver. */
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#define LX_BUS_PCI 1
+#define ATH11K_STATE_OFF 0
+#define PCIR_COMMAND 4
+#define PCIR_MSI_CTRL 2
+struct ar { int state; } ar;
+struct ath11k_base { struct { struct ar *ar; } pdevs[1]; } ab;
+static struct ath11k_base *driver;
+static int radio_bus, early_error, late_error, early_calls, late_calls;
+static int suspend_calls, suspend_late_calls, suspend_error, suspend_late_error;
+static unsigned long long lx_os_nanoseconds(void) { return 0; }
+static void lx_tell(const char *s, ...) {}
+static int resume_restore_seen;
+static int ath11k_core_resume_early(struct ath11k_base *a) { assert(resume_restore_seen); early_calls++; return early_error; }
+static int ath11k_core_resume(struct ath11k_base *a) { late_calls++; return late_error; }
+static void ath11k_core_deinit(struct ath11k_base *a) {}
+static int ath11k_core_suspend(struct ath11k_base *a) { suspend_calls++; return suspend_error; }
+static int ath11k_core_suspend_late(struct ath11k_base *a) { suspend_late_calls++; return suspend_late_error; }
+static struct { unsigned msi_cap; } radio;
+static bool radio_probed;
+static struct { uint8_t bytes[256], written[32]; } shadow;
+static uint8_t config[256];
+static unsigned writes[128], nwrites;
+static uint32_t lx_os_pci_config_read(unsigned at, unsigned width) {
+ assert(width == 2 && at < 255); return config[at] | (uint32_t)config[at+1] << 8;
+}
+static void lx_os_pci_config_write(unsigned at, uint32_t value, unsigned width) {
+ assert(width == 2 && at < 255 && nwrites < 128);
+ resume_restore_seen = 1;
+ writes[nwrites++] = at; config[at] = value; config[at+1] = value >> 8;
+}
+static void mhi_ownership_hold(void);
+static bool ownership_clean = true;
+static unsigned remove_calls;
+static bool mhi_ownership_clean(void) { return ownership_clean; }
+static void lx_station_withdraw(void) {}
+static void lx_station_leave(void) {}
+static void lx_pci_remove(void) { remove_calls++; if (ownership_clean) radio_probed = false; }
+static void *lx_pci_driver(void) { return radio_probed ? &ab : NULL; }
+@RESTORE@
+@RESUMED@
+@RESUME@
+@SUSPEND@
+@STOP@
+struct mhi_controller { int unused; } controller;
+static struct { struct mhi_controller *c; struct { bool allocated; } host; bool power_down_dirty; } mhi;
+static int host_error, attach_calls, looking_calls;
+static bool attached, polling;
+static void qrtr_send(void) {}
+static void lx_os_qrtr_attach(void (*send)(void)) { attach_calls++; attached = send != NULL; }
+static void looking(bool on) { looking_calls++; polling = on; }
+static unsigned hold_calls;
+static void mhi_ownership_hold(void) { hold_calls++; }
+static int mhi_host_power_up(void *host) { return host_error; }
+@MHI_SYNC@
+@MHI_ASYNC@
+
+static void resume_case(int first, int second) {
+ driver = &ab; radio_bus = LX_BUS_PCI; radio_probed = true;
+ early_error = first; late_error = second;
+ early_calls = late_calls = hold_calls = 0;
+ resume_restore_seen = 0; nwrites = 0;
+ shadow.written[PCIR_COMMAND / 8] = 1u << (PCIR_COMMAND % 8);
+ int expected = first ? -first : second ? -second : 0;
+ assert(lx_resume() == expected);
+ assert(early_calls == 1 && late_calls == (first == 0));
+ assert(driver == &ab);
+ assert(hold_calls == (expected != 0));
+}
+static void stop_case(void) {
+ driver = &ab; radio_bus = LX_BUS_PCI; radio_probed = true; ownership_clean = false; remove_calls = 0;
+ lx_stop();
+ assert(driver == &ab && radio_probed && remove_calls == 0);
+ ownership_clean = true;
+ lx_stop();
+ assert(driver == NULL && !radio_probed && remove_calls == 1);
+}
+static void mark(unsigned at, uint8_t value) {
+ shadow.bytes[at] = value; shadow.written[at / 8] |= 1u << (at % 8);
+}
+static void restore_case(unsigned cap) {
+ memset(&shadow, 0, sizeof(shadow)); memset(config, 0xa5, sizeof(config));
+ radio.msi_cap = cap; radio_probed = true; nwrites = 0;
+ /* Mix BAR/address/vector and low-only/high-only writes; untouched bytes survive. */
+ mark(PCIR_COMMAND, 7); mark(0x10, 0x12); mark(0x11, 0x34);
+ mark(0x55, 0x56); mark(0xfe, 0x78);
+ if (cap) { mark(cap + PCIR_MSI_CTRL, 0x81); mark(cap + 8, 0x99); }
+ lx_pci_resumed();
+ assert(nwrites == (cap ? 6u : 4u));
+ bool last_phase = false; unsigned command_pos = 999, msi_pos = 999;
+ for (unsigned i = 0; i < nwrites; i++) {
+  bool last = writes[i] == PCIR_COMMAND || (cap && writes[i] == cap + PCIR_MSI_CTRL);
+  if (last) last_phase = true; else assert(!last_phase);
+  if (writes[i] == PCIR_COMMAND) command_pos = i;
+  if (cap && writes[i] == cap + PCIR_MSI_CTRL) msi_pos = i;
+ }
+ assert(command_pos != 999); if (cap) assert(msi_pos > command_pos);
+ assert(config[4] == 7 && config[5] == 0xa5);
+ assert(config[0x54] == 0xa5 && config[0x55] == 0x56);
+ assert(config[0xfe] == 0x78 && config[0xff] == 0xa5 && config[0x30] == 0xa5);
+ radio_probed = false; unsigned previous = nwrites; lx_pci_resumed(); assert(previous == nwrites);
+}
+int main(void) {
+ resume_case(0, 0); resume_case(-ETIMEDOUT, 0); resume_case(0, -EIO);
+ stop_case();
+ driver = NULL; early_calls = late_calls = 0; assert(lx_resume() == 0);
+ driver = &ab; radio_bus = 99; assert(lx_resume() == 0); assert(!early_calls && !late_calls);
+ assert(lx_suspend() == EOPNOTSUPP); radio_bus = LX_BUS_PCI;
+ ab.pdevs[0].ar = &ar; ar.state = 1; assert(lx_suspend() == EBUSY); assert(!suspend_calls);
+ ar.state = ATH11K_STATE_OFF; suspend_error = -EIO; assert(lx_suspend() == EIO); assert(!suspend_late_calls);
+ suspend_error = 0; suspend_late_error = -ETIMEDOUT; assert(lx_suspend() == ETIMEDOUT);
+ suspend_late_error = 0; assert(lx_suspend() == 0);
+ restore_case(0x50); restore_case(0);
+ mhi.c = &controller; mhi.host.allocated = true;
+ host_error = EIO; assert(mhi_sync_power_up(&controller) == -EIO);
+ assert(!attached && !polling && attach_calls == 2 && looking_calls == 2);
+ host_error = ETIMEDOUT; assert(mhi_async_power_up(&controller) == -ETIMEDOUT);
+ host_error = 0; assert(mhi_async_power_up(&controller) == 0 && attached && polling);
+ mhi.host.allocated = false; int previous = attach_calls;
+ assert(mhi_sync_power_up(&controller) == -EINVAL && attach_calls == previous);
+ puts("PASS extracted actual suspend/resume, PCI restore and MHI adapter contracts (mock dependencies)");
+ return 0;
+}

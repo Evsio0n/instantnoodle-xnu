@@ -1,0 +1,3 @@
+# Commands run by the launchd job com.hackios.demo on the installed phone with the modem (cell=1): the modem's session as iOS's second network
+# (configd runs DHCP on en1, which the kernel answers with the session's address). Nothing else: no diagnostics on a phone in daily use.
+/hackios/bin/net_test wait 50 dhcp en1 waitaddr en1 40

@@ -181,7 +181,7 @@ Shared lock was free; current kernel includes the other agent's sleep/display fi
 - `inject_bt.c` is UUID/expected-pointer/instruction guarded for 20F66. Factory wrapper clears only proprietary multi-adv;
   final init step selects generic vendor descriptor. Omitted init steps call **0x1001c204c (continue)**; 0x1001c20b0 finishes
   the whole sequence and is wrong for a middle step. Find dyld image by UUID, not index zero. Details:
-  [bluetooth subsystem](subsystems/bluetooth.md), [research](research/bluetooth-ios.md), [test setup](TESTING.md#bluetooth-on-instantnoodle-opt-in-ram-only).
+  [bluetooth subsystem](bluetooth.md), [research](../research/bluetooth-ios.md), [test setup](../TESTING.md#bluetooth-on-instantnoodle-opt-in-ram-only).
 - **Stop condition reached; implementation stopped.** `213836-run.log.live.*`: initial GATT PASS; post-wake connection
   requests MITM security, then iOS says “Ignoring security request as there are no sessions that support it!” (4815/705).
   Owner must be present with a controlled peer in pairing mode, use Settings → Bluetooth, and confirm matching code/consent

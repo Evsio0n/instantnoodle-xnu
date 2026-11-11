@@ -10,7 +10,7 @@
  *   alarm SECONDS             the program's end, from now on, instead of 300 s
  *   claim                     what follows registers with TrollStore's signer fields (above)
  *   wait-net SECONDS          until en0 has an address, for at most SECONDS (the address is not printed)
- *   fetch HOST PORT PATH SHA256 FILE   HTTP/1.0 GET into FILE, and its hash checked: tools/ipa/serve.py is the other end
+ *   fetch HOST PORT PATH SHA256 FILE   HTTP/1.0 GET into FILE, and its hash checked: tools/ipa/serve.py is the other end. Says how far every 32 MB; a stall starts it again, up to three tries
  *   unpack FILE DIR           a ustar archive under DIR (tools/ipa/pack.sh made it): Payload/NAME.app and ents/BUNDLE.plist, entitlements as the host read them from the signatures
  *   install DIR               the .app in DIR/Payload into a bundle container, then the containers it needs, then registered
  *   state BUNDLE              what LaunchServices says of it
@@ -23,6 +23,7 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <netdb.h>
@@ -109,8 +110,12 @@ wait_net(double most)
 
 /* ---- fetch ---- */
 
+#define FETCH_STALL_S 30        /* nothing read for this long is a stall: run 125618 stood still until the run's end with the network joined, and nothing said how far it had got */
+#define FETCH_TRIES 3
+#define FETCH_STALLED 2
+
 static int
-fetch(const char *host, const char *port, const char *path, const char *expected, const char *file)
+fetch_once(const char *host, const char *port, const char *path, const char *expected, const char *file)
 {
 	struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *found = NULL;
 	CC_SHA256_CTX hash;
@@ -134,9 +139,15 @@ fetch(const char *host, const char *port, const char *path, const char *expected
 		return 1;
 	}
 	freeaddrinfo(found);
+	{
+		struct timeval stall = { .tv_sec = FETCH_STALL_S };
+
+		setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &stall, sizeof(stall));
+	}
 	snprintf(request, sizeof(request), "GET %s HTTP/1.0\r\nHost: %s\r\n\r\n", path, host);
 	if (write(sock, request, strlen(request)) < 0) {
 		say("fetch: cannot send");
+		close(sock);
 		return 1;
 	}
 	while (body == NULL && have < sizeof(buffer) - 1) {
@@ -144,7 +155,8 @@ fetch(const char *host, const char *port, const char *path, const char *expected
 
 		if (n <= 0) {
 			say("fetch: the connection ended in the headers");
-			return 1;
+			close(sock);
+			return n < 0 && errno == EAGAIN ? FETCH_STALLED : 1;
 		}
 		have += (size_t)n;
 		buffer[have] = 0;
@@ -182,18 +194,32 @@ fetch(const char *host, const char *port, const char *path, const char *expected
 	}
 	for (;;) {
 		ssize_t n = read(sock, buffer, sizeof(buffer));
+		time_t before;
 
 		if (n < 0) {
-			say("fetch: read failed after %llu bytes", got);
-			return 1;
+			int why = errno;
+
+			say(why == EAGAIN ? "fetch: nothing for %d s after %llu bytes" : "fetch: read failed (%d) after %llu bytes", why == EAGAIN ? FETCH_STALL_S : why, got);
+			close(sock);
+			close(out);
+			return FETCH_STALLED;
 		}
 		if (n == 0) {
 			break;
 		}
 		CC_SHA256_Update(&hash, buffer, (CC_LONG)n);
+		before = time(NULL);
 		if (write(out, buffer, (size_t)n) != n) {
 			say("fetch: cannot write after %llu bytes (is /var big enough?)", got);
+			close(sock);
+			close(out);
 			return 1;
+		}
+		if (time(NULL) - before >= 5) {
+			say("fetch: one write took %ld s, after %llu bytes", (long)(time(NULL) - before), got);
+		}
+		if ((got + (unsigned long long)n) >> 25 != got >> 25) {
+			say("fetch: %llu MB in %.0f s", (got + (unsigned long long)n) >> 20, -began.timeIntervalSinceNow);
 		}
 		got += (unsigned long long)n;
 	}
@@ -211,6 +237,20 @@ fetch(const char *host, const char *port, const char *path, const char *expected
 	}
 	say("fetch: the hash is right");
 	return 0;
+}
+
+static int
+fetch(const char *host, const char *port, const char *path, const char *expected, const char *file)
+{
+	int result = FETCH_STALLED;
+
+	for (int try = 1; try <= FETCH_TRIES && result == FETCH_STALLED; try++) {
+		if (try > 1) {
+			say("fetch: from the start again, try %d of %d", try, FETCH_TRIES);
+		}
+		result = fetch_once(host, port, path, expected, file);
+	}
+	return result == 0 ? 0 : 1;
 }
 
 /* ---- unpack: ustar, files, directories and links; nothing outside DIR ---- */

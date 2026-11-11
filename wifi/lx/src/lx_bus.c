@@ -971,14 +971,19 @@ lx_stop(void)
 	if (ab == NULL) {
 		return;
 	}
-	driver = NULL;
+	if (radio_bus == LX_BUS_PCI && !mhi_ownership_clean()) {
+		lx_tell("lx: stop: failed MHI lifetime retained for recovery\n");
+		return;
+	}
 	lx_station_withdraw();
 	lx_station_leave();
 	if (radio_bus == LX_BUS_PCI) {
 		lx_pci_remove();		/* (ath11k_pci_remove(): the core down, the firmware off, MHI and the interrupts let go of) */
+		if (lx_pci_driver() != NULL) return;
 	} else {
 		ath11k_core_deinit(ab);
 	}
+	driver = NULL;
 	lx_tell("lx: the driver is down again\n");
 }
 
@@ -991,9 +996,10 @@ lx_diagnostic(unsigned command)
  if (command == 0) return 0x51434133;
  if (command == 2) return 0x51434134;
  if (command != 1 || radio_bus != LX_BUS_PCI) return EINVAL;
+ if (!mhi_ownership_clean()) return EIO;
  if (driver != NULL) lx_stop();
  else lx_pci_remove();
- return lx_pci_driver() == NULL ? 0 : EBUSY;
+ return lx_pci_driver() == NULL && mhi_ownership_clean() ? 0 : EBUSY;
 }
 
 int
@@ -1045,8 +1051,11 @@ lx_resume(void)
 	}
 	lx_pci_resumed();
 	if ((ret = ath11k_core_resume_early(ab)) < 0 || (ret = ath11k_core_resume(ab)) < 0) {
-		lx_tell("lx: resume: the driver does not come back (%d): it is taken down\n", ret);
-		lx_stop();
+		/* A timeout can arrive after MHI mission, so the adapter must latch it
+		 * even when the host itself has not seen RDDM. Keep every owner intact
+		 * for a later serialized power-cycle/restart; removal is not recovery. */
+		mhi_ownership_hold();
+		lx_tell("lx: resume: the driver does not come back (%d): ownership retained for recovery\n", ret);
 		return (-ret);
 	}
 	lx_tell("lx: resume: the firmware runs again, the driver is set up on it: %llu ms\n", (lx_os_nanoseconds() - began) /

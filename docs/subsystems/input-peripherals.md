@@ -213,9 +213,12 @@ an IMX471 tuning, recording.
 
 ### Sensors, ambient light, location
 
-Not present. The accelerometer, gyroscope, compass, light, proximity and barometer hang off the audio DSP behind its
-sensor framework ("SEE"), reached through QMI service 400 over QRTR; the steps and their state are in
-[../TODO.md](../TODO.md). GPS belongs to the modem, which is not started.
+On the OnePlus 8, the sensor processor (SLPI) runs SEE and exposes QMI service 400 through QRTR. RAM run 030448
+(ticket 218) supplied the OEM light/proximity board records. Both `wise_light` and `proximity` then advertised a
+sensor identifier. No standard `ambient_light` or accelerometer appeared in that run. The captured OnePlus board
+description selects the BMI260 and its orientation. Actual motion samples, near/far transitions, front lux, automatic
+panel brightness and iOS rotation each require separate device evidence. GPS runs through the external SDX55 modem.
+Ticket 207 received 150 position reports with zero fixes. Subsequently 225 captured two native proximity states and their transition, and 226 brought up genuine BMI26x accel and gyro streams and matched six timestamped vectors each. Ticket 232 captured a changing OEM light signal and matched its native userspace readback. These are independent of final Core Motion and automatic screen brightness behavior. See [the current handoff](../HANDOFF.md).
 
 ## Files
 

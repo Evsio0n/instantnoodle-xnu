@@ -4,13 +4,19 @@
 #define SLPI_SMEM_BYTES 0x200000u
 #define SLPI_SMEM_TOC (SLPI_SMEM_BYTES-0x1000u)
 struct slpi_item { uint32_t id,offset,bytes; uint16_t host0,host1; };
-struct slpi_report { uint32_t remote_partition,remote_bytes,found;struct slpi_item items[6]; };
+struct slpi_report { uint32_t remote_partition,remote_bytes,found;struct slpi_item items[6];
+ uint32_t global_partitions,global130_count;struct slpi_item global130; };
 typedef int (*slpi_read_fn)(void *,uint32_t,void *,uint32_t);
 static uint16_t slpi_u16(const uint8_t *p){return (uint16_t)p[0]|(uint16_t)p[1]<<8;}
 static uint32_t slpi_u32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
 static int slpi_read(slpi_read_fn rd,void *ctx,uint32_t off,void *p,uint32_t n){return off<=SLPI_SMEM_BYTES && n<=SLPI_SMEM_BYTES-off && rd(ctx,off,p,n);}
 static int slpi_magic(const uint8_t *p,const char *m){return p[0]==m[0]&&p[1]==m[1]&&p[2]==m[2]&&p[3]==m[3];}
 static void slpi_keep(struct slpi_report *r,uint16_t a,uint16_t b,uint32_t id,uint32_t off,uint32_t n){
+ /* SMEM 130 is AP board data in the generic partition. It belongs outside
+  * found, which the owned boot preflight uses for remote transport items. */
+ if(id==130 && a==0xfffe && b==0xfffe){
+  r->global130_count++; r->global130=(struct slpi_item){id,off,n,a,b};return;
+ }
  static const uint16_t wanted[]={430,481,424,478,479,480};
  for(unsigned k=0;k<6;k++)if(id==wanted[k]){
   /* Prefer remote0/3 partition. Global fallback only fills missing items. */
@@ -23,7 +29,7 @@ static const char *slpi_partition_scan(slpi_read_fn rd,void *ctx,const uint8_t *
  if(!off || size<32 || off>SLPI_SMEM_TOC || size>SLPI_SMEM_TOC-off || !slpi_read(rd,ctx,off,h,32))return "partition range/read";
  uint32_t lo=slpi_u32(h+12),hi=slpi_u32(h+16);
  if(!slpi_magic(h,"$PRT")||slpi_u32(h+8)!=size||slpi_u16(h+4)!=a||slpi_u16(h+6)!=b||lo<32||lo>hi||hi>size)return "partition geometry";
- if(a!=0xfffe){r->remote_partition=off;r->remote_bytes=size;}
+ if(a!=0xfffe){r->remote_partition=off;r->remote_bytes=size;}else r->global_partitions++;
  for(at=32;at<lo;){
   if(++steps>512 || lo-at<16 || !slpi_read(rd,ctx,off+at,e,16))return "uncached entry bounds";
   uint32_t n=slpi_u32(e+4),pd=slpi_u16(e+8),ph=slpi_u16(e+10);

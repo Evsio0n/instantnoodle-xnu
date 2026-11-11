@@ -30,6 +30,7 @@ it is not retried (look at the log first). Exit status 0 when every check passed
 """
 import concurrent.futures as cf
 import hashlib
+import importlib.util
 import os
 import re
 import shutil
@@ -158,7 +159,16 @@ def host_checks():
     out.append(('report.py self-test', r.returncode == 0, r.stdout.strip() or r.stderr.strip()[-200:]))
     r = sh('python3 -I tools/sched-test/amp.py --self-test && bash -n tools/sched-test/qemu.sh')
     out.append(('sched-test amp.py self-test', r.returncode == 0, r.stdout.strip() or r.stderr.strip()[-200:]))
-    r = sh("nix-shell -p python3Packages.numpy python3Packages.pillow --run 'python3 tools/look/check.py --self-test'")
+    if shutil.which('nix-shell'):
+        r = sh("nix-shell -p python3Packages.numpy python3Packages.pillow --run 'python3 tools/look/check.py --self-test'")
+    elif (sys.platform == 'darwin' and shutil.which('docker')
+          and any(importlib.util.find_spec(name) is None for name in ('numpy', 'PIL'))):
+        # The Mac build host keeps its image dependencies in the Linux builder.
+        # Feed the file under test so this also checks the caller's worktree.
+        with open('tools/look/check.py') as script:
+            r = sh(['docker', 'exec', '-i', 'oneplus8-build', 'python3', '-', '--self-test'], stdin=script)
+    else:
+        r = sh([sys.executable, 'tools/look/check.py', '--self-test'])
     out.append(('look/check.py self-test', r.returncode == 0, r.stdout.strip() or r.stderr.strip()[-200:]))
     return out
 

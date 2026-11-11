@@ -4,6 +4,7 @@
 #   after a launch has been seen refused for want of them). The job list holds this Mac's address, so it is made here.
 #   HK_TAP="X Y": a finger on the icon there (fractions of the screen), as FrontBoard refuses a program's request where it took a finger's (run 124145). The finger goes first and the program's request after
 #   the last picture, for its answer in the log: a refusal puts up an alert, which takes the next touch (run 124448). HK_WAIT=SECONDS: how long to watch it.
+#   HK_SETTLE=SECONDS: that long after the home screen before the fetch, past wifid's link change and the camera's start (run 130759 stalled 0.25 s after them).
 # tools/ipa/try.sh run TAG TAR 'ARGS': the boot, with the server bound to this Mac's address on its default interface, serving that one file, and gone when this ends. Through the queue, as one quoted string:
 #   tools/bootq run --who next-features --what "..." --no-touch --max 460 -- "bash tools/ipa/try.sh run TAG TAR 'ARGS'". NF_KERNEL may name the row's kernel.
 set -e
@@ -23,7 +24,7 @@ prepare)
 	[ -z "${HK_TAP:-}" ] || { FIRST="/hackios/bin/rwtouch wait 3 tap $HK_TAP"; LAST="/hackios/bin/hkinstall alarm 30 open $BUNDLE"; }
 	cat > "$J" <<JOBS
 # $TAG: an .ipa installed and opened, not logged in; /var in RAM, so nothing is kept
-/hackios/bin/rwtouch uptime 40 idle 40 25 mark $TAG-home
+/hackios/bin/rwtouch uptime 40 idle 40 25 ${HK_SETTLE:+wait $HK_SETTLE }mark $TAG-home
 /hackios/bin/hkinstall alarm 400 ${HK_CLAIM:+claim }wait-net 120 fetch $IP $PORT /$(basename "$TAR") $SHA /var/tmp/hkinstall.tar unpack /var/tmp/hkinstall.tar /var/containers/hk-unpack install /var/containers/hk-unpack state $BUNDLE
 /hackios/bin/rwtouch wait 5 mark $TAG-icon
 $FIRST

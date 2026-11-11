@@ -1,0 +1,3 @@
+"settings.open.title" = "打开此 App 的系统设置";
+"settings.open.failed" = "iOS 未能打开此 App 的设置。";
+"settings.location.denied" = "iOS 未授权此 App 使用定位。可在此 App 的系统设置中查看权限。";

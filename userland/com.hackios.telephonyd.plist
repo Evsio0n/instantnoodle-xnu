@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hackios.telephonyd</string>
+	<!-- the stand-in for CommCenter (src/hk_commcenter.m): CoreTelephony's two Mach services, answered from the
+	     kernel's kern.hackios.cellular_* (boot-arg cell=1). Started when somebody first asks. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/hackios/bin/hk_commcenter</string>
+	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>com.apple.commcenter.coretelephony.xpc</key>
+		<true/>
+		<key>com.apple.commcenter.xpc</key>
+		<true/>
+	</dict>
+	<key>UserName</key>
+	<string>root</string>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

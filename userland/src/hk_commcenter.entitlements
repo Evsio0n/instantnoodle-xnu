@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- hk_commcenter as the telephony CallKit provider (src/hk_commcenter.m, "Calls"): what callservicesd asks of the provider's connection -->
+	<key>application-identifier</key>
+	<string>com.apple.coretelephony</string>
+	<key>com.apple.callkit</key>
+	<array>
+		<string>private-provider-api</string>
+		<string>private-controller-api</string>
+	</array>
+</dict>
+</plist>

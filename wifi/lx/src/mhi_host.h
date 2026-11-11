@@ -18,8 +18,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef MHI_HOST_CHANNELS
 #define MHI_HOST_CHANNELS	4
+#endif
+#ifndef MHI_HOST_EVENT_RINGS
 #define MHI_HOST_EVENT_RINGS	4
+#endif
 
 /* execution environments (BHI_EXECENV, EE events) and states (MHISTATUS, state change events) */
 enum { MHI_HOST_EE_PBL, MHI_HOST_EE_SBL, MHI_HOST_EE_AMSS, MHI_HOST_EE_RDDM, MHI_HOST_EE_WFW, MHI_HOST_EE_PTHRU,
@@ -46,6 +50,8 @@ struct mhi_host_ops {
 	/* without the lock: */
 	void	(*status)(void *context, enum mhi_host_status what);
 	void	(*receive)(void *context, unsigned channel, const void *data, size_t length);
+	/* Same DMA address/alignment contract, with an explicitly uncached CPU mapping. */
+	void	*(*dma_alloc_uncached)(void *context, size_t size, size_t align, uint64_t *address);
 };
 
 struct mhi_host_channel_config {
@@ -54,6 +60,9 @@ struct mhi_host_channel_config {
 	uint32_t event_ring;		/* which of the event rings its completions go to */
 	bool inbound;			/* from the device (buffers are posted for it) */
 	uint32_t ee_mask;		/* the execution environments it runs in (bit per EE): started when the device enters one */
+	bool command_only;		/* reserve TREs for channel commands; never post a payload or RX credit */
+	bool client_rx;			/* client owns a single premapped receive credit */
+	bool client_tx;			/* payload storage belongs to the bounded uplink pool */
 };
 
 struct mhi_host_event_config {
@@ -61,6 +70,7 @@ struct mhi_host_event_config {
 	uint32_t vector;		/* the MSI vector the device raises for it */
 	uint32_t moderation_ms;
 	bool control;			/* state changes and command completions come here */
+	bool burst, client_managed, uncached;
 };
 
 struct mhi_host_config {
@@ -68,6 +78,10 @@ struct mhi_host_config {
 	uint32_t timeout_ms;
 	uint32_t buffer_length;		/* of an inbound channel's buffers */
 	unsigned channel_count, event_count;
+	/* event_count is the on-wire context span, including unowned slots with elements=0.
+	 * The device assigns the trailing hardware_event_count slots to hardware. */
+	unsigned hardware_event_count;
+	size_t register_window_size;	/* mapped BAR bytes, required before publishing hardware ER contexts */
 	struct mhi_host_channel_config channels[MHI_HOST_CHANNELS];
 	struct mhi_host_event_config events[MHI_HOST_EVENT_RINGS];
 	const uint8_t *image;		/* the device's firmware, its secondary boot loader in front */
@@ -84,6 +98,33 @@ struct mhi_host_ring {
 	uint32_t rp, wp;		/* as the host has them: element indices */
 };
 
+/* Selected by the controller before power-up. Burst channels poll the shared WP after
+ * their first doorbell. Some also request a fresh doorbell on each return to M0. */
+enum mhi_host_transfer_db { MHI_HOST_DB_ALWAYS, MHI_HOST_DB_BURST, MHI_HOST_DB_BURST_SWITCH };
+
+#define MHI_TX_BUFFERS 4u
+#define MHI_TX_CAPACITY 32768u
+struct mhi_tx_pool {
+	uint8_t *base;
+	uint64_t iova, epoch;
+	const void *producer;
+	unsigned mtu, pending;
+	uint64_t submitted, completed, cancelled, doorbells;
+	struct { unsigned slot, length; bool live; } entry[MHI_TX_BUFFERS];
+	bool bound_once, closing, retired, quarantined;
+};
+
+enum mhi_rx_owner { MHI_RX_NEW, MHI_RX_IDLE, MHI_RX_POSTED, MHI_RX_COMPLETE,
+    MHI_RX_RETIRED, MHI_RX_QUARANTINED };
+struct mhi_rx_credit {
+	uint8_t *buffer;
+	uint64_t iova, epoch;
+	uint32_t capacity, slot, received, issued;
+	unsigned completion_code, start_acks, reset_acks, completions, last_length;
+	enum mhi_rx_owner owner;
+	bool closing, pending, drained;
+};
+
 struct mhi_host_channel {
 	const struct mhi_host_channel_config *config;
 	struct mhi_host_ring ring;
@@ -91,8 +132,14 @@ struct mhi_host_channel {
 	uint64_t buffers_address;
 	uint32_t buffer_length;
 	uint32_t command_status;	/* the last command's completion code; 0: none yet */
+	uint32_t command_slot;
 	bool running;
+	bool command_in_flight;
 	bool busy;			/* its completions are being handed on */
+	bool db_armed;
+	enum mhi_host_transfer_db transfer_db;
+	struct mhi_rx_credit rx;
+	struct mhi_tx_pool tx;
 };
 
 struct mhi_host {
@@ -101,6 +148,8 @@ struct mhi_host {
 	struct mhi_host_config config;
 
 	bool allocated, powered, mission, failed;
+	/* Failed start/reset, RDDM or link loss: retain DMA ownership through recovery. */
+	bool ownership_dirty;
 	bool mission_told;		/* the device's own event says its mission has begun (the register says it earlier) */
 	unsigned rung_again;		/* doorbells rung again for a command not completed */
 	volatile uint32_t ee, state;	/* as the device last said */
@@ -113,6 +162,7 @@ struct mhi_host {
 	struct mhi_host_ring events[MHI_HOST_EVENT_RINGS];
 	bool event_busy[MHI_HOST_EVENT_RINGS];
 	bool event_again[MHI_HOST_EVENT_RINGS];
+	bool event_active[MHI_HOST_EVENT_RINGS], event_db_sent[MHI_HOST_EVENT_RINGS];
 	struct mhi_host_ring commands;
 	struct mhi_host_channel channels[MHI_HOST_CHANNELS];
 
@@ -128,10 +178,17 @@ struct mhi_host {
 int	mhi_host_init(struct mhi_host *host, const struct mhi_host_ops *ops, void *context, const struct mhi_host_config *config);
 /* The device booted into its mission (the channels for it started): 0, or an errno. */
 int	mhi_host_power_up(struct mhi_host *host);
-/* The device reset (MHICTRL.RESET), the channels stopped. */
-void	mhi_host_power_down(struct mhi_host *host);
+/* The device reset (MHICTRL.RESET), the channels stopped: 0, or an errno.
+ * EIO means reset did not complete and ownership must stay dirty until recovery. */
+int	mhi_host_power_down(struct mhi_host *host);
+/* Whether the ordinary lifecycle may release memory; true while healthy/running
+ * does NOT mean that DMA is stopped. A failure stays latched through power-down. */
+bool	mhi_host_ownership_clean(const struct mhi_host *host);
 /* An interrupt: vector v of the host's (its BHI vector is 0); or nothing came, and everything is looked at (-1). */
 void	mhi_host_interrupt(struct mhi_host *host, int vector);
+/* Consume at most budget event elements on one client-managed ring. *done
+ * counts consumed elements, including a terminal error. IRQ/poll-all skip it. */
+int	mhi_host_poll_event(struct mhi_host *host, unsigned ring, unsigned budget, unsigned *done);
 /* A datagram on an outbound channel; waits for room up to the timeout. 0, or an errno. */
 int	mhi_host_send(struct mhi_host *host, unsigned channel, const void *data, size_t length);
 /* The device kept out of its low-power states while a vote stands; get waits for it to be in M0 (0, or ETIMEDOUT). */
@@ -194,6 +251,7 @@ int	mhi_host_force_rddm(struct mhi_host *host);
 #define MHI_CODE_EOT		0x2
 #define MHI_CODE_OVERFLOW	0x3
 #define MHI_CODE_EOB		0x4
+#define MHI_CODE_OOB		0x5
 #define MHI_CODE_DB_MODE	0x6
 #define MHI_TRE_IEOB		(1u << 8)
 #define MHI_TRE_IEOT		(1u << 9)

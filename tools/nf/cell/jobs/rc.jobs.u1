@@ -1,0 +1,8 @@
+# Commands run by the launchd job com.hackios.demo: the daily system with the modem (cell=1) and the stand-in for CommCenter.
+# What MobileGestalt says of the device now that the device tree has a baseband entry, the modem's session as iOS's network, the lock
+# screen swiped away and Settings opened (its first page shows a Cellular row or does not). Screenshots are taken from the computer.
+/hackios/bin/mg_test HasBaseband cellular-data telephony DeviceSupportsCellularData
+/hackios/bin/net_test wait 50 dhcp en1 waitaddr en1 40
+/hackios/bin/rwtouch wait 2 swipe 0.5 0.985 0.5 0.3 250 wait 4
+/hackios/bin/battery_test launch com.apple.Preferences
+/hackios/bin/net_test wait 15 fetch https://www.apple.com/library/test/success.html

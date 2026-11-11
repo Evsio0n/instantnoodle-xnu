@@ -9,12 +9,14 @@
  * One request a connection, one connection at a time: a test page's few files do not need more.
  */
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -39,7 +41,57 @@ type_of(const char *name)
 	if (strcmp(dot, ".js") == 0) {
 		return "text/javascript";
 	}
+	if (strcmp(dot, ".json") == 0) {
+		return "text/plain; charset=utf-8";
+	}
 	return "application/octet-stream";
+}
+
+static void
+write_all(int client, const char *data, size_t length)
+{
+	while (length != 0) {
+		ssize_t put = write(client, data, length);
+
+		if (put <= 0) {
+			return;
+		}
+		data += put;
+		length -= (size_t)put;
+	}
+}
+
+/*
+ * The browser cannot call sysctl directly.  Keep this endpoint deliberately
+ * boring: it returns the kernel's already privacy-safe, coordinate-free
+ * counter string and nothing else.  A page reload never needs a file write.
+ */
+static int
+answer_gnss(int client)
+{
+	char status[512];
+	char head[256];
+	size_t size = sizeof(status) - 1;
+	int length;
+
+	printf("hkhttpd: gnss.json\n");
+
+	if (sysctlbyname("kern.hackios.modem_gnss", status, &size, NULL, 0) != 0) {
+		length = snprintf(status, sizeof(status), "error=sysctl errno=%d", errno);
+		size = length > 0 && (size_t)length < sizeof(status) ? (size_t)length : 0;
+	} else {
+		/* sysctl string handlers commonly count their terminating NUL. */
+		if (size != 0 && status[size - 1] == 0) {
+			size--;
+		}
+		status[size] = 0;
+	}
+	length = snprintf(head, sizeof(head),
+	    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %zu\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+	    size);
+	write_all(client, head, (size_t)length);
+	write_all(client, status, size);
+	return 1;
 }
 
 static void
@@ -70,6 +122,10 @@ answer(int client, const char *dir)
 		if (*name == 0) {
 			name = "index.html";
 		}
+		if (strcmp(name, "gnss.json") == 0) {
+			(void)answer_gnss(client);
+			return;
+		}
 		/* flat: nothing above or beside the directory can be named */
 		if (strchr(name, '/') == NULL && strchr(name, '%') == NULL && name[0] != '.') {
 			snprintf(path, sizeof(path), "%s/%s", dir, name);
@@ -89,20 +145,9 @@ answer(int client, const char *dir)
 	length = snprintf(head, sizeof(head),
 	    "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lld\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
 	    type_of(name), (long long)st.st_size);
-	(void)write(client, head, (size_t)length);
+	write_all(client, head, (size_t)length);
 	for (ssize_t got; (got = read(file, buffer, sizeof(buffer))) > 0;) {
-		const char *at = buffer;
-
-		while (got > 0) {
-			ssize_t put = write(client, at, (size_t)got);
-
-			if (put <= 0) {
-				close(file);
-				return;
-			}
-			at += put;
-			got -= put;
-		}
+		write_all(client, buffer, (size_t)got);
 	}
 	close(file);
 }

@@ -24,5 +24,8 @@ int	lx_pci_probe(void);		/* lx_pci.c: the device behind the host bridge given to
 void	lx_pci_remove(void);		/* lx_pci.c: ... and taken from it */
 void	*lx_pci_driver(void);		/* lx_pci.c: what the driver made of it (its struct ath11k_base); NULL: none */
 void	lx_pci_resumed(void);		/* lx_pci.c: the device has its power back: what the driver wrote to it, again */
+struct mhi_controller;
+bool	mhi_ownership_clean(void);	/* lx_mhi.c: failure latched until power-up recovery succeeds */
+void	mhi_ownership_hold(void);		/* lx_mhi.c: failed resume retains the controller and DMA ownership */
 
 #endif

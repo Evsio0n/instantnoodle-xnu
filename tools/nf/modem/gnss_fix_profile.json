@@ -1,0 +1,13 @@
+{
+  "kernel_sha256": "d1a69e8b69f89738b81150b481740179da7ddc859de88bbb8001971f81d89f25",
+  "root_sha256": "f16ccf3d747d62b42142f5fc67057bc6a1025d1f7e1ee4e0aa64ff100e1240aa",
+  "resident_sha256": "3fb7b93a834345031f02e36b9501c3beec10a5eab6c14eaea3b601adb20a6a4b",
+  "bundle_id": "com.hackios.gnss-monitor",
+  "bundle_cdhash": "a053955a82d940b567d2dca87cddfeea39776a28",
+  "executable_sha256": "4f97e76e451c681e77f7d222cb3594caa29656dde26423e190502f7ae54ee746",
+  "plist_sha256": "4cc1b71f250d16a01a629505702614af32b74fca948d9dde039d8a3400f99211",
+  "init_sha256": "bdd982bfc1f81d4ec9491b0afc680995f72af170c6488546574f7cd911de56a0",
+  "jobs_sha256": "bb12ff584ee8924eb5a26aabde75e766f4ec4ac46daa9d5bd6029c5a8322a6d8",
+  "stock_locationd_sha256": "8ddbfa6670b75d8b19af7f7069ee404a1a4c6cb358d93d85ef88b7b89823aa35",
+  "check": "check-image.py: apfsck -cw: clean\ncheck-image.py: volume 0: 583 entries read back by apfs-tool, every one as in /tmp/pool-ab.wMH8iwXX/tree\nroot inode independently verified: 040755 uid0 gid0"
+}

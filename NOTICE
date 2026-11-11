@@ -8,6 +8,10 @@ This repository builds on:
 - haxi0/iphont-xnu-kernel and haxi0/iphont-xnu-userland, the OnePlus 8 (instantnoodle) port this work started from.
 - Project Silicium / Mu-Silicium (https://github.com/Project-Silicium/Mu-Silicium), the UEFI the phone boots
   through (uefi/).
+- dekefake/hackios-op8pro (https://github.com/dekefake/hackios-op8pro), the HackiOS port to the OnePlus 8 Pro. The
+  cellular path here (tools/nf/cell: the modem driver, its MHI host and network interface, and the call additions to
+  the audio drivers) is ported from its commit e5631cd, under the same Apple Public Source License 2.0. The ported
+  files carry its text and name it at their head; tools/nf/cell/fetch-ref.sh fetches the unmodified originals.
 
 Apple, iOS and XNU are trademarks of Apple Inc. The XNU sources and the patches to them are under the Apple Public
 Source License 2.0 (LICENSE). This project is not affiliated with, authorised or endorsed by Apple Inc., OnePlus or

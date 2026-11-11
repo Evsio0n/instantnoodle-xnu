@@ -1,0 +1,8 @@
+/hackios/lib/libhackios.dylib backboardd containermanagerd containermanagerd_system
+/hackios/lib/libhackios-sb.dylib SpringBoard
+/hackios/lib/libhackios-media.dylib mediaserverd
+/hackios/lib/libhackios-app.dylib Sileo
+/hackios/lib/libhackios-camera.dylib Camera
+/hackios/lib/libhackios-tweaks.dylib Preferences
+/hackios/lib/libhackios-bt.dylib bluetoothd
+/hackios/lib/libhackios-call.dylib callservicesd

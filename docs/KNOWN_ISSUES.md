@@ -1,7 +1,7 @@
 # Known issues — what does not work on this device (right now)
 
 Answers **"what currently doesn't work?"** Entries are things a user or developer will notice; work to fix them is in [TODO.md](TODO.md) (`T..`), not repeated here.
-Primary device: **OnePlus 8 (instantnoodle)**; redwood and QEMU are marked where different. Audited 2026-10-26 against the source and the project's records.
+Primary device: **OnePlus 8 (instantnoodle)**; redwood and QEMU are marked where different. Audited 2026-11-07 against the source and the project's records; the cellular, call audio, installed build and Metal entries (K04, K06, K11, K15, K21, K35, K41, K42) revised 2026-11-11.
 
 **Kind:** *Unsupported* (no implementation) · *Bug* (implemented, wrong; cause known or not) · *Partial* · *Unreliable* · *Unverified* (implemented, never seen working).
 **Severity:** **S1** blocks basic use or safety · **S2** a major iOS feature missing/broken · **S3** noticeable defect · **S4** minor/cosmetic.
@@ -14,24 +14,24 @@ Nothing is marked "works" merely because a driver exists: evidence is stated. Fo
 | K01 | Graphics | Metal is experimental; most Metal features and apps untested | Partial | S2 | off by default | not applicable |
 | K02 | Security | No fingerprint / biometric unlock | Unsupported | S2 | yes | yes |
 | K03 | Camera | OnePlus 8: Camera.app on the front sensor only (`cam=5`, RAM runs), no tuning, warm; redwood: no video | Partial | S2 | partly | works (no video) |
-| K04 | Audio | No headphones/USB-C audio, earpiece, call audio; one mic only | Unsupported / Partial | S2 | yes | partly |
+| K04 | Audio | No headphones/USB-C audio; a call's sound only in the cellular system, its level not adjustable; one mic only | Unsupported / Partial | S2 | yes | partly |
 | K05 | Connectivity | Partial Bluetooth; Wi-Fi gaps and unverified sleep | Partial / Unverified | S2 | yes | yes |
-| K06 | Telephony | No cellular, calls, SMS, voicemail | Unsupported | S1 | yes | yes |
-| K07 | Sensors | No accelerometer/gyro/compass/light/proximity/barometer | Unsupported | S2 | yes | yes |
+| K06 | Telephony | OnePlus 8: data, SMS and VoLTE calls work (K41); no hold, DTMF, MMS, hotspot, voicemail. Redwood: nothing | Partial | S2 | partly | yes |
+| K07 | Sensors | No sensor service/data; AP candidate probe unclassified | Partial | S2 | yes | yes |
 | K08 | Battery | Charger/shutdown paths unverified; no drain figure; no fast charging | Unverified / Unsupported | S1 | yes | partly |
-| K09 | Display | Brightness optical effect unverified; rendering gaps; ~2% late swaps | Unverified / Bug | S3 | yes | |
+| K09 | Display | Brightness optical effect unverified; no ambient sensor service; rendering gaps | Unverified / Bug | S3 | yes | |
 | K10 | Power | Sleep is shallow; drain asleep unknown; heavy wake CPU | Partial | S2 | yes | no sleep |
 | K11 | Services | App Store LOADING; no Apple ID, iCloud, push, FairPlay | Unsupported | S2 | yes | yes |
-| K12 | Location | RAM test roots: Wi-Fi location works by eye; default images and GNSS: none | Partial | S2 | yes | yes |
+| K12 | Location | Wi-Fi location works by eye; generic GNSS transport reports but no outdoor fix or locationd bridge | Partial | S2 | yes | yes |
 | K13 | Security | Security stand-ins accept everything; keychain protects nothing | By design | S3 | yes | yes |
 | K14 | Persistence | RAM-only runs lose all data; Wi-Fi password not kept | By design | S3 | RAM runs | RAM runs |
-| K15 | UI | Poster switcher black; shadows under switcher cards; CC glyph strokes | Bug | S3 | yes | |
+| K15 | UI | Poster switcher turned off by our hook (black before Metal, not tried since); shadows under switcher cards; CC glyph strokes | Bug | S3 | yes | |
 | K16 | Boot | Stock ABL breaks with USB cable in; short menu countdown; no recovery image in a fresh clone | Limitation | S2 | yes | |
 | K17 | Media | No video/Live Photo recording; portrait mode skipped | Unsupported | S3 | yes | yes |
 | K18 | Thermal | Throttling never observed | Unverified | S3 | yes | yes |
 | K19 | Testing | Scripted gestures do not reach system gestures; switcher not openable by script | Limitation | S4 | yes | |
 | K20 | Redwood | Not re-verified | Unverified | S3 | | yes |
-| K21 | Installed build | Installed bundle lags the source | Limitation | S3 | yes | |
+| K21 | Installed build | "Cellular 2026-11-11" is installed; its telephony daemon is one revision behind the source | Limitation | S4 | yes | |
 | K22 | Agent toolkit | New USB mailbox/control path awaits owner-approved RAM loading | Unverified | S3 | yes | |
 | K23 | Scheduling | Edge: rare 10-11 ms render frame under heavy DF load; BG starved when UT saturates E; energy model unvalidated | Partial | S4 | yes | untested |
 | K24 | Testing | `sleep` check can fail a correct sleep (continuous clock 0.4 s short once) | Bug (test) | S4 | yes | |
@@ -41,12 +41,14 @@ Nothing is marked "works" merely because a driver exists: evidence is stated. Fo
 | K30 | Metal (Gallium) | Metal lines and points draw nothing on the Gallium back end (vk draws them) | Bug | S3 | test runs | |
 | K31 | Metal (Gallium) | Packed 16-bit formats mirrored against real Metal; the source of the exchange the wallpaper showed is open | Bug or unexplained | S3 | system with metal= | |
 | K32 | Metal (Vulkan) | An argument buffer is read at the command buffer's commit, not when the GPU runs it | Limitation | S3 | metal_drv_test --m5c | |
-| K35 | Metal (Vulkan) | Compositor on Metal feels slower than on hk-gl; Maps' pinch stutters | Open | S2 | metal=2 | |
+| K35 | Metal (Vulkan) | Compositor on Metal stutters: about 1 frame in 10 late in daily use; Maps' pinch stutters | Open | S2 | metal=2 | |
 | K36 | Metal (Vulkan) | A surface of rows this GPU cannot draw reaches other readers a second late | Limitation | S4 | metal=2 | |
 | K37 | Metal (Vulkan) | CoreImage on Metal made empty images: no function stitching | Fixed (test roots) | S2 | metal=2 | |
 | K38 | Camera | Back camera's preview at 15 frames a second in the dark, from the sensor; the light not measured. mediaserverd's 1 GB a second: fixed in test roots | Open | S2 | cam=5 | |
 | K39 | Maps | Maps opens only with the fairplayd.H2 job dropped from a test root; the installed system unchanged | Open | S2 | test roots | |
 | K40 | Metal (Vulkan) | The compositor's memory grows to 2.5 GB in 12 minutes and never comes back; the screen can restart | Open | S1 | metal=2 | |
+| K41 | Cellular | What is left of calls and SMS: level, hold, DTMF, MMS, hotspot; the screen stays on at the ear | Partial | S2 | yes | |
+| K42 | Metal (Vulkan) | What Metal still refuses, drops or stands in for, as the system's own processes ask for it | Partial | S3 | metal=2 | |
 
 ---
 
@@ -98,6 +100,13 @@ Nothing is marked "works" merely because a driver exists: evidence is stated. Fo
 ## K35 The compositor on Metal feels slower than on hk-gl — OnePlus 8 · Display · **Open** · S2
 - **The owner:** 「opengl很快，沒metal這麼卡」, 「地圖伸縮卡頓」; of `fb_wait` 1, 3, 5 rows 「普通」, 「尚可」; the default 13 has not been looked at.
 - **Measured, heavy script (runs 005452, 010021):** GPU per frame about 15-25% above hk-gl's, frame gaps close. docs/research/mdp-driver-plan.md 9.
+- **Daily use of the installed system (2026-11-11; the owner: 「卡頓、掉幀」, and that Metal 3 had it too). Read from the kernel's 5-second display statistics of that day's four boots, 50 busy windows, and from the source; nothing was changed and nothing new was run for it:**
+  - **The numbers** [measured, by log]: 54 frames a second at the median when busy, 87 at best; 85% of the gaps between frames on the 90 Hz beat; about 10% of the frames one refresh or more late; the longest pause in a 5 s window mostly about 50 ms, 87 ms at worst.
+  - **Not the GPU's speed, not the install** [measured / source]: the GPU is busy 3% at the median and 53% at most while the phone is used. The installed kernel's display and GPU drivers are Metal 3's source but for one option that is not on.
+  - **Pipelines built while drawing** [measured, a correlation]: windows in which a render pipeline was built have twice the late frames (median 19 against 9) and longer pauses (71 ms against 49). There is no pipeline cache on disk, the same pipeline is built more than once, and it is built on the thread that draws. A cache was written once and never verified or installed. iOS's own compositor looks for a precompiled pipeline library at its start and finds none for this GPU.
+  - **What an image costs on its way to the screen** [measured, by log, unless said]: no pixel format is converted on the CPU (BGRA, sRGB, 10-bit, ETC2 and ASTC are Vulkan's own formats, mipmaps are made by the GPU; PVRTC, BC and ASTC HDR are refused). An IOSurface is imported without a copy in 0.35-1.1 ms, but never cached: every use imports again. At every submission the kernel cleans the imported surfaces out of the CPU's cache, about 11 MB and 0.5 ms under the GPU's one lock (`HKGPU.cpp`): 71-95 ms in 5 s. YUV becomes RGB on the CPU (`hkBiplanarTexture`): 51 ms for the first image (a scalar loop), 3.3-4.5 ms a frame after it; the camera's preview and HEIC wallpaper layers use it. A whole-screen image is 11 MB and takes 8-9 ms to allocate, most of a frame; 27 to 71 of them in each boot that day. Not timed: HEIC is always decoded in software; app snapshots are kept as JPEG or PNG, decoded and uploaded again when used.
+  - **30-74 passes a frame is this layer's shortcut, not the GPU's limit** [source, not run on the phone]: a draw that reads the target it draws to ends the pass and starts another (`draw_stands_apart`). The Turnip driver this port uses declares `VK_KHR_dynamic_rendering_local_read`, `VK_EXT_rasterization_order_attachment_access` and `VK_EXT_attachment_feedback_loop_layout`, which let such a draw stay in its pass. An earlier attempt to merge them, without the barriers it needs, broke the blur and was taken back. For the compositor the saving was once estimated at about 1 ms a frame; for a game that shades in one pass (reading its own target in every light's draw) it is the difference between a few passes and hundreds.
+  - **Not established:** which of these is what the owner feels. The compositor's own time by stage in daily use has not been measured: hkmetal has the counters, and the probe file that turns them on (`metal_stats`) is not in the installed root. The plan, measurement first: T40.
 - **Maps' pinch (runs 015419, 020307, scripted, no network):** the part found is Metal's: Maps asks for two new memoryless whole-screen 4x targets every frame, which this port really allocates, 35-76 ms each. An image pool (256 MB) took that from 2.3 s to about 0.4 s in a 5 s window. Compositor frames over 18 ms in the pinch are now about 5%; the earlier 47-60% runs lost Maps to a fault of the sampler's, so there is no clean baseline. A comparison that stood here (76 frames against hk-gl's 182) was **wrong**: first-run sheets covered the map. No valid hk-gl comparison of the pinch exists.
 - **Maps' rate in motion (run 061838, kernel mdp-93fe105e, seeded, scripted, no network, blank grid; verified on phone by log):** Maps' map frames 28 and 25 a second, compositor 66 and 57, half the gaps under 12 ms, longest 56 and 80 ms, GPU busy about 50%, textures 0.3 s per 5 s. Why Maps stays near 28 is open. Submissions waited for a push 40 times, 275 ms in about 11 s: a lead.
 - **Real tiles (with the network), the owner: 「不跟手，有時候還會黑色」, 「旋轉不跟手」.** Two faults found, neither shown on a blank grid. (1) The vertex stage's textures were dropped in hkmetal: VectorKit's ground, icons and labels failed their draws and took their command buffers with them. Fixed since `metal-二次看`: 0 failed draws, 「地圖可以正確渲染」 (run 093635). Black is **not called gone** until the owner says. (2) 99.9% of Maps' pipeline requests are retries of two refused ones (`GlowAlpha`, `PatternedRibbon`: framebuffer fetch at 4 samples), about 15 a frame, up to 1.4 s in 5 s: 42442 of 42497 (run 102841). A memo of the refusal since `metal-三次看`: Maps at rest with no fingers from about 7.3 map frames a second to about 17 (run 104515); with fingers, best window 36 to 58. **A clean no-finger gesture number does not exist yet.** The two pipelines still don't draw; what they are is known by name only. Next in this: buffers, up to 1914 made per 5 s, about 1 s of the main thread, about 70% freed again soon.
@@ -203,6 +212,12 @@ No driver, `biometrickitd`/`pearld` denied, no Secure Enclave. Passcode is not s
 - **Boundary:** a blocked call may fail fast. No forged signatures, no emulated fairplayd, no hooks around FairPlay.
 
 ## K40 The compositor's memory grows and doesn't come back — OnePlus 8 · Metal (Vulkan) · **Open** · S1
+
+The SpringBoard subrange mapping case now has a matched treatment. 222 / 050211 reduced residual IOSurface map bytes from 167608320 to zero at rest after five Safari/Home cycles. In 231 / 053731 the matched 12-minute workload and all 30 foreground phases passed, with retained SpringBoard growth 984964544 -> 1376448 bytes. Preserve the distinction from the original free-use backboardd incident below.
+
+Hardware ticket #222 (050211) compared five Safari/Home transitions with #216 (025724). SpringBoard retained 0 versus 167,608,320 bytes of IOSurface backing maps after rest. VM tag 21 grew by 16,384 versus 167,624,704 bytes. Both had five foreground and Home handoffs with physical panel frames. The existing subrange lookup correction is in `xnu/hackios.patch`. Corrected RAM ticket #231 (053731) completed the matched 720.036-second rotation with 30 foreground/panel phases and no reported display give-ups or GPU faults. SpringBoard retained footprint growth was 1,376,448 versus 984,964,544 bytes in #210; the observed VM tag 21 peak was 32 versus 794 MiB. Verification of the exact daily pair and the historical manual backboardd workload remain separate.
+
+RAM ticket 210 on November 10 (023202) completed six rounds of Maps, Camera, News, Weather and Safari. All 30 launches were accepted. Over 720.035 s SpringBoard footprint grew from 86.1 to 1025.4 MiB. Its private GEM objects stayed at 51.4 MiB. VM tag 21 (IOKit) reached 794 MiB in the last detailed telemetry sample. Backboardd peaked at 216.1 MiB and ended at 161.6 MiB. This reproduces sustained memory growth in a different process from the earlier backboardd incident. A specific map or allocation lifetime has not been identified. Wi-Fi was off and Maps had a fresh RAM data volume.
 - **Measured (`memlog`; verified on phone):** backboardd from 38 MB at boot to 1555 MB, SpringBoard to 501, wired 1.9 to 4.7 GB in 11 minutes by script (run 091520, no network); backboardd to 2523 MB, wired 4.4 GB, in 12 minutes of the owner's use (run 100158). In steps as apps and screens open, flat at rest, never down. Free memory near zero from about 2-4 minutes.
 - **What it does:** idle processes are jetsammed from about 10 minutes of heavy use (VM page shortage, code 4). In runs 041029, 083507, 084652 backboardd itself was killed, the screen restarting; in 100158 it survived 2.5 GB, seemingly because nothing more was opened after memory ran out (two runs, an inference).
 - **Not it:** Maps' 4x pool (256 MB at most, one process's), the camera's flood (K38, fixed), a full `/var` (835 of 1536 MB, though its RAM disk takes 1536 MB of the phone's about 6.1 GB at boot on RAM runs only, `hk_ufs.c`).
@@ -219,8 +234,8 @@ No driver, `biometrickitd`/`pearld` denied, no Secure Enclave. Passcode is not s
 - Redwood (per README, unverified recently): front/rear preview, focus, HEIC photos; no video or Live Photo recording; processing is CPU-only (grey-world white balance, no noise reduction). Work: T25.
 
 ## K04 Audio — OnePlus 8 · **Partial**
-- **Works:** speakers (heard), UI sounds/ringtones/alerts/notification sounds, volume keys, main microphone (clap test).
-- **Unsupported:** USB-C analog headphones (no detection, no RX path), earpiece, call audio, Bluetooth audio, secondary microphones, noise suppression.
+- **Works:** speakers (heard), UI sounds/ringtones/alerts/notification sounds, volume keys, main microphone (clap test). **In the cellular system (2026-11-11, the owner on real calls):** a call's sound both ways at the earpiece; the speaker button switches the amplifiers (seen in the log of a real call, not yet confirmed by ear). K41.
+- **Unsupported:** USB-C analog headphones (no detection, no RX path), secondary microphones, noise suppression. **Untested:** a cellular call over a Bluetooth headset. A call's level cannot be changed (the DSP refuses a volume step without Android's calibration).
 - **Caveats:** amplifiers default off in the kernel (`sound_amps=0`; the profile passes 1); speaker protection is a software guard, not the DSP algorithm; level is 12 dB under stock maximum (`sound_below=96`); the first sound after an unpark has not been listened to;
   the amp health polarity is only checked via MANALARM/MANSTATE. Work: T08, T24. Evidence: [audio.md](subsystems/audio.md).
 
@@ -232,11 +247,12 @@ No driver, `biometrickitd`/`pearld` denied, no Secure Enclave. Passcode is not s
   - A RAM run starts with a new `/private/var`: networks are not remembered (`fw/network` joins one at start). Installed boot keeps `/private/var` but auto-join across reboots has not been checked.
 - **Cause of the TKIP/-3903 failure** was found and fixed (wifi.md). Evidence level high for the listed joins.
 
-## K06 Cellular, calls, SMS, voicemail — all · Telephony · **Unsupported** · S1 for a phone
-No modem start, no baseband IOKit drivers; CommCenter (non-cellular variant) is denied after it crashes on missing `AppleIPAppender`/`AppleBasebandPCI`; `vmd` denied (spun a core). Phone/Messages apps cannot place or receive. Work: T06. Also NFC (`nfcd` denied): T34.
+## K06 Cellular, calls, SMS, voicemail — all · Telephony · **Partial** · S2
+**OnePlus 8 (2026-11-11, verified on the phone, installed):** the carrier's name, signal, mobile data, SMS both ways and VoLTE calls both ways with sound, through the ported modem driver (`cell=1`) and a stand-in for CommCenter. What works, how, and where the code is: [subsystems/cellular.md](subsystems/cellular.md); what is left: K41.
+CommCenter itself still cannot run here (it crashes on missing `AppleIPAppender`/`AppleBasebandPCI` and is denied), so iOS gets only the answers the stand-in gives: no voicemail (`vmd` denied: it spun a core), no Personal Hotspot row. The tree's first modem path (`modem=3`, `tools/nf/modem`) stays a diagnostic: it holds the modem in mission mode and QMI LOC is phone-proven on it, but it never registered. **Redwood:** no modem work. Work: T06. Also NFC (`nfcd` denied): T34.
 
-## K07 Sensors — all · **Unsupported** · S2
-No screen rotation, motion, compass, proximity, light, barometer; no auto-brightness (`BLControl` waits 5 s for an ALS at window-server start and gives up). The sensors sit behind a DSP (SEE, QMI 400): the audio DSP on redwood, the SLPI on the OnePlus 8, where it boots and answers with an empty list. The path is not built. Work: T04.
+## K07 Sensors — all · **Partial** · S2
+No screen rotation, motion, compass, proximity, light, barometer; no auto-brightness (`BLControl` waits 5 s for an ALS at window-server start and gives up). The OnePlus 8's SLPI/SEE path still has no sensor data or HID bridge. A separate AP-side read-only probe shares the slider I2C bus and, after `ldoc10`, found no ACK at ODM candidate `0x46` in run `020629`; this does not establish the fitted part or rail. Work: T04.
 
 ## K08 Battery and charging — OnePlus 8 · **Unverified / Unsupported** · S1 (safety paths)
 - **Works (seen):** level/voltage/current/charging reported to iOS; status bar percentage; charger type via diagnostics lines.
@@ -245,7 +261,7 @@ No screen rotation, motion, compass, proximity, light, barometer; no auto-bright
 - **Unsupported:** OnePlus Warp fast charging, PD/PPS. No drain figure (asleep or awake). Work: T01, T13, T19. Evidence: [power.md](subsystems/power.md).
 
 ## K09 Display and brightness — OnePlus 8 · **Unverified / Bug (minor)**
-- **Brightness:** the Settings/Control Center slider reaches the panel as DCS `0x51` commands (verified at command level); **that the light actually changes, and the byte order, have not been verified** (no light measurement, no DSI read). There is no ambient sensor (K07). T16.
+- **Brightness:** the Settings/Control Center slider reaches the panel as DCS `0x51` commands (verified at command level); **that the light actually changes, and the byte order, have not been verified** (no light measurement, no DSI read). There is no ambient sensor service; a hardware candidate remains unverified (K07). T16.
 - **Late swaps:** ~2% of swaps come a refresh late (one push in flight); the first gesture set after boot is ~7% late; the unlock-after-wake blur costs 14 ms of GPU per frame. T23.
 - **Never send DCS 0x10** (panel static until reset): this is a developer hazard, not a user setting.
 - 60 Hz fallbacks exist (`fb_hz=60`, `fb_push=0`) if 90 Hz misbehaves. Resolved: tearing, shadows "too large" (owner).
@@ -263,10 +279,12 @@ No screen rotation, motion, compass, proximity, light, barometer; no auto-bright
 ## K11 App Store, Apple ID, iCloud, push, FairPlay — all · **Unsupported (blocked)** · S2
 App Store shows LOADING for ever (the bag request is built but never resolved; an AMS thread waits on `fairplayd.H2`, which exits 0 immediately every 10 s). No Apple ID sign-in, no `apsd` push courier (identity needs the Secure Enclave), `mobileactivationd` answers "Device is not activated".
 Safari, Settings, Sileo/Procursus (apt, tweaks) work. `nsurlsessiond` must run or Sileo downloads sit "Queued". Work: T15.
+- **Why it is blocked:** activation, Apple ID and the push courier need the device to sign with keys that Apple put into a real iPhone's Secure Enclave and registered on its servers. This phone has neither the chip nor the keys, and forging a device's identity is not done in this project. Qualcomm's TrustZone could give the keychain and a passcode real local protection (not started, T28); it cannot stand in for those keys.
+- **What it means in use:** no iMessage or FaceTime, and a third-party app gets its messages only while it is open. Calls, SMS and notifications made on the phone itself (alarms, reminders, the SMS banner) do not pass through Apple's push and work.
 
 ## K12 Location — all · **Partial** · S2
-**The default images:** no `locationd` job, so no position there. No GNSS (the modem boots in tests, no QMI LOC yet). Work: T14.
-**With `locationd`'s job on a root (`tools/nf/mk_extra.sh loc`, not the default image's) Maps opens to a white screen** and is killed by the watchdog: `locationd`'s queue waits on `fairplayd.H2`, which never answers (K11). Without fairplayd's job on the root Maps draws its sheet (run 055706, one variable, on GL; run 060829 on Metal, up to the location prompt). **Interim, a choice the owner will see:** `tools/nf/mk_extra.sh loc` leaves that job off RAM test roots with `locationd`, so the lookup fails at once; what needs FairPlay stays unavailable, as it was, and the installed system is not changed. **Wi-Fi location works by the owner's eye (2026-11-06, run 083507: 「map可以加载了，定位正常」), on that RAM root, with Wi-Fi joined by hand; the earlier expectation of no fix without Mescal was wrong. Mescal is not forged or emulated: it is simply absent. Accuracy has not been measured and the path is inferred (Apple's Wi-Fi positioning from `locationd`'s scans).** No GNSS. Diagnosis: research/next-features.md section 17.
+**The default images:** no `locationd` job, so no position there. The RAM diagnostic root now brings the external SDX55 to mission, discovers QMI LOC service 16 over the reusable QRTR/QMI path, and receives generic LOC position reports; run `015925` (#156) still had zero satellites and no fix indoors. No iOS/locationd bridge exists, and outdoor RF evidence is still missing. Work: T14/T06.
+**With `locationd`'s job on a root (`tools/nf/mk_extra.sh loc`, not the default image's) Maps opens to a white screen** and is killed by the watchdog: `locationd`'s queue waits on `fairplayd.H2`, which never answers (K11). Without fairplayd's job on the root Maps draws its sheet (run 055706, one variable, on GL; run 060829 on Metal, up to the location prompt). **Interim, a choice the owner will see:** `tools/nf/mk_extra.sh loc` leaves that job off RAM test roots with `locationd`, so the lookup fails at once; what needs FairPlay stays unavailable, as it was, and the installed system is not changed. **Wi-Fi location works by the owner's eye (2026-11-06, run 083507: 「map可以加载了，定位正常」), on that RAM root, with Wi-Fi joined by hand; the earlier expectation of no fix without Mescal was wrong. Mescal is not forged or emulated: it is simply absent. Accuracy has not been measured and the path is inferred (Apple's Wi-Fi positioning from `locationd`'s scans).** GNSS has transport-level reports but no satellite/fix evidence and no `locationd` bridge. Diagnosis: research/next-features.md section 17.
 
 ## K13 Security properties — all · **By design (stand-ins)** · S3
 AMFI and Sandbox answer "allowed" to everything; entitlements come from the signature; no trust cache. `AppleKeyStore` models a device with no passcode and never locked: keychain items are "wrapped" with a reversible transformation that protects nothing, and the keychain lives in `/private/var`.
@@ -279,7 +297,7 @@ Occasionally a daemon fails on the fresh `/var`: run 060507 (2026-11-05, `ramhfs
 Also seen once (run 085644, 2026-11-05, 1 boot of 14): mobiletimerd[120] jumped into a read-write page of the shared cache ("Data/Stack execution not permitted ... protections were read-write", exception 1 code 0x2, then a corpse), after another instance had logged "Settings is nil". Unexplained; whether it comes from the fresh `/var` is an inference from its neighbour above, not established.
 
 ## K15 UI rendering gaps — OnePlus 8 · **Bug** · S3
-- Long-press on the lock-screen wallpaper (poster switcher) would show black; it is disabled instead (`poster_switcher_allowed()`); cause unknown.
+- The lock screen's wallpaper itself draws: the default one, by CollectionsPoster through Metal, in all four boots of 2026-11-11 (log). Long-press on it (the poster switcher) is turned off by our own hook (`poster_switcher_allowed()` in `inject_sb.c`), because PosterBoard's screen came out black; cause unknown. That was seen before the compositor moved to Metal and **has not been tried since**. A lead, by timing only: when PosterBoard takes its snapshot after the screen goes off it asks Metal for a texture layout object, gets nil (K42), and draws nothing afterwards.
 - Shadows under cards of the app switcher are missing (function `sb3` refused). The switcher's wallpaper wash uses a placeholder image.
 - Control Center glyph strokes appear only after the fade settles (`cc_fade` workaround exists, off).
 - Notification banner material has not been compared with a real iOS.
@@ -305,7 +323,7 @@ Scripted touches do not reach iOS system gestures (swipe-up home/switcher) excep
 Documented capabilities come from the upstream README and earlier sessions. The owner asked not to run POCO checks. Lacks GPU page tables, DCVS, fence IRQ, sleep, interrupt touch. T30.
 
 ## K21 Installed build lags the source — OnePlus 8 · **Limitation** · S3
-The installed bundle/loader date from 2026-10-25 14:20; GPU collapse, brightness, Wi-Fi, `ca_ambient`, vmd fix and later work are only in RAM runs. T03.
+Installed since 2026-11-11: the bundle "Cellular 2026-11-11" in boot slot 1 (kernel `cell-0a663690`, Metal over Vulkan for the whole system, Wi-Fi, Bluetooth, the cameras, the modem); "Metal 3 2026-11-06" stays in slot 0 as the menu's previous version. It is behind the source by one revision of `hk_commcenter` (K41) and by whatever lands after it. Its line has `syssleep=0` (K10: Wi-Fi does not survive a system sleep), so the phone never sleeps deeply and its drain is unmeasured. The next install goes into slot 0, over "Metal 3". T03.
 
 ---
 
@@ -314,3 +332,26 @@ Verify against code and evidence, state Kind, Severity, device, expected vs actu
 
 ## K22 Agent toolkit activation — developers · Unverified · S3
 The physical phone still runs loader 0.5 without the new `getvar:iphont` extension. New agent commands correctly return `old_loader`; deep/control features cannot be considered working there yet. The owner deferred a RAM-only reload on 2026-10-26. No flash operation is needed to validate the extension. See [TOOLKIT.md](TOOLKIT.md), TODO T36.
+
+## K41 Cellular: what is left — OnePlus 8 · **Partial** · S2
+- **Works (verified on the phone, 2026-11-11; installed as "Cellular 2026-11-11"):** carrier and signal, mobile data, SMS both ways with notifications, VoLTE calls both ways with sound, the speaker button. Details: [subsystems/cellular.md](subsystems/cellular.md). The kernel side is in `tools/nf/cell/`, iOS's side in `userland/src/hk_commcenter.m` and `inject_call.m`.
+- **Not done or unverified:** a call's level (no calibration: the DSP refuses a volume step), the speaker and mute as a person hears them (the route switch is in the log of a real call), hold and call waiting, DTMF on the air, MMS, long messages over eight parts, a call over a Bluetooth headset, Personal Hotspot (the row does not appear), emergency calls (not tried), a modem restart with IMS up, sleep with the modem up.
+- **The screen stays on at the ear:** there is no proximity sensor yet (K07), so a cheek can press what is on the screen during a call.
+- **Fixed on the way, in every kernel built before 2026-11-11:** closing `/dev/oslog_stream` panicked (`kfree: ... found in heap data.* instead of *`): xnu's own `bsd/kern/subr_log_stream.c` frees with `kfree_type` what it allocated with `kalloc_data`. Anything that reads iOS's live log (`oslog`, `os_activity_stream`) ended the system when it stopped; with Wi-Fi on that is a cold-recovery hold. Fixed in `xnu-src` (not exported to `xnu/` yet: whoever runs `xnu/export.sh` next carries it) and in the cellular kernels (`tools/nf/cell/overlay/xnu/files/bsd/kern/subr_log_stream.c`).
+- **The installed bundle's `hk_commcenter` is the first daily build:** if MobileGestalt ever says "no baseband" again it renames the kept file itself, too late to help. The next bundle should carry the newer daemon, which marks `init`'s stamp instead.
+
+## K42 Metal on Vulkan: what is not implemented — OnePlus 8 · Metal (Vulkan) · **Partial** · S3
+Read from the logs of the four boots of 2026-11-11 and from the source; nothing was run for it. Those boots had only the system's own interface
+processes in them (no Maps, Safari, Photos or third-party app), so what apps would ask for is not in this list; T10 keeps the older, longer one.
+The libvulkan on the phone is a day older than the source that was read.
+
+| Kind | What | Who asks |
+|---|---|---|
+| Visible | Framebuffer fetch at 4 samples: the pipeline is refused | Siri's orb (refused in every boot), two of Maps' pipelines (K35) |
+| Visible | `newTextureLayoutWithDescriptor:` returns nil | SpringBoard, PosterBoard (K15) |
+| Visible | A vertex attribute that is read but was never described: the pipeline is refused | Messages' app view |
+| Visible | A draw with no pipeline state set is dropped | the Fitness widget |
+| Stand-in | A 4:2:0 surface goes through a CPU copy; a memoryless target really gets memory | the compositor, wallpapers, Maps |
+| Absent | Tessellation, mesh shaders, indirect command buffers, ray tracing, sparse textures | nobody in these boots |
+| Ignored | Depth bias, depth clamp, fill mode, more than one viewport, indirect draws | nobody in these boots; a 3D app would show it (inferred) |
+| Speed | No precompiled pipeline library is found for this GPU; a refused pipeline is asked for again every frame | the compositor, chronod |

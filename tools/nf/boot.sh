@@ -25,6 +25,16 @@ QUIET="sound_amps=0 haptic=0"; [ -z "${NF_LOUD:-}" ] || QUIET=
 NOSLEEP="syssleep=0 "; [ -z "${NF_SLEEP:-}" ] || NOSLEEP=
 LINE="board_gpu_zap=0x8e21a000 fb_panel=amb655uv01 ufs_write=0 fb_hz=90 cpus=8 cpufreq=1 bootcpu=7 gpu=1 gpu_irq=0 gpu_dcvs=0 gpu_sleep=0 gpu_hwcg=0 ${NOSLEEP}ufs=2 root_apfs=ufs_darwin hk_data=2 hk_data_mb=${NF_VAR_MB:-512} var_data=hfs var_store=0 var_data_format=1 return_dark=1 exctrace=1 $QUIET $ARGS"
 case " $LINE " in *" touchscreen=1 "*|*" wifi_again="*|*" adsp_again="*|*" ufs_write=1 "*|*" var_store=1 "*) echo "refused: $LINE"; exit 1 ;; esac
+case " $ARGS " in
+*" modem_gnss=1 "*|*" modem_gnss=2 "*|*" modem_radio=1 "*|*" modem_radio=2 "*|*" modem_radio=3 "*|*" modem_radio=4 "*|*" modem_radio=5 "*|*" modem_radio=6 "*)
+	case " $LINE " in *" wifi=0 "*) ;; *) echo "refused: GNSS/radio modem runs require explicit wifi=0"; exit 1 ;; esac
+	;;
+esac
+case " $ARGS " in *" modem_gnss=2 "*)
+    for item in $LINE; do
+        case "$item" in wifi=0) ;; wifi=*) echo "refused: modem_gnss=2 requires wifi=0 throughout"; exit 1 ;; esac
+    done ;;
+esac
 FULL="loader_return_after=$SECS epoch=$(date +%s) sb_delay=8 $LINE"
 PREFIX=$(wc -c < ../oneplus8-audit/gpu-plan/observed-loader-prefix.txt)
 [ $(( ${#FULL} + PREFIX )) -le 607 ] || { echo "command line $(( ${#FULL} + PREFIX )) bytes, the loader takes 607"; exit 1; }

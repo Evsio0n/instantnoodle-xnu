@@ -202,9 +202,120 @@ All in `userland/src/inject_sb.c` (replacements located by class, selector and e
 - **CommCenter** (cellular): the `-noncellular` variant is chosen by launchd when the device tree has no `baseband` node and it
   answers `com.apple.commcenter.xpc`/`.coretelephony.xpc`, serves geod its policy, loads network-extension configurations — and
   then dies every time on one of two missing IOKit drivers: 11 of 20 crashes SIGSEGV right after "Could not find
-  AppleIPAppender service" (user client `ApplePDPHelperInterface`: PDP contexts, flows, dedicated bearers) and 9 SIGABRT right
+  AppleIPAppender service" (user-side `ApplePDPHelperInterface`, for PDP contexts, flows and dedicated bearers) and 9 SIGABRT right
   after "Unable to communicate with AppleBaseband driver" (`com.apple.driver.AppleBasebandPCI`). Stubbing one would leave the
   other. It stays denied. [observed]
+
+  **20F66 native service discovery [stock binary, 2026-11-10].** The signed arm64
+  CommCenter imports `TelephonyBasebandCreateController` and the PDP helper's
+  `getInstance()`. Their paths are independent. The baseband controller
+  looks up class `AppleBaseband`, subscribes to `IOServiceMatched` if publication
+  is late and opens type 0. The PDP singleton initializes by looking up the
+  **class** `AppleIPAppender`, opening type 0 and registering an interest
+  notification. Both stock launch jobs have the same label/endpoint and
+  opposite `baseband` device-tree conditions. A job's presence or a successful
+  Mach lookup alone does not establish either driver connection.
+
+  On the ABP path `IOABPControlClass::start` directly looks up class
+  `AppleBasebandPCIControl`. For each requested transport, `IOABPClass::start_nl`
+  adds a **top-level CFString** `ABPInterfaceProtocol` to
+  `IOServiceMatching("AppleBasebandPCIInterface")`, then registers first-match
+  and termination notifications with that dictionary. The 20F66
+  `libPCITransport` enum map contains 0 → `pbl`, 1 → `sahara`, 4 → `qmux1`,
+  5 → `qmux2`. The control and channel clients each open type 0 and then issue
+  a scalar handshake. Channel open also sets up `IOGeneralInterest`;
+  normal `readAsync` uses an asynchronous IOKit completion. A synchronous
+  router emit cannot stand in for that delivery or its cancellation on close.
+  These are caller observations. Hardware readiness,
+  permissions, returned values and completed QMUX transactions require their
+  own runtime evidence.
+
+  **The signed consumer and its event lifetime [20F66 static].** The original
+  CommCenter executable declares `com.apple.driver.AppleBasebandPCI.user-access`
+  and `com.apple.driver.AppleBasebandPCIControl.user-access`. The stock launch
+  job runs it as `_wireless`. On a system with trusted code-signing enforcement,
+  the caller's task entitlement can be queried by the IOKit user-client
+  machinery. This port documents the limits of its identity and sandbox
+  implementations in [kernel-standins](kernel-standins.md). Verifying the
+  original file on the host establishes its identity and its declared
+  entitlements; a device-side grant also requires a trusted link between
+  the executing task and that verified code. Such a grant has not been
+  demonstrated for this port.
+
+  For the ordinary ABP transport, `libPCITransport` forwards asynchronous
+  reads and writes to the named `libIOABP` routines. Its SDK stubs describe an
+  explicitly sized buffer and callback. The library binds an IONotificationPort
+  to its run loop or dispatch queue before subscribing, mutex-protects
+  submission through that port, and handles a missing async port as an error.
+  Channel close sends a closing request and releases the IOKit connection.
+  Stop also clears the iterators and notification port and schedules cleanup
+  connected to its dispatch group. That group covers the library's observed
+  cleanup block; the behavior of every outstanding driver read during removal
+  is still unknown. The lookup and transfer wrappers themselves specify no
+  SIM or bearer operation. What a running CommCenter sends over them depends
+  on its initialization and radio policy.
+
+  The [notification probe](../../tools/nf/stock-cellular/test_abp_notifications.c)
+  reproduces the run-loop registration with first-match and termination
+  iterators, a positive IOResources control, and an unknown protocol negative
+  control. It uses a 100 ms window. On the development Mac it reported one
+  initial IOResources entry, zero ABP matches, and zero later events. The
+  same source links for arm64 iOS 16.5. This test exercises discovery only.
+  There is no proven stock transfer fixture with trusted client admission,
+  a live compatible channel, and a bounded read completion on this board.
+
+  Run the pinned artifact checks and the local notification test from the
+  kernel checkout on macOS.
+
+  ```sh
+  python3 tools/nf/stock-cellular/check_abp_20f66.py
+  probe_dir=$(mktemp -d)
+  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -framework IOKit \
+      -framework CoreFoundation tools/nf/stock-cellular/test_abp_notifications.c \
+      -o "$probe_dir/notify"
+  "$probe_dir/notify"
+  ```
+
+  **Internal NAS binding [source and host test].**
+  [hk_abp_nas](../../xnu/files/bsd/dev/hk_abp_nas.c) watches the existing
+  QRTR catalogue through its lookup callback. A unique advertised NAS v1,
+  instance 0 allows the serial modem owner to bind `qmux1` and `qmux2`
+  independently to the maintained NAS router. A second peer, service deletion
+  or link loss invalidates outstanding leases, including when firmware later
+  reuses the same endpoint. The backend has no Apple IOKit registration.
+  `tools/qrtr-test/run.sh` drives its real transport entry points with
+  synthetic packets, including equal transaction IDs on two channels, an
+  unchanged modem error, and a late reply after revocation. Its source also
+  compiles using the NF BSD development kernel's ARM64 CFLAGS.
+  Worker integration requires the same serialized context for client state
+  and inbound QRTR processing; the ordinary mission loop and MHI polling
+  thread are distinct. The caller must drain the worker before tearing down
+  the adapter. Hardware receipt #269 predates this binding.
+
+  **Publication ordering [stock binary].** `libPCITransport` caches
+  `pci::transport::kernel::probeVariant()` with `dispatch_once`. It checks the
+  control service classes synchronously. `AppleBasebandPCIControl` selects
+  variant 1, `AppleConvergedIPCBBControl` selects 2 and finding neither caches
+  0, for which `kernel::create()` returns an empty result. The ABP control
+  provider therefore needs to be ready before the client's first probe.
+  Later channel matching notifications do not revisit that process-wide
+  decision. In variant 1 the separate `pci::event::PDPListener::start()` looks
+  up class `AppleBasebandPCIPDPManagerBase`.
+
+  **Provider responsibility [XNU source].** In xnu-8796.121.2,
+  `IOService::matchPassive` delegates unhandled top-level keys to the family
+  and the default `IOService::matchPropertyTable` returns true. An ABP channel
+  provider must compare this key in its family matching override, e.g. with
+  `compareProperty(table, "ABPInterfaceProtocol")`, against the service's
+  OSString. An unfiltered class count cannot detect an alias between channels.
+  The [stock contract check](../../tools/nf/stock-cellular/check_abp_20f66.py)
+  reproduces the source identities, enum map and caller checks against the
+  local dyld cache. The [mobile probe](../../tools/nf/stock-cellular/abp_match.c)
+  uses the same dictionary, independently checks returned property types and
+  includes a nonexistent protocol. A run with no interfaces reports zero for
+  every channel. UniXNU `e2fdae4`, `docs/porting/baseband.md` §3, describes
+  the same channel names. Its local QcomBaseband gitlink `dd0199c` has no
+  checked-out implementation.
 - **vmd** (voicemail): asked launchd for CommCenter's service in a loop with no delay — 1363 failed lookups in 70 s, 40% of a
   core for ever — which was the root cause of "laggy after wake / CPU 95% busy" (gesture cores 95% busy after wake against
   55-60% before). Found with `kern.hackios.top` per-process CPU. Denied: 40-55% after. Not the sleep. [observed]

@@ -30,12 +30,14 @@ What has been **seen working on the phone itself** (the kernel's log of a run sa
 | Wi-Fi (QCA6390) | works in RAM runs (WPA2, WPA2/TKIP mixed, WPA3 SAE) | on by default (`wifi=0` off), `fw-wifi` | [wifi.md](../subsystems/wifi.md) |
 | System sleep, wake by key/timer/cable | works (6 of 7 cores off); not the SoC's lowest state | `syssleep` default on | power.md |
 | GPU block collapse in sleep, brightness command path | works / command path verified | `gpu_sleep` default | gpu.md, display.md |
-| Boot from flash, boot menu, boot guard, `/private/var` on HFS+ | works (installed 2026-10-24) | `common/flash/install-xl.sh` | [storage.md](../subsystems/storage.md), INSTALL.md |
+| Boot from flash, boot menu, boot guard, `/private/var` on HFS+ | works (first installed 2026-10-24; now "Cellular 2026-11-11" in slot 1, "Metal 3 2026-11-06" in slot 0) | `common/flash/install-xl.sh` | [storage.md](../subsystems/storage.md), INSTALL.md |
 | Custom boot logo | works | `userland/mkbootlogo.py` | research/ios-userland.md §7 |
-| Metal driver | experimental, off by default | `metal=1`/`2` | gpu.md |
+| Metal driver | runs the whole installed system over Vulkan since 2026-11-06; off in the kernel's defaults; about 1 frame in 10 late in daily use (K35), gaps in K42 | `metal=2 metal_backend=vk camtl=1` in the bundle's line | gpu.md, [../KNOWN_ISSUES.md](../KNOWN_ISSUES.md) |
+| Cellular (Snapdragon X55): carrier and signal, mobile data, SMS both ways, VoLTE calls both ways | works, installed 2026-11-11, owner-confirmed (「顯示了，能用能打電話」); no hold, DTMF, MMS, hotspot | `modem=5 cell=1` in the bundle's line; the cellular kernel only | [cellular.md](../subsystems/cellular.md) |
+| A call's sound, earpiece and speakers | works on real calls (the owner: 「可以了！」); the level cannot be changed; speaker and mute not confirmed by ear | `voice=3`, default with `cell=1` | cellular.md |
 | Bluetooth (QCA6390) | buds, A2DP, HFP and BLE verified 2026-10-26/27; on today's kernel, on by default in RAM with Wi-Fi, camera and DSP on: controller up, iOS powered on, 449 LE reports in 4 s (run 012611); **owner-confirmed on the combined build 2026-11-06 (「闪光灯和蓝牙OK了」; what was tried with it not relayed).** Not separately checked: traffic beside Wi-Fi | `bt=1` in the defaults, `BLUETOOTH=1`, `fw-bt` | [bluetooth.md](../subsystems/bluetooth.md) |
 | Cameras | all four sensors answer with their chip IDs (`cam=2`, run 081247); **Camera.app works: the Back Camera the wide IMX586 (C-PHY, run 124917), the Front Camera the IMX471** (`cam=5`, RAM runs 104112/105351, verified on phone: preview, tap to focus, a HEIC photo, Photo/Video/Portrait modes), the preview made by the GPU (`camera_gpu.c`, run 112756, no throttling); no path for the other three yet, no IMX471 tuning | `cam=N`, `cam_scan`, `cam_pll2`, `cam_step`, `cam_gain`, `fw-camera` | [input-peripherals.md](../subsystems/input-peripherals.md#cameras-oneplus-8-instantnoodle_camerac-cam12-all-four-chip-ids-verified-on-phone-2026-11-04) |
-| Not done | headphones/USB-C audio, sensors, cellular, location, fast charging (Warp), SoC low-power states, auto-brightness | | [../TODO.md](../TODO.md), [../KNOWN_ISSUES.md](../KNOWN_ISSUES.md) |
+| Not done | sensors (no proximity, light, motion: no auto-brightness, no rotation, the screen stays on at the ear), headphones/USB-C audio, GPS, video recording, fingerprint, fast charging (Warp), SoC low-power states (and the installed line keeps system sleep off), App Store / Apple ID / push (no Secure Enclave: K11) | | [../TODO.md](../TODO.md), [../KNOWN_ISSUES.md](../KNOWN_ISSUES.md) |
 
 ## Setting up (RAM-only run)
 
@@ -82,7 +84,7 @@ sound_below=96 slider_cal=... sb_clock=24`. Wi-Fi, the flashlight and Bluetooth 
   "Bootloader (fastboot)" entry works; docs/INSTALL.md's "volume down + power" is from the phones with Android).
 - `slider_cal`, `sb_clock=24` (status-bar clock clear of the camera hole at x 61-137 of 1080) are in the profile.
 - `/private/var` size shows ~2 GB on RAM boots (ramfs cap `max_mem/4`), 95 GB with the HFS+ volume.
-- The OnePlus has no ambient light sensor wired in this port, so auto-brightness has nothing to read.
+- The port has no usable ambient-light sensor service, so auto-brightness has nothing to read; the ODM hardware candidate remains unconfirmed after the read-only `0x46` probe.
 - Test with `tools/t` ([../TESTING.md](../TESTING.md)); tests must be short (the owner asked twice).
 
 ## Hardware map (more in research/hardware-qualcomm.md)

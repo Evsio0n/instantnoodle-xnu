@@ -933,6 +933,7 @@ static void
 test_helpers(void)
 {
 	struct qmi_handle qmi;
+	struct qmi_handle explicit_qmi;
 	struct qmi_txn txn, other;
 	struct ask ask = { 21 };
 	struct answer answer;
@@ -944,6 +945,10 @@ test_helpers(void)
 	/* no router: no handle */
 	hk_qmi_set_transport(NULL);
 	check(qmi_handle_init(&qmi, 8192, &handle_ops, handle_handlers) == -ENXIO && qmi.sock == NULL, "a handle is made with no router there");
+	check(qmi_handle_init_transport(&explicit_qmi, 8192, &handle_ops, handle_handlers, &router_ops) == 0 &&
+	    explicit_qmi.sock != NULL && router.open, "an explicit transport makes a handle without the global router");
+	qmi_handle_release(&explicit_qmi);
+	check(!router.open && explicit_qmi.sock == NULL, "an explicit-transport handle releases its own router");
 
 	hk_qmi_set_transport(&router_ops);
 	memset(&seen, 0, sizeof(seen));

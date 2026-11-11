@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GNSS Monitor</title>
+<style>
+html,body{margin:0;background:#080d17;color:#fff;font-family:-apple-system,BlinkMacSystemFont,sans-serif}
+main{max-width:390px;min-height:700px;margin:auto;padding:58px 24px;text-align:center;box-sizing:border-box}
+h1{font-size:34px;color:#63dcff;font-weight:650;margin:0 0 34px}
+.state{font:17px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-line;line-height:1.9;text-align:left}
+.ok{color:#72f0a2}.warn{color:#ffd166}.muted{color:#9ca8b7;font-size:14px;line-height:1.6;margin-top:34px}
+.pill{display:inline-block;border:1px solid #315069;border-radius:20px;padding:6px 14px;color:#b8d8e8;margin-bottom:24px}
+.raw{margin-top:22px;padding:10px;border:1px solid #1c3042;border-radius:10px;color:#8fa4b7;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;text-align:left;overflow-wrap:anywhere}
+button{margin-top:22px;padding:10px 18px;border:1px solid #315069;border-radius:10px;background:#142638;color:#fff;font:inherit}button:disabled{opacity:.6}
+</style>
+<main>
+  <div class="pill" id="feed">RAM-only · connecting to kernel feed</div>
+  <h1>GNSS monitor</h1>
+  <div class="state" id="state">MODEM      waiting
+QRTR       waiting
+SATELLITES waiting
+SIGNAL     waiting
+POSITION   waiting
+FIX        no fix</div>
+  <div class="raw" id="raw">No coordinates, satellite identities, or EFS data are exposed.</div>
+  <button id="refresh" type="button">Refresh now</button>
+  <div class="muted" id="updated">Last successful update: none yet</div>
+  <div class="muted">http://127.0.0.1:8765/<br><span id="automatic">Auto-refresh every 10 seconds while this page is visible</span></div>
+  <!-- A no-script probe makes the loopback connection observable even if WebKit's
+       scripting is disabled.  It carries counters only, and does not add a second
+       connection when the script below is polling. -->
+  <noscript><iframe src="gnss.json?initial=1" title="GNSS feed probe" style="position:absolute;width:1px;height:1px;border:0;opacity:0"></iframe></noscript>
+</main>
+<script>
+(function () {
+  var state = document.getElementById("state");
+  var feed = document.getElementById("feed");
+  var raw = document.getElementById("raw");
+  var refresh = document.getElementById("refresh");
+  var updated = document.getElementById("updated");
+  var automatic = document.getElementById("automatic");
+  var timer = null;
+  var inFlight = null;
+  var refreshMs = 10000;
+  var timeoutMs = 8000;
+
+  function parse(text) {
+    var out = {};
+    text.trim().split(/\s+/).forEach(function (part) {
+      var at = part.indexOf("=");
+      if (at > 0) out[part.slice(0, at)] = part.slice(at + 1);
+    });
+    return out;
+  }
+  function n(data, key) {
+    var value = Number(data[key]);
+    return isFinite(value) ? value : 0;
+  }
+  function oneDecimal(value, empty) {
+    return value === 0 ? (empty || "—") : (value / 10).toFixed(1);
+  }
+  function render(text) {
+    var data = parse(text);
+    if (data.error) throw new Error(text);
+    var enabled = n(data, "enabled") === 1;
+    var started = n(data, "started") === 1;
+    var services = n(data, "qrtr_services");
+    var reports = n(data, "sv_reports");
+    var listed = n(data, "listed");
+    var signalled = n(data, "signal");
+    var positions = n(data, "position_reports");
+    var fixes = n(data, "fixes");
+    var stages = ["off", "starting modem", "loading firmware", "mission · waiting for LOC",
+      "requesting GNSS start", "GNSS start accepted", "legacy start · unconfirmed", "failed", "stopped"];
+    var failures = ["", "modem boot failed", "firmware transfer failed",
+      "modem startup RDDM · GNSS never started", "mission transition failed",
+      "modem errfatal", "LOC service did not appear"];
+    var hasStage = Object.prototype.hasOwnProperty.call(data, "stage");
+    var stage = n(data, "stage");
+    var failed = hasStage && stage === 7;
+    var stopped = hasStage && stage === 8;
+    var phase = hasStage ? (stages[stage] || "unknown state") :
+      (started ? "start requested · acceptance unknown" : (enabled ? "waiting · stage unavailable" : "off"));
+    var reason = failures[n(data, "failure")] || "unknown modem failure";
+    feed.textContent = "RAM-only · " + (failed ? reason : (stopped ? "session ended" : "live kernel feed"));
+    feed.className = "pill " + (hasStage && stage === 5 ? "ok" : "warn");
+    state.textContent =
+      "MODEM      " + phase + "\n" +
+      "QRTR       " + services + " services" + "\n" +
+      "SATELLITES " + listed + " listed · " + reports + " decoded reports" + "\n" +
+      (Object.prototype.hasOwnProperty.call(data,"sv_wire") ? "SV wire    " + n(data,"sv_wire") + " packets · " + n(data,"sv_absent") + " no list · " + n(data,"sv_empty") + " empty · " + n(data,"sv_bad") + " malformed · " + n(data,"sv_no_cn0") + " entries without valid C/N0\n" : "") +
+      "SIGNAL     " + signalled + " with signal · best " + oneDecimal(n(data, "best_dbhz10"), "—") + " dB-Hz\n" +
+      "POSITION   " + positions + " reports" + "\n" +
+      "FIX        " + (fixes ? fixes + " fix" + (fixes === 1 ? "" : "es") + (failed || stopped ? " · historical" : "") :
+        (failed ? "unavailable · modem failed" : (stopped ? "session ended without fix" :
+          (hasStage && stage === 5 ? "no fix yet" : "waiting for an accepted session"))));
+    raw.textContent = text;
+    updated.textContent = "Last successful update: " + new Date().toLocaleTimeString();
+  }
+  function schedule() {
+    clearTimeout(timer);
+    timer = null;
+    if (!document.hidden) timer = setTimeout(poll, refreshMs);
+  }
+  function poll() {
+    clearTimeout(timer);
+    timer = null;
+    if (document.hidden || inFlight) return;
+    var request = {controller: new AbortController(), timedOut: false, hidden: false};
+    inFlight = request;
+    refresh.disabled = true;
+    refresh.textContent = "Refreshing…";
+    var timeout = setTimeout(function () {
+      request.timedOut = true;
+      request.controller.abort();
+    }, timeoutMs);
+    fetch("gnss.json?" + Date.now(), {cache: "no-store", signal: request.controller.signal})
+      .then(function (response) {
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return response.text();
+      })
+      .then(render)
+      .catch(function (error) {
+        if (request.hidden) return;
+        feed.textContent = "RAM-only · kernel feed unavailable";
+        feed.className = "pill warn";
+        state.textContent = "No current GNSS status.\nThe last successful update is stale.";
+        raw.textContent = "waiting for kern.hackios.modem_gnss\n" +
+          (request.timedOut ? "Request timed out after 8 seconds" : error);
+      })
+      .then(function () {
+        clearTimeout(timeout);
+        inFlight = null;
+        refresh.disabled = false;
+        refresh.textContent = "Refresh now";
+        schedule();
+      });
+  }
+  refresh.addEventListener("click", poll);
+  document.addEventListener("visibilitychange", function () {
+    automatic.textContent = document.hidden ? "Auto-refresh paused while this page is hidden" :
+      "Auto-refresh every 10 seconds while this page is visible";
+    if (document.hidden) {
+      clearTimeout(timer);
+      timer = null;
+      if (inFlight) {
+        inFlight.hidden = true;
+        inFlight.controller.abort();
+      }
+    } else {
+      poll();
+    }
+  });
+  poll();
+}());
+</script>

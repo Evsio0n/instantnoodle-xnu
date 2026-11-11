@@ -43,7 +43,7 @@ phone itself: that needs a load that heats it past 95 C.
 ## Motion/light sensors (accelerometer, gyroscope, compass, light, proximity, barometer): not available
 
 They are not wired to the application processor: they hang off a DSP, behind its sensor framework (Qualcomm's "SEE"), reached through the QMI service 400 over QRTR. **On the
-OnePlus 8 that DSP is the SLPI (PAS 12, PID 3), not the audio DSP:** it boots here and service 400 answers, with an empty sensor list ([../research/next-features.md](../research/next-features.md) section 4; `hk_slpi_boot.c`, off by default).
+OnePlus 8 that DSP is the SLPI (PAS 12, PID 3), not the audio DSP:** it boots here and service 400 answers, with an empty sensor list in the historical SEE lookup ([../research/next-features.md](../research/next-features.md) section 4; `hk_slpi_boot.c`, off by default). This is separate from the AP-side `sensor_probe=1` run `020629`, which tested I2C `0x46` after `ldoc10` and got no ACK.
 The table below is redwood's audio-DSP path. What is there and what is missing:
 
 | Step | State |
@@ -61,6 +61,5 @@ run on a phone is not recorded.
 
 ## Location (GPS): not available
 
-The GNSS receiver belongs to the modem, which this port does not start yet. On redwood that is the in-SoC modem (`qcom,mss@4080000`); **the OnePlus 8 has none in the SoC:
-its modem is an external SDX55 on PCIe 2 (`mdm0: qcom,ext-sdx55m`, no `qcom,mss` node in its tree [observed])**, see [../research/next-features.md](../research/next-features.md) section 3. GNSS comes
-with the modem, through its QMI location service (16). Location by Wi-Fi does not need the modem: it is `locationd` and Apple's positioning service (same page, section 5).
+The GNSS receiver belongs to the external modem. On redwood that is the in-SoC modem (`qcom,mss@4080000`); **the OnePlus 8 has none in the SoC:
+its modem is an external SDX55 on PCIe 2 (`mdm0: qcom,ext-sdx55m`, no `qcom,mss` node in its tree [observed])**, see [../research/next-features.md](../research/next-features.md) section 3. The SDX55 now reaches mission in RAM tests and its QMI location service (16) is discovered over QRTR, but the diagnostic run has no satellites/fix and there is no `locationd` bridge. Location by Wi-Fi does not need the modem: it is `locationd` and Apple's positioning service (same page, section 5).

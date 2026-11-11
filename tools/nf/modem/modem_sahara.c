@@ -138,6 +138,7 @@ modem_sahara_input(struct modem_sahara *s, const void *packet, size_t length)
 		s->ops->say(s->context, "sahara: hello: version %u, compatible with %u, packets of up to %u bytes, mode %u\n", get32(p + 8), get32(p + 12), get32(p + 16),
 		    get32(p + 20));
 		if (get32(p + 20) == MODE_MEMORY_DEBUG) {
+			s->memory_debug_offered = true;
 			s->ops->say(s->context, "sahara: the device has crashed and offers its memory: not taken\n");
 			return MODEM_SAHARA_FAILED;
 		}

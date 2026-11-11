@@ -4,7 +4,7 @@ The development roadmap. It lists **work**; what is *broken for a user right now
 the session state is in [HANDOFF.md](HANDOFF.md). Entries here (`T..`) are cross-referenced, not duplicated. Evidence for every item is the
 source tree and the subsystem pages; items built from source comments cite the file.
 
-*Last audited: 2026-10-26 against the working tree (both git trees dirty, see HANDOFF).* Target device is the **OnePlus 8** unless an item
+*Last audited: 2026-11-07 against the working tree (both git trees dirty, see HANDOFF).* Target device is the **OnePlus 8** unless an item
 says otherwise; the owner asked not to run redwood checks.
 
 **Status:** Not Started · Partial (some of it works) · In Progress (someone is actively changing it) · Blocked (cannot proceed without something named) ·
@@ -23,18 +23,18 @@ ISP ("roadmap修相機 ->其他 -> 最后trustzone和Titan 480 IFE").**
 |---|---|---|---|
 | T01 | Verify the unverified power work on the phone | Built, Unverified | P0 |
 | T02 | Wi-Fi radio through system sleep | Built, Unverified | P0 |
-| T03 | Install the current build / keep installed bundle current | Partial | P1 |
-| T04 | Motion, light and proximity sensors (screen rotation, auto-brightness) | In Progress (OnePlus 8: SLPI boots, empty list) | P1 |
+| T03 | Install the current build / keep installed bundle current | Partial: "Cellular 2026-11-11" installed | P1 |
+| T04 | Motion, light and proximity sensors (screen rotation, auto-brightness) | In Progress (SLPI/SEE unfinished; AP `0x46` probe NACKed) | P1 |
 | T05 | Bluetooth | In Progress | P1 |
-| T06 | Cellular modem, telephony, SMS | Partial: the modem boots (RAM test), no services | P1 |
+| T06 | Cellular modem, telephony, SMS | OnePlus 8: data, SMS and VoLTE calls with sound, installed 2026-11-11 (`cell=1`); level, hold, DTMF, MMS, hotspot open | P1 |
 | T07 | OnePlus 8 cameras | Partial | P1 |
 | T08 | Headphones / USB-C audio | Not Started | P1 |
 | T09 | Fingerprint / biometric authentication | Not Started | P1 |
-| T10 | Metal: from experimental to usable | In Progress | P1 |
+| T10 | Metal: from experimental to usable | In Progress: runs the installed system; daily stutter is T40 | P1 |
 | T11 | Heterogeneous CPU scheduling (Edge) | Partial (working, uncommitted) | P1 |
 | T12 | Sleep power: SoC low-power states | Blocked | P1 |
 | T13 | Battery drain measurement | Not Started | P1 |
-| T14 | Location (GPS) | Partial: Wi-Fi location works by eye on RAM roots; no GNSS | P2 |
+| T14 | Location (GPS) | Partial: Wi-Fi works by eye; generic GNSS reports, no outdoor fix/locationd bridge | P2 |
 | T15 | App Store, Apple ID, FairPlay, push (Secure Enclave dependent) | Blocked | P2 |
 | T16 | Brightness: prove the light changes | Partial | P2 |
 | T17 | CPU time after wake (widgets, chronod) | Partial | P2 |
@@ -58,6 +58,7 @@ ISP ("roadmap修相機 ->其他 -> 最后trustzone和Titan 480 IFE").**
 | T35 | Complete (do not reopen): items that older text made look open | Complete | — |
 | T36 | iphont agent hardware validation and workflow migration | Partial / Built, Unverified | P1 |
 | T38 | The owner's list for after the camera (Wi-Fi list, sound/vibration, wallpaper, Bold Text, clock, screenshots, smoothness, sensors, GPS) | Not Started (after T07) | P1 |
+| T40 | Metal: the stutter of daily use (pipeline cache, image reuse, cache cleaning, memory) | Not Started: plan written, waits for the owner's word | P1 |
 
 ---
 
@@ -88,20 +89,22 @@ ISP ("roadmap修相機 ->其他 -> 最后trustzone和Titan 480 IFE").**
 ## P1
 
 ### T03 Keep the installed bundle current — Boot/Installed · Partial · P1
+- **2026-11-11:** the bundle "Cellular 2026-11-11" was installed at the owner's word into boot slot 1 (`tools/nf/cell/install.sh`, the loader's `fb_install`; K21); "Metal 3 2026-11-06" stays in slot 0. `boot_a`, `boot_b` and the slots' attributes were not written. The lines below are the older state.
 - **State:** the installed bundle and `boot_b` loader were updated 2026-10-25 14:20 (power rounds 1-4). Later work (GPU collapse, brightness, `ca_ambient`, vmd DENY,
   Wi-Fi) is not installed. The latest userland images were built for tests, not the installed recipe.
 - **Next:** `common/flash/install-xl.sh instantnoodle update` after T01 evidence; **requires the owner's explicit OK** (writes the flash). Rebuild with `FLASH_USERLAND_VARS`.
 - **Refs:** [INSTALL.md](INSTALL.md), research/boot-chain-and-recovery.md.
 
-### T04 Motion, light and proximity sensors — Sensors · In Progress (OnePlus 8: SLPI boots, its sensor list is empty) · P1
-- **OnePlus 8, corrected 2026-11-06:** the facts below are redwood's. Here the sensors are on the **SLPI**, not the audio DSP, and it boots: service 400 answers (runs 235547, 000154). Most likely the sensors PD never started [inferred]. Plan and open-source `hexagonrpc`: [research/next-features.md](research/next-features.md) section 4. **2026-11-06: the overlap is fixed in the private tree (`hk_adsp.c`, `0x91b00000`, run 081133: the DSP and iOS's sound through it, not listened to), not yet in `xnu-src`. Next needs the owner there: an SLPI attempt needs a cold reset after it, and a reset with the cable in needs a hand on the phone** (section 17).
+### T04 Motion, light and proximity sensors — Sensors · In Progress (OnePlus 8: SLPI/SEE data path unfinished; AP probe tested) · P1
+- **OnePlus 8, corrected 2026-11-09:** the sensors are on the **SLPI**, not the audio DSP, and the native SLPI/QRTR service boots. Run `214628` used the newly built kernel but the older single `ambient_light` probe; it returned normally with no lux. The next kernel adds `slpi_glink_probe=4`, a bounded sequential SUID inventory for seven datatype names on one QMI client, with transaction validation. The inventory is diagnostic only: it does not start a sensor stream or claim hardware success. The remaining runtime gap is the sensors PD/FastRPC path (`fastrpcglink-apps-dsp`, attach `pd=2`, registry listener `apps_std` handle routing).
 - **Why:** no accelerometer means no screen rotation, no CoreMotion, no auto-brightness (and CoreBrightness's 5 s ALS wait stays).
 - **Facts:** sensors hang off the audio DSP behind its sensor framework ("SEE") via QMI service 400 over QRTR ([thermal.md](subsystems/thermal.md) has the step table:
   DSP started / GLINK / QRTR / services listed = done (`adsp=1`, `hk_adsp.c`; `sysctl kern.hackios.adsp_services`); QRTR ports of our own on the DSP channel, the service locator and notifier
   the DSP's sensor domain waits for, the sensor registry the DSP reads from Android's partitions, a SEE client, delivery as HID events for CoreMotion = **to do**).
 - **Files:** `bsd/dev/hk_adsp.c`, `hk_qmi.c`, `sys/hk_qrtr.h`; new driver; iOS side: a virtual HID accelerometer service in `inject.c` (pattern: the touch service).
 - **Blockers:** sensor registry (Android partitions: `persist`/`vendor`) unavailable without Android; OnePlus 8 firmware needs checking.
-- **Next:** run `adsp=1` and read `kern.hackios.adsp_services` for service 400 (the previous plan's first question; result not recorded).
+- **AP-side probe (run `020629`, bootq #157):** `sensor_probe=1` shared the slider's `se5` bus and ran after `ldoc10`; ODM candidate `0x46` NACKed with error 6, including one recovery retry, while the slider's `0x18`/`0x19` devices worked. This does not identify the fitted ALS/PS part. Host contract is 8/8. The matching BMI26x alternatives use `bus_type=1`/SE3 and the AP FDT's SPI/I2C nodes are disabled, so no AP SPI probe is justified.
+- **Next:** identify the SEE/SLPI SE3 bus and registry/rail sequence, then run one owner-present read-only probe after the required cold reset. Do not scan arbitrary I2C addresses or toggle the named SEE rails from AP code.
 - **Refs:** K07.
 
 ### T05 Bluetooth — Connectivity · In Progress · P1
@@ -124,11 +127,40 @@ ISP ("roadmap修相機 ->其他 -> 最后trustzone和Titan 480 IFE").**
   Opt-in `bt=1` / `BLUETOOTH=1`; nothing flashed. `213836` run: 10/11 (post-wake GATT failed); host parsers/guards PASS.
 
 ### T06 Cellular modem, telephony and SMS — Connectivity · Partial · P1
+
+- **2026-11-11: it works on the OnePlus 8, by another road than the tickets below.** The OnePlus 8 Pro port's modem driver (dekefake/hackios-op8pro, APSL 2.0), moved to this phone behind `cell=1`, registers, carries data, SMS and VoLTE calls with sound, and is installed. What works and how: [subsystems/cellular.md](subsystems/cellular.md); the code: `tools/nf/cell/` and `userland/src/hk_commcenter.m`; what is left: K41. **Next:** move the driver from its overlay build into the normal `./xl build` (it links against the container's nf-tree objects today, `tools/nf/cell/README.md`); the bundle after this one should carry the newer `hk_commcenter`; hold, DTMF on the air, MMS, the level of a call. The tickets below are the record of the tree's first path (`modem=3`), which reached QMI control and the SIM but never registered.
+
+- [#284](../../oneplus8-audit/cellular-data-next/pro-donor-scratch/hardware.json) received modem ACKs for 64 real MCFG bytes across two completed range transfers after a volatile readwrite create/stat/delete cycle. LOW_POWER was refused (60); three backed-off ONLINE requests were refused (52), with OFFLINE and unregistered independently observed.
+- [#283](../../oneplus8-audit/cellular-data-next/pro-donor-efs/hardware.json) started external mission channels 10/11 and received a mode-2 HELLO. The channel has no Sahara transmit payload or verified EFS export-memory mapping. DMS refused ONLINE earlier with 52. Signed UI now distinguishes live values, stopped state, same-boot history and DMS/UIM results.
+- [#282](../../oneplus8-audit/cellular-data-next/pro-donor-integrated/hardware.json) exercised RFS, UIM, DMS/NAS, dual WDS, WDA, zero-payload IP_HW0 and the signed desktop observer in one boot. DMS returned error 52. A later bounded SFR matched the known RemoteFS Sahara completion assertion; the App saw only the stopped provider.
+- [#281](../../oneplus8-audit/cellular-data-next/rfs-server-check/hardware.json) received and discarded the five-byte public marker, then received two read requests. Both were denied by the namespace filter before any file opened. The 90-second UIM sample remained DETECTED with no primary binding, and the modem stayed OFFLINE.
+- [#280](../../oneplus8-audit/cellular-data-next/rfs-wrq-observe/hardware.json) identified two public server-check WRQs, both denied. The initial card was DETECTED/unbound, and DMS already reported SHUTTING_DOWN. The later fault reason matched `assert`/`efs` substrings.
+- [#279](../../oneplus8-audit/cellular-data-next/cold-gw-online/early-ready/hardware.json) reached the early READY gate and received a genuine DMS ONLINE refusal (52, DEVICE_NOT_READY) with 34 °C and two OFFLINE reads. NAS remained unregistered and WDS disconnected; the modem stayed healthy through 250 seconds and recovered normally.
+- [#278](../../oneplus8-audit/cellular-data-next/cold-gw-online/hardware.json) confirmed conditional primary binding and READY on the replacement card. The modem asserted ERRFATAL before the scheduled ONLINE check completed. DMS ONLINE remained unsent, registration is untested, and the complete desktop and stock USB return were verified.
+- [#277](../../oneplus8-audit/cellular-data-next/uim-activate-once/hardware.json) verified one live primary-GW activation, the mapped READY USIM and the signed status app on the same boot. Carrier registration, packet attachment, WDS connectivity and stock CommCenter/Settings integration remain open. The one-time activation grant was consumed.
+
+- [#276](../../oneplus8-audit/cellular-data-next/rfs-uim/hardware.json) reached the read-only AP firmware service (20 denied write requests, zero read requests/bytes). A card indication and solicited UIM readback showed slot 1 present, USIM DETECTED and a successful 22-byte direct ATR. READY, GW binding, carrier registration and a live data bearer remain open.
+
+- [#275](../../oneplus8-audit/cellular-data-next/family-owner/hardware.json) verified separate IPv4/IPv6 WDS clients, raw-IP WDA format, and negative per-family XNU admission against a real UL100 pool when disconnected. Actual bearer establishment, a bound cellular interface and real UL/DL packet transfer remain open.
+
+- [#274](../../oneplus8-audit/cellular-data-next/pdc-native-selected/hardware.json) observed direct MHI EOT for all three control requests. The PDC platform read returned NOT_PROVISIONED and concurrent NAS supplied valid serving state. The source-derived PDC software read on vendor OTA logical index 0 received no matching ACK or indication in its ten-second window; its selection remains unknown.
+
+- [#272](../../oneplus8-audit/stock-cellular-ui/nas-serving-events/hardware.json) received real NAS serving-notification enable and clear ACKs on one client, with no unsolicited change during 12 s. [#273](../../oneplus8-audit/cellular-data-next/pdc-inventory/hardware.json) found the firmware PDC endpoint; its capability and HW/SW inventory requests had no matched replies. Installed and active configuration counts remain unknown.
+
+- [#271](../../oneplus8-audit/stock-cellular-ui/board-frontend/hardware.json) verified the maintained IPCR owner and two private NAS-backed IOKit entries, matching, normal open denial, two valid kernel completions, per-channel withdrawal and full hardware cleanup. Stock Apple UserClient/CommCenter integration, SIM readiness, registration and a carrier bearer are still open.
+
+- [#269](../../oneplus8-audit/stock-cellular-ui/qmux-nas/hardware.json) routed two successful same-transaction NAS replies to separate CIDs/ports. [#270](../../oneplus8-audit/stock-cellular-ui/qmux-owner/hardware.json) routed two modem errors through the single-poller backend and passed the ingress drain/ownership checks. Stock iOS client attachment remains open.
+
+- [#268 stock UI](../../oneplus8-audit/stock-cellular-ui/hardware.json) had an active kernel modem producer while stock Settings showed no Cellular row. The ordinary mobile probe found no Apple PCI baseband/QMUX interface or running stock CommCenter; the stock settings bundle exists. [Bridge boundary and UIM endpoint evidence](../../oneplus8-audit/cellular-data-next/uim-endpoints/README.md).
+
+- [#264 mission inventory](../../oneplus8-audit/cellular-data-next/mhi-inventory/hardware.json) observed the IPCR pair running on event ring 2 and the current control profile's empty channel contexts 100/101. Event rings 7/8 had no allocated contexts. Legacy UIM explicitly marked the first entry invalid and the second entry's NO_ATR error valid. Stock FASTBOOT recovery was verified.
+
+- 2026-11-10, IP_HW0 data path. Transfer doorbells, sparse event rings 7/8 and bounded client polling pass the host simulation. [#265](../../oneplus8-audit/cellular-data-next/mhi-commands/hardware.json) verified both IP data channels can START and RESET without payload buffers on the real modem, preserve the IPCR control pair, and return DMA ownership. [#266](../../oneplus8-audit/cellular-data-next/mhi-rx-receipt/hardware.json) posted one 32,680-byte downlink credit on real ER8 and reclaimed it after acknowledged RESET; it produced zero completions and zero bytes. Actual received data, framing, an active WDS bearer and a live ifnet provider remain open. [Driver and test details](research/next-features.md#sdx55-ip_hw0-transfer-doorbells)
 - **OnePlus 8, corrected 2026-11-06:** no in-SoC modem, so no `qcom,mss` and no PAS start: an external SDX55 on PCIe 2, flashless, its firmware sent by the AP over MHI BHI and Sahara. Plan and risks: [research/next-features.md](research/next-features.md) section 3.
-- **2026-11-06, Boot C (`modem=1`, read only):** the modem's PMIC answers and system 0 may write its PON, so the AP can reset it. The owner: modem up, for GNSS (「連 modem 一起做」); sensors, mobile data and telephony are not picked. `modem=2` (run 035821): the reset works, PCIe 2's link is up at 5 GT/s x2, `17cb:0306` answers in its PBL. `modem=3` (run 071723, private kernel 19c17424): **the SDX55 runs its image: EE 2, MDM2AP status 1, stable for the 60 s watched.** That run's end did not stop the chip; since run 073746 a warm reset does (research/next-features.md section 17). Nothing asked of it: no registration, no QMI yet. **Mission runs are stopped until the supervisor says; `modem_mission=1` is needed.** **Next:** QRTR on `IPCR`, rmtfs with writes in RAM, QMI LOC; land `tools/nf/modem/` in `xnu-src`. Files: `bsd/dev/instantnoodle_modem.c`, `tools/nf/modem/`. Details: research/next-features.md section 17.
-- **Facts:** the modem (MSS, redwood's `qcom,mss@4080000`) is not started; CommCenter (`-noncellular` variant) answers but dies on missing `AppleIPAppender` (SIGSEGV) and
+- **2026-11-06/07, modem/GNSS status:** Boot C and Boot M1 are done: the external SDX55 resets, PCIe 2 enumerates, Sahara sends 15 images, and mission mode stays up. Run `015925` (#156) phone-proved the QRTR MHI adapter, generic QMI LOC service lookup (node 3 port 84), generic Start acceptance (session 1), and 120 generic position reports through about 170 s. The on-phone page fetched `index.html` and repeated `gnss.json` from its own loopback. The run was indoors with zero satellites and no fix, so an outdoor RF run remains the only missing evidence. EFS-Sahara channel 11 completed the read-only HELLO/table/read/RESET exchange separately. The strict allocation-free QRTR wire decoder, transport-independent service/port core, MHI-IPCR adapter, explicit QMI transport and generic LOC tables all pass host tests. **Next:** take one owner-present outdoor RAM-only run using the existing generic path and counter page; then implement only the AP services that run proves necessary. Do not merge EFS-Sahara into QRTR: channels 10/11 are MHI. Files: `bsd/dev/instantnoodle_modem.c`, `tools/nf/modem/`, `bsd/dev/hk_qrtr_core.c`, `bsd/dev/hk_qmi.c`, `bsd/sys/hk_qrtr_wire.h`. Details: research/next-features.md section 17 and `docs/research/gnss-monitor-isolation-20261106.md`.
+- **Facts:** the OnePlus 8's external SDX55 is started only by the opt-in RAM diagnostic above; CommCenter (`-noncellular` variant) answers but dies on missing `AppleIPAppender` (SIGSEGV) and
   `AppleBasebandPCI` (SIGABRT) — stubbing one leaves the other ([research/ios-userland.md](research/ios-userland.md) §4). `vmd` denied.
-- **Next:** start the modem (PAS), QMI services, then IOKit drivers for the baseband path; scope is research-heavy.
+- **Read-only QMI layer (2026-11-07):** bounded DMS Model/Operating Mode, NAS Signal Strength and WDS Packet Service Status schemas/callers now exist and are linked into the private NF kernel. `modem_radio=1` now gives DMS/NAS/WDS separate handles, one query per endpoint and clean teardown; host fixtures pass under ASan/UBSan. The November 10 UIM queries supersede the original deferral. They project slot, card and app state and omit identifiers and PIN data. Ticket #161 was invalid for GNSS/radio evidence because the omitted `wifi=0` let the OnePlus default bring Wi-Fi up and hit the known dirty-ownership gate. The next phone action is an owner-present outdoor RAM-only run after cold reset and explicit `wifi=0`.
 - **Refs:** K06.
 
 ### T07 OnePlus 8 cameras — Camera · Partial · P1
@@ -421,6 +453,7 @@ ISP ("roadmap修相機 ->其他 -> 最后trustzone和Titan 480 IFE").**
   entry points. Siri orb abort history.
 - **Files:** `userland/src/hkmetal.m`, `hkdrawable.m`, `tools/mesa/air/*`, `docs/air.md`.
 - **Next:** make `metal=2` the default only after: chronod pipelines; a Metal app test (e.g. a triangle app exists: `triangle_app.m`); compare Maps visually. Record numbers in air-report.
+- **2026-11-11:** the installed system has run wholly on Metal over Vulkan since "Metal 3" (2026-11-06) by its bundle's line (`metal=2 metal_backend=vk camtl=1`); the kernel's default is unchanged. What the system's own processes still get refused: K42. The stutter of daily use: T40.
 - **Refs:** K01.
 
 ### T11 Heterogeneous CPU scheduling — CPU · Partial (working, uncommitted) · P1
@@ -1192,7 +1225,7 @@ ISP ("roadmap修相機 ->其他 -> 最后trustzone和Titan 480 IFE").**
 ## P2
 
 ### T14 Location (GPS) — Connectivity · Partial · P2
-GNSS belongs to the modem (T06): on the OnePlus 8 the SDX55, via its QMI service 16, with no NMEA channel [observed]. **Only GNSS is blocked by T06.** Location by Wi-Fi is `locationd` and Apple's positioning service: 2026-11-06, the daemon runs and its switch is on from `var.skel` (RAM; `tools/nf/mk_extra.sh loc`). **A root with `locationd` hangs Maps (white screen) while `com.apple.fairplayd.H2`'s job is on it:** `locationd`'s queue waits on fairplayd, which never answers; without that job Maps draws (run 055706). No signatures are forged: Mescal is simply absent. **Interim:** `tools/nf/mk_extra.sh loc` leaves that job off RAM test roots with `locationd`, a choice for the owner to see. Seen on Metal (runs 060829, 083507). **The owner saw Maps load and locate correctly with Wi-Fi joined (run 083507, about 08:43): location by Wi-Fi works on that root.** Earlier text here expecting no fix without Mescal was wrong. **Next:** measure accuracy with `location_test` (one join of Wi-Fi by the owner); decide whether `locationd` and no fairplayd job go in the installed root. **Open:** Settings has no Location Services row; `+[CLLocationManager locationServicesEnabled]` does not come back from `/hackios/bin` (both last seen with fairplayd's job on). Details: [research/next-features.md](research/next-features.md) section 17. Refs: K12.
+GNSS belongs to the modem (T06): on the OnePlus 8 the SDX55, via its QMI service 16, with no NMEA channel [observed]. The generic QRTR/MHI/QMI LOC path is phone-proven in run `015925` (#156): Start was accepted and 120 position reports arrived, all indoors with zero satellites and no fix. **Only outdoor RF evidence and the iOS/locationd bridge remain.** Location by Wi-Fi is `locationd` and Apple's positioning service: 2026-11-06, the daemon runs and its switch is on from `var.skel` (RAM; `tools/nf/mk_extra.sh loc`). **A root with `locationd` hangs Maps (white screen) while `com.apple.fairplayd.H2`'s job is on it:** `locationd`'s queue waits on fairplayd, which never answers; without that job Maps draws (run 055706). No signatures are forged: Mescal is simply absent. **Interim:** `tools/nf/mk_extra.sh loc` leaves that job off RAM test roots with `locationd`, a choice for the owner to see. Seen on Metal (runs 060829, 083507). **The owner saw Maps load and locate correctly with Wi-Fi joined (run 083507, about 08:43): location by Wi-Fi works on that root.** Earlier text here expecting no fix without Mescal was wrong. **Next:** take one owner-present outdoor generic GNSS run, then measure Wi-Fi accuracy with `location_test`; decide whether `locationd` and no fairplayd job go in the installed root. **Open:** Settings has no Location Services row; `+[CLLocationManager locationServicesEnabled]` does not come back from `/hackios/bin` (both last seen with fairplayd's job on). Details: [research/next-features.md](research/next-features.md) section 17. Refs: K12.
 
 ### T15 App Store, Apple ID, FairPlay, push — Services · Blocked · P2
 - **Facts:** App Store LOADING for ever: AMS builds a bag request but the promise never resolves; an AMS thread waits on `fairplayd.H2`, which exits 0 immediately every 10 s
@@ -1297,6 +1330,19 @@ The Python CLI, native loader/kernel mailbox, event logging, userspace bridge, d
 - **Not exercised with the pipes on:** three failed pushes, a panic, system sleep, HBM.
 - **Installed boots:** not installed. Publishing also needs `xnu/export.sh` fixed (`BUILD_*` in its pattern) and the sources exported.
 - Later: UBWC between the GPU and the pipes; a frame's dirty region (a command-mode panel can take a partial update).
+
+### T40 Metal: the stutter of daily use — GPU/Graphics · Not Started · P1
+- **State:** analysed 2026-11-11 from the installed system's logs and the source (K35, the "daily use" entry); nothing written, nothing run. About 1 frame in 10 is late; the GPU is idle most of the time; the suspects are all on the compositor's CPU thread. **The owner has not said to start.**
+- **Step 0, measure:** one RAM boot with hkmetal's per-stage statistics on (the probe file `share/probes/metal_stats` in the root), the owner using the phone as usual for two minutes: recording, waiting, pipelines, image allocation and copies per 5 s. Every later step is compared with the same measure.
+- **Step 1, pipelines:** a pipeline cache on disk, seeded at build time; the common ones built at the compositor's start; no pipeline built twice. Check: late frames and the longest pause in windows where pipelines are built, same no-finger script. Shader translation went from 26.7 s to 2.8 s for the compositor by the same means (measured earlier).
+- **Step 2, big images:** whole-screen images kept and reused (8-9 ms each today); memoryless 4x targets made truly lazy (`VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT`), 35-76 ms each. Check: allocations over 5 ms near zero.
+- **Step 3, what every frame pays:** clean the CPU's cache only for a surface the CPU wrote or will read (`HKGPU.cpp`, about 0.5 ms a submission); cache IOSurface imports by surface id (0.35-1.1 ms each). Check: the kernel's own figures, and that screenshots and app snapshots never show an old picture.
+- **Step 4, memory:** K40, by a run of 12 minutes or more.
+- **Also, no code:** one run at 60 Hz for the owner's eye (16.7 ms a frame instead of 11.1: an even 60 may look better than an uneven 60-90); the GPU's top step at 587 MHz.
+- **Later, for games rather than the interface:** keep a draw that reads its own target in its pass with the three Vulkan extensions Turnip declares (K35); YUV to RGB on the GPU; a first-image NEON path is the cheap half of that.
+- **Not worth it:** writing a Metal driver straight onto the GPU. It removes one layer and the pass splitting, but pipelines would still have to be compiled, and the allocation, cache and memory costs are below that layer. Mesa's Adreno back end and compiler are years of reverse engineering.
+- **Rules:** each step behind a switch, verified on RAM boots, installed only after the owner has looked. The next install overwrites slot 0 ("Metal 3").
+- **Refs:** K35, K40, K42, `docs/air.md`, `userland/src/hkmetal.m`, `tools/mesa/air/`.
 
 ## Complete — do not reopen (older documents made these look unfinished)
 - Speakers on the OnePlus 8 (heard by the owner 2026-10-24); the alert slider; the main microphone (owner's claps); App Library grey pods (fixed 2026-10-25); iOS shadows "too large" (owner: resolved);

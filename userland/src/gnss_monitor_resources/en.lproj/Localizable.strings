@@ -1,0 +1,3 @@
+"settings.open.title" = "Open Settings for this app";
+"settings.open.failed" = "iOS could not open Settings for this app.";
+"settings.location.denied" = "Location access is unavailable. Check permissions in Settings for this app.";

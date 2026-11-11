@@ -77,6 +77,52 @@ static struct instantnoodle_i2c bus = {
 #define OPF_20HZ                0x70
 #define CNTL2_40MT              0x2c            /* (GAIN_4_TIME | ADC_RES_10_BIT) & 0x1e | GAIN_2_TIME */
 
+/*
+ * ODM's sensor alternatives put an I2C ALS/proximity candidate at bus 5, address 0x46.  Keep this
+ * diagnostic beside the slider so it uses the same bus object and lock: another struct for GPIO 4/5
+ * would permit two transfers on the same wires at once.  The bytes below are deliberately raw.  The
+ * fitted part (and therefore its ID register) is not established yet, so this probe does not name an
+ * STK or BMI device and does not write a sensor register.
+ */
+#define SENSOR_PROBE_ADDR       0x46
+
+static void
+sensor_probe(void)
+{
+	uint32_t enabled = 0;
+	uint8_t raw[4] = { 0 };
+	int err;
+
+	if (!instantnoodle_board() || !PE_parse_boot_argn("sensor_probe", &enabled, sizeof(enabled)) || enabled == 0) {
+		return;
+	}
+	say("sensor-probe: se5 GPIO4/5 cfg %#x/%#x io %#x/%#x; addr %#x, read-only\n",
+	    instantnoodle_gpio_cfg(bus.sda), instantnoodle_gpio_cfg(bus.scl), instantnoodle_gpio_io(bus.sda),
+	    instantnoodle_gpio_io(bus.scl), SENSOR_PROBE_ADDR);
+
+	/* Address-only ACK first.  This does not select or write a sensor register. */
+	err = instantnoodle_i2c_write(&bus, SENSOR_PROBE_ADDR, NULL, 0);
+	if (err != 0) {
+		say("sensor-probe: addr %#x ACK error %d; one bus recovery and retry\n", SENSOR_PROBE_ADDR, err);
+		instantnoodle_i2c_recover(&bus);
+		err = instantnoodle_i2c_write(&bus, SENSOR_PROBE_ADDR, NULL, 0);
+	}
+	if (err != 0) {
+		say("sensor-probe: addr %#x no ACK after recovery (%d)\n", SENSOR_PROBE_ADDR, err);
+		return;
+	}
+	say("sensor-probe: addr %#x ACK\n", SENSOR_PROBE_ADDR);
+
+	/* Read four raw bytes from register zero; no configuration or reset command is sent. */
+	err = instantnoodle_i2c_read(&bus, SENSOR_PROBE_ADDR, 0, raw, sizeof(raw));
+	if (err != 0) {
+		say("sensor-probe: addr %#x raw[0..3] read error %d\n", SENSOR_PROBE_ADDR, err);
+		return;
+	}
+	say("sensor-probe: addr %#x raw[0..3] %#02x %#02x %#02x %#02x (identity unclassified)\n",
+	    SENSOR_PROBE_ADDR, raw[0], raw[1], raw[2], raw[3]);
+}
+
 SYSCTL_DECL(_kern_hackios);
 static uint32_t position;               /* HK_SLIDER_*, 0 while not known */
 SYSCTL_UINT(_kern_hackios, OID_AUTO, slider, CTLFLAG_RD | CTLFLAG_LOCKED, &position, 0, "the alert slider: 1 down, 2 middle, 3 up");
@@ -221,6 +267,9 @@ slider_thread(__unused void *parameter, __unused wait_result_t result)
 		say("slider: no supply for the sensors: the alert slider is not read\n");
 		thread_terminate(current_thread());
 	}
+	/* The ODM ALS/PS candidate shares this rail.  Probe only after the existing
+	 * slider owner has enabled it; the probe itself remains read-only. */
+	sensor_probe();
 	delay_for_interval(20, NSEC_PER_MSEC);
 	if (!sensor_init(ADDR_UP, "up") || !sensor_init(ADDR_DOWN, "down")) {
 		say("slider: the alert slider is not read\n");
@@ -260,7 +309,10 @@ instantnoodle_slider_init(void)
 	thread_t thread;
 
 	PE_parse_boot_argn("slider", &on, sizeof(on));
-	if (!instantnoodle_board() || on == 0) {
+	if (!instantnoodle_board()) {
+		return;
+	}
+	if (on == 0) {
 		return;
 	}
 	if (kernel_thread_start(slider_thread, NULL, &thread) == KERN_SUCCESS) {

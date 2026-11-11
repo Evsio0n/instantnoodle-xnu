@@ -1186,7 +1186,17 @@ input_thread(__unused void *arg)
 		if (count++ < 4) {
 			say("redwood: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
 		}
-		if (t.type > HK_TOUCH_UP) {
+		if (t.type == HK_TOUCH_WAKE) {
+			uint64_t now = mach_absolute_time();
+			if (buttons != NULL && (touch_mode & 0xff) == TOUCH_MODE_WAKE &&
+			    now >= t.time && micros(now - t.time) <= 500000) {
+				struct hk_touch press = { .time = t.time, .type = HK_BUTTON_DOWN, .finger = HK_BUTTON_LOCK };
+				send_button(buttons, &press);
+				press.type = HK_BUTTON_UP;
+				send_button(buttons, &press);
+				say("instantnoodle: dark-screen tap delivered in wake mode\n");
+			}
+		} else if (t.type > HK_TOUCH_UP) {
 			if (buttons != NULL) {
 				send_button(buttons, &t);
 			}

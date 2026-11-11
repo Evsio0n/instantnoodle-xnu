@@ -1,0 +1,66 @@
+/* Compile the existing software-device fixture, never its destructive run.sh.
+ * Real mhi_host.c linked separately; only the device's write callback is fault-injected.
+ */
+#define main existing_mhi_main
+#include "@FIXTURE@"
+#undef main
+static unsigned reset_requests, image_requests;
+static bool refuse_reset;
+static void fault_write(void *c, uint32_t offset, uint32_t value) {
+ if (offset == MHI_REG_MHICTRL && (value & MHI_CTRL_RESET)) {
+  reset_requests++;
+  if (refuse_reset) {
+   pthread_mutex_lock(&dev.lock); *reg(offset) = value; pthread_mutex_unlock(&dev.lock);
+   return; /* RESET remains set forever, no AFTER_RESET scheduled. */
+  }
+ }
+ if (offset == BHI + MHI_BHI_IMGTXDB) image_requests++;
+ op_write(c, offset, value);
+}
+int main(int argc, char **argv) {
+ /* Existing suite executes production MHI host against its simulated device. */
+ if (existing_mhi_main(1, argv)) return 1;
+ arena_used = 0; arena = aligned_alloc(4096, ARENA);
+ struct mhi_host h = {0}; struct mhi_host_config cfg = config();
+ struct mhi_host_ops fault_ops = ops; fault_ops.write = fault_write;
+ cfg.timeout_ms = 20;
+ device_init(image, sizeof(image), 512 * 1024);
+ dev.state = MHI_HOST_STATE_SYS_ERR; set_status();
+ CHECK(mhi_host_init(&h, &fault_ops, NULL, &cfg) == 0);
+ refuse_reset = true;
+ CHECK(mhi_host_power_up(&h) == EIO); /* reset timeout intentionally maps to EIO */
+ CHECK(reset_requests == 1 && image_requests == 0);
+ CHECK(!h.powered && h.allocated);
+ CHECK(pthread_mutex_trylock(&host_lock) == 0); pthread_mutex_unlock(&host_lock);
+ /* A failed power-up is not proof of hardware DMA quiescence. No claim of that here. */
+
+ /* A failed power-down is different: the reset bit is still asserted, so a
+  * caller must refuse DMA/SMMU release until a power-cycle recovery succeeds. */
+ refuse_reset = false; reset_requests = image_requests = 0;
+ device_init(image, sizeof(image), 512 * 1024);
+ CHECK(mhi_host_power_up(&h) == 0);
+ /* A running device entering SYS_ERR is also an ownership failure. The
+  * status callback is asynchronous in the real layer; service() models the
+  * same interrupt/poll observation before any teardown is attempted. */
+ pthread_mutex_lock(&dev.lock);
+ dev.state = MHI_HOST_STATE_SYS_ERR;
+ set_status();
+ pthread_mutex_unlock(&dev.lock);
+ mhi_host_interrupt(&h, -1);
+ CHECK(!mhi_host_ownership_clean(&h));
+ refuse_reset = false;
+ device_init(image, sizeof(image), 512 * 1024);
+ CHECK(mhi_host_power_up(&h) == 0 && mhi_host_ownership_clean(&h));
+ reset_requests = 0; refuse_reset = true;
+ CHECK(mhi_host_power_down(&h) == EIO);
+ CHECK(reset_requests == 1 && !h.powered && !mhi_host_ownership_clean(&h));
+ CHECK((*reg(MHI_REG_MHICTRL) & MHI_CTRL_RESET) != 0);
+ /* The fixture's device_init models the external power-cycle/recovery step. */
+ refuse_reset = false;
+ device_init(image, sizeof(image), 512 * 1024);
+ CHECK(mhi_host_power_up(&h) == 0 && mhi_host_ownership_clean(&h));
+ CHECK(mhi_host_power_down(&h) == 0 && mhi_host_ownership_clean(&h));
+ free(arena);
+ printf("reset-timeout: power-up and power-down faults fail closed; recovery precedes DMA release; %u checks, %u failed\n", checks, failures);
+ return failures != 0;
+}

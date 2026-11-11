@@ -17,6 +17,9 @@
 
 #define PATTERN_SIZE    300000
 #define RB_HALT         0x08
+#ifndef ENOENT
+#define ENOENT 2
+#endif
 
 static int checks, failures;
 
@@ -111,6 +114,72 @@ synthetic_dir(const char *path)
 		printf("  synthetic directory %s: %s\n", path, strerror(errno));
 	}
 	return ok;
+}
+
+/* Compare the stock application directory on either side of an additive RAM mount.
+ * Only the new bundle is excluded. Track both names and inode numbers. */
+struct app_view {
+	unsigned count;
+	uint64_t fingerprint;
+};
+
+static int
+stock_app_view(struct app_view *view)
+{
+	char buffer[4096];
+	off_t pos = 0;
+	int fd = open("/flash/Applications", O_RDONLY | O_DIRECTORY, 0);
+	if (fd < 0) return 0;
+	*view = (struct app_view){0};
+	ssize_t n;
+	while ((n = getdirentries(fd, buffer, sizeof(buffer), &pos)) > 0) {
+		for (char *at = buffer; at < buffer + n;) {
+			struct dirent *e = (struct dirent *)(void *)at;
+			size_t header = __builtin_offsetof(struct dirent, d_name);
+			size_t remaining = (size_t)(buffer+n-at);
+			if (remaining <= header || e->d_reclen <= header || e->d_reclen > remaining ||
+			    e->d_namlen >= sizeof(e->d_name) || header+e->d_namlen >= e->d_reclen ||
+			    e->d_name[e->d_namlen] != 0) {
+				close(fd);
+				return 0;
+			}
+			at += e->d_reclen;
+			size_t len = e->d_namlen;
+			if (len <= 4 || strcmp(e->d_name+len-4,".app") || !strcmp(e->d_name,"GNSSMonitor.app"))
+				continue;
+			uint64_t h = 14695981039346656037ULL;
+			for (size_t j=0; j<len; j++) h = (h ^ (unsigned char)e->d_name[j]) * 1099511628211ULL;
+			view->fingerprint += h ^ e->d_ino;
+			view->count++;
+		}
+	}
+	close(fd);
+	return n == 0 && view->count > 0;
+}
+
+static void
+mount_gnss_bundle(void)
+{
+	const char *target = "/flash/Applications/GNSSMonitor.app";
+	struct app_view before = {0}, after = {0};
+	struct stat settings_before, settings_after, bundle;
+	int has_stock = stock_app_view(&before) &&
+	    stat("/flash/Applications/Preferences.app/Preferences", &settings_before) == 0;
+	check(has_stock, "stock applications and Settings available before GNSS staging");
+	if (!has_stock) return;
+	/* Keep the original Applications directory on its own mount. Only introduce
+	 * the individual signed diagnostic bundle. Existing app vnodes stay intact. */
+	int exposed = stat(target, &bundle) != 0 && errno == ENOENT && synthetic_dir(target) &&
+	    bind_dir(in_image("/Applications/GNSSMonitor.app"), target) &&
+	    stat("/flash/Applications/GNSSMonitor.app/GNSSMonitor", &bundle) == 0;
+	int intact = stock_app_view(&after) && before.count == after.count &&
+	    before.fingerprint == after.fingerprint &&
+	    stat("/flash/Applications/Preferences.app/Preferences", &settings_after) == 0 &&
+	    settings_before.st_dev == settings_after.st_dev && settings_before.st_ino == settings_after.st_ino;
+	printf("app-view: stock_before=%u stock_after=%u settings_same=%d owned_bundle=%d\n",
+	    before.count, after.count, intact, exposed);
+	check(intact, "original Applications directory and Settings preserved");
+	check(exposed && intact, "GNSSMonitor bundle visible under /Applications on the RAM profile");
 }
 
 /*
@@ -266,7 +335,12 @@ flash_root(const char *dev)
 	printf("  %d applications waiting to be installed, %d of them in /Applications\n", apps, bound);
 	check(apps > 0 && bound == apps, "the first boot's applications in /Applications");
 
-	ok = sysctlbyname("kern.hk_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
+	const char *gnss_mode = boot_arg("modem_gnss");
+	if (gnss_mode && strcmp(gnss_mode, "2") == 0 &&
+	    stat(in_image("/Applications/GNSSMonitor.app/Info.plist"), &fw_st) == 0)
+		mount_gnss_bundle();
+
+    ok = sysctlbyname("kern.hk_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
 	if (!ok) {
 		printf("  switching the root: %s\n", strerror(errno));
 	}

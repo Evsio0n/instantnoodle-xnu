@@ -1,7 +1,7 @@
 /* Default-off stage1 only: read SMEM metadata; never starts/stops/acks a DSP. */
 #include <vm/memory_types.h>
 #include <sys/instantnoodle.h>
-#include "slpi_smem_ro.h"
+#include "slpi_oem130_ro.h"
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t,vm_size_t,unsigned int);
 extern void ml_io_unmap(vm_offset_t,vm_size_t);
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
@@ -26,6 +26,20 @@ static void instantnoodle_slpi_probe_init(void){
  struct slpi_report report;const char *why=slpi_observe(slpi_ro_read,(void *)mapped,&report);
  if(why){snprintf(line,sizeof(line),"slpi-ro: observation rejected: %s\n",why);slpi_ro_log(line);}
  else{
+  struct so130_observation oem={0};
+  const char *status=so130_observe(slpi_ro_read,(void *)mapped,&report,&oem);
+  snprintf(line,sizeof(line),"slpi-oem130: status=%s global_partitions=%u hits=%u bytes=%u\n",
+           status,report.global_partitions,report.global130_count,report.global130.bytes);
+  slpi_ro_log(line);
+  if(oem.checked){
+   for(unsigned i=0;i<SO130_TYPES;i++){
+    snprintf(line,sizeof(line),"slpi-oem130: type=%u id=%u slots(name,bus,dir,irq)=%02x%02x%02x%02x,%02x%02x%02x%02x,%02x%02x%02x%02x\n",
+     so130_types[i],oem.type[i].id,oem.type[i].slot[0][0],oem.type[i].slot[0][1],oem.type[i].slot[0][2],oem.type[i].slot[0][3],
+     oem.type[i].slot[1][0],oem.type[i].slot[1][1],oem.type[i].slot[1][2],oem.type[i].slot[1][3],
+     oem.type[i].slot[2][0],oem.type[i].slot[2][1],oem.type[i].slot[2][2],oem.type[i].slot[2][3]);
+    slpi_ro_log(line);
+   }
+  }
   snprintf(line,sizeof(line),"slpi-ro: PID0/3 partition offset=%x size=%x selected-items=%u\n",report.remote_partition,report.remote_bytes,report.found);slpi_ro_log(line);
   for(unsigned i=0;i<6;i++)if(report.items[i].bytes){
    struct slpi_item *it=&report.items[i];snprintf(line,sizeof(line),"slpi-ro: item%u hosts%u/%u offset=%x bytes=%u\n",it->id,it->host0,it->host1,it->offset,it->bytes);slpi_ro_log(line);

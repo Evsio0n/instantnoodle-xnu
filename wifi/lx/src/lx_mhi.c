@@ -34,6 +34,7 @@ static struct {
 	const struct firmware *firmware;
 	int vectors[MHI_HOST_EVENT_RINGS + 1];	/* the argument of each interrupt's handler: its vector */
 	bool irqs;				/* requested */
+	bool power_down_dirty;			/* reset did not complete: retain ownership until recovery */
 	volatile bool looking, looks;		/* the thread that looks: wanted, running */
 } mhi;
 
@@ -232,6 +233,11 @@ void
 linuxkpi_mhi_free_controller(struct mhi_controller *c)
 {
 	if (c == mhi.c) {
+		/* These upstream interfaces are void: returning from a refused free
+		 * would let the caller free the IRQ array and enclosing ath11k object.
+		 * Stop before that lifetime is lost; this is containment, not recovery. */
+		if (!mhi_ownership_clean() || (mhi.host.allocated && mhi.host.powered))
+			lx_os_panic("lx: mhi: controller free before verified shutdown");
 		mhi.c = NULL;
 	}
 	kfree(c);
@@ -261,6 +267,8 @@ linuxkpi_mhi_unregister_controller(struct mhi_controller *c)
 	if (c != mhi.c) {
 		return;
 	}
+	if (!mhi_ownership_clean() || (mhi.host.allocated && mhi.host.powered))
+		lx_os_panic("lx: mhi: controller unregister before verified shutdown");
 	looking(false);
 	irqs_free();
 	c->mhi_dev = NULL;
@@ -340,7 +348,7 @@ mhi_sync_power_up(struct mhi_controller *c)
 {
 	int error;
 
-	if (c != mhi.c || !mhi.host.allocated) {
+	if (c == NULL || c != mhi.c || !mhi.host.allocated) {
 		return (-EINVAL);
 	}
 	/*
@@ -354,6 +362,7 @@ mhi_sync_power_up(struct mhi_controller *c)
 		looking(false);
 		return (-error);
 	}
+	__atomic_store_n(&mhi.power_down_dirty, false, __ATOMIC_RELEASE);
 	return (0);
 }
 
@@ -371,7 +380,7 @@ mhi_power_down(struct mhi_controller *c, bool graceful)
 	}
 	lx_os_qrtr_attach(NULL);
 	looking(false);
-	mhi_host_power_down(&mhi.host);
+	if (mhi_host_power_down(&mhi.host) != 0) mhi_ownership_hold();
 }
 
 void
@@ -387,6 +396,20 @@ mhi_unprepare_after_power_down(struct mhi_controller *c)
 	if (c == mhi.c) {
 		irqs_free();
 	}
+}
+
+bool
+mhi_ownership_clean(void)
+{
+	/* Losing the controller pointer is not proof that its device stopped. */
+	return (!__atomic_load_n(&mhi.power_down_dirty, __ATOMIC_ACQUIRE) &&
+	    (!mhi.host.allocated || mhi_host_ownership_clean(&mhi.host)));
+}
+
+void
+mhi_ownership_hold(void)
+{
+	__atomic_store_n(&mhi.power_down_dirty, true, __ATOMIC_RELEASE);
 }
 
 int

@@ -1,5 +1,5 @@
 #!/bin/bash
-# tools/nf/mk_extra.sh [bt] [loc] [slpi] [ipa]: what the next-features round adds to a test root, in out/nf-extra/ (mk_root.sh lays it over the root, and takes away
+# tools/nf/mk_extra.sh [bt] [loc] [slpi] [ipa] [gnss]: what the next-features round adds to a test root, in out/nf-extra/ (mk_root.sh lays it over the root, and takes away
 # what out/nf-extra/.remove names): bt = what userland/build.sh's BLUETOOTH=1 adds; loc = iOS's location daemon's job, let through mkjobs.py's DENY.
 # Apple's and the vendor's files stay in out/ and fw-bt/, out of git. The programs are made in the container by tools/nf/mk_media.sh.
 set -e
@@ -49,6 +49,11 @@ PLIST
 		mkdir -p $X/bin
 		cp out/nf-media/hkinstall $X/bin/
 		codesign -s - -f --entitlements userland/src/hkinstall.entitlements $X/bin/hkinstall 2>&1 | tail -1
+		;;
+	gnss)
+		mkdir -p $X/bin $X/share/gnss-monitor
+		cp userland/obj/hkhttpd $X/bin/
+		cp tools/nf/gnss-monitor/index.html $X/share/gnss-monitor/
 		;;
 	slpi)
 		# The sensor DSP's firmware, as hk_slpi_boot.c reads it from fw/: the .mdt and b02 to b21, read from the phone's modem partition (not in git); b00 and b01 are in the .mdt

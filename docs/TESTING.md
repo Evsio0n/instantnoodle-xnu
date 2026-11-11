@@ -169,6 +169,10 @@ Two figures, and a report gives both:
 
 The owner's page (`tools/metal/loop/eye.py`, http://127.0.0.1:8765/) shows the same queue, from `tools/bootq status --json`, which reads the queue's files and never asks the phone.
 
+The panel publishes one integration build. Each feature row carries a status, a short result and its evidence. Run `python3 tools/metal/loop/release_catalog.py update-feature ID STATE DETAIL EVIDENCE` after a feature milestone. When the source build hashes still match, the updated evidence survives publishing that manifest again. The trusted file `tools/metal/loop/diagnostics.json` maps diagnostic names to fixed local runners. Editing the profile file takes effect on the next request. HTTP clients can select a profile, but cannot supply a command line.
+
+On this Mac, a recorded IN2010 DMA quarantine appears in `tools/bootq status --json` and on the panel. `tools/bootq recover --ticket N` reserves a recovery-only job scoped to that exact incident. The normal queue waits for a witnessed hard reset through stock ABL and a fresh, idle Developer-mode USB session. The owner panel uses a 24-hour initial transport wait. A USB disappearance, elapsed cooling timer or a returned kernel does not establish that proof.
+
 Several sessions and the owner's test page share one phone. `xl`'s lock says only that it is busy now, so waiters raced each other, nobody could see who was next, and a waiter could not be taken back. Every boot goes through the queue:
 
 ```bash
@@ -187,3 +191,13 @@ tools/bootq cancel 12
 - **`--no-touch`** says a finger spoils the run; `status` shows it, so tell the owner to keep off. **`--max`** is only a note: past it `status` says OVERDUE and nothing is stopped.
 - **Exit codes:** the command's own, 75 no run log, 124 `--wait` passed, 125 cancelled while waiting. Inside a ticket (`BOOTQ_TICKET` set), `run` just runs the command, so a script and what it calls can both use it.
 - The state is in `/tmp/hackios-bootq`, outside every working copy, as `xl`'s locks are. A ticket whose process died is dropped. `tools/bootq_test.py` tests all of this against a pretend phone (verified on this Mac; no phone is touched).
+
+## GNSS Monitor foreground measurement
+
+`python3 tools/nf/modem/gnss_fix_ticket.py` verifies the pinned kernel, APFS and command line on the host. Add `--run` to submit a bounded RAM diagnostic. The queue receipt separately records the actual application and plist hashes seen at /Applications, SpringBoard launch and foreground, accepted LOC session, fresh satellite measurements, and any user-initiated Core Location callback. Only a foreground tap in GNSS Monitor requests the normal When In Use permission. The default run classifies its surroundings as unspecified. No coordinate is included in its host results.
+
+Pass a completed ticket to `python3 tools/metal/loop/receipt_matrix.py gnss-fix TICKET` to preview its matrix evidence, adding `--apply` to replay publication. Successful GNSS workers normally launch a bounded host-only recorder that waits for bootq to commit terminal history. It checks the original command, pinned files, matching app identity, raw coordinate-free samples and modem teardown. A modem fix and an authorized public callback update their respective features independently. Profile runs do not establish outdoor conditions or the origin of Core Location's callback.
+
+### GNSS app discovery after #228
+
+`python3 tools/nf/modem/gnss_discovery.py` verifies the independently signed app profile offline. Add `--run` for one queue-owned RAM case. It reads LaunchServices as mobile for GNSS Monitor and a Settings control, captures a matching registered path and both app digests, and reports ordinary native foreground separately. On-device Safari can open `http://127.0.0.1:8765/`; its user-selected link uses the app’s own URL scheme. The icon is another normal launch path. Opening the app does not request location; that is a separate foreground button. Signed profile eligibility on this physical device is enforced by iOS. A normal development IPA is retained privately for a paired, eligible device’s standard Xcode/Apple Configurator installation if the system app view is not registered.

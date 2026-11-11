@@ -673,6 +673,10 @@ to_handler(struct qmi_state *s, uint8_t type, uint16_t id, uint16_t message, uin
 	os_free(decoded, h->decoded_size);
 }
 
+/* Keep the transaction layout shared with the linked Wi-Fi driver intact.
+ * Only hk_qmi_txn_init_projected can place this private tag in txn->ei. */
+static struct qmi_elem_info projection_tag;
+
 /* The router has a datagram for us. */
 static void
 qmi_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
@@ -698,8 +702,23 @@ qmi_receive(void *context, uint32_t node, uint32_t port, const void *data, size_
 		os_lock(&s->lock);
 		found = find_transaction(s, NULL, id);
 		txn = found != NULL ? *found : NULL;
+		/* A transaction number alone is not an address or a message type. A
+		 * stale response from a previous service must not complete this one. */
+		if (txn != NULL && (!txn->bound || txn->peer_node != node ||
+		    txn->peer_port != port || txn->message != message || txn->done)) {
+			os_unlock(&s->lock);
+			return;
+		}
 		if (txn != NULL && !txn->done && txn->ei != NULL && txn->dest != NULL) {
-			txn->result = hk_qmi_decode(data, length, txn->ei, txn->dest);
+			txn->result = txn->validate != NULL ? txn->validate(data, length) : 0;
+			if (txn->result == 0) {
+				if (txn->ei == &projection_tag) {
+					const struct hk_qmi_projection *p = txn->dest;
+					txn->result = p->decode(data, length, p->output);
+				} else {
+					txn->result = hk_qmi_decode(data, length, txn->ei, txn->dest);
+				}
+			}
 			txn->done = true;
 			os_wake(&s->lock, txn);
 			os_unlock(&s->lock);
@@ -729,6 +748,16 @@ qmi_server(void *context, bool arrived, uint32_t service, uint32_t version, uint
 	svc = *p;
 	if (!arrived && svc != NULL) {
 		*p = svc->next;
+		if (s->connected && s->peer_node == node && s->peer_port == port) {
+			s->connected = false;
+		}
+		for (struct qmi_txn *txn = s->transactions; txn != NULL; txn = txn->next) {
+			if (!txn->done && txn->bound && txn->peer_node == node && txn->peer_port == port) {
+				txn->result = -ENOTCONN;
+				txn->done = true;
+				os_wake(&s->lock, txn);
+			}
+		}
 	}
 	os_unlock(&s->lock);
 
@@ -759,11 +788,14 @@ qmi_server(void *context, bool arrived, uint32_t service, uint32_t version, uint
 }
 
 int
-qmi_handle_init(struct qmi_handle *qmi, size_t largest, const struct qmi_ops *ops, const struct qmi_msg_handler *handlers)
+qmi_handle_init_transport(struct qmi_handle *qmi, size_t largest, const struct qmi_ops *ops,
+    const struct qmi_msg_handler *handlers, const struct hk_qrtr_ops *transport)
 {
-	const struct hk_qrtr_ops *transport = qmi_transport;
 	struct qmi_state *s;
 
+	if (qmi == NULL) {
+		return -EINVAL;
+	}
 	qmi->sock = NULL;
 	if (transport == NULL) {
 		return -ENXIO;
@@ -789,6 +821,12 @@ qmi_handle_init(struct qmi_handle *qmi, size_t largest, const struct qmi_ops *op
 		return -ENXIO;
 	}
 	return 0;
+}
+
+int
+qmi_handle_init(struct qmi_handle *qmi, size_t largest, const struct qmi_ops *ops, const struct qmi_msg_handler *handlers)
+{
+	return qmi_handle_init_transport(qmi, largest, ops, handlers, qmi_transport);
 }
 
 /* Nobody may be waiting in qmi_txn_wait() on this handle any more. */
@@ -841,18 +879,21 @@ hk_qmi_connect(struct socket *sock, uint32_t node, uint32_t port)
 }
 
 int
-qmi_txn_init(struct qmi_handle *qmi, struct qmi_txn *txn, const struct qmi_elem_info *ei, void *structure)
+qmi_txn_init_checked(struct qmi_handle *qmi, struct qmi_txn *txn,
+    const struct qmi_elem_info *ei, void *structure,
+    int (*validate)(const void *data, size_t length))
 {
 	struct qmi_state *s = state_of(qmi);
 	uint16_t id;
 
-	memset(txn, 0, sizeof(*txn));
-	if (s == NULL) {
+	if (s == NULL || txn == NULL) {
 		return -EINVAL;
 	}
+	memset(txn, 0, sizeof(*txn));
 	txn->qmi = qmi;
 	txn->ei = ei;
 	txn->dest = structure;
+	txn->validate = validate;
 	os_lock(&s->lock);
 	/* the next number nobody else has (0 to 65534, round and round) */
 	for (id = (uint16_t)(s->last_id + 1);; id++) {
@@ -876,30 +917,35 @@ qmi_txn_init(struct qmi_handle *qmi, struct qmi_txn *txn, const struct qmi_elem_
 }
 
 int
+qmi_txn_init(struct qmi_handle *qmi, struct qmi_txn *txn, const struct qmi_elem_info *ei, void *structure)
+{
+	return qmi_txn_init_checked(qmi, txn, ei, structure, NULL);
+}
+
+int
+hk_qmi_txn_init_projected(struct qmi_handle *qmi, struct qmi_txn *txn, struct hk_qmi_projection *projection)
+{
+	if (projection == NULL || projection->decode == NULL || projection->output == NULL) {
+		return -EINVAL;
+	}
+	return qmi_txn_init_checked(qmi, txn, &projection_tag, projection, NULL);
+}
+
+int
 qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, int msg_id, size_t largest,
     const struct qmi_elem_info *ei, const void *structure)
 {
 	struct qmi_state *s = state_of(qmi);
 	uint32_t node, port;
-	bool connected;
-	size_t size = largest + QMI_HEADER_SIZE;
+	size_t size;
 	void *buffer;
 	int length, error;
 
-	if (s == NULL || txn == NULL) {
+	if (s == NULL || txn == NULL || txn->qmi != qmi ||
+	    msg_id < 0 || msg_id > UINT16_MAX || largest > UINT16_MAX) {
 		return -EINVAL;
 	}
-	os_lock(&s->lock);
-	connected = s->connected;
-	node = s->peer_node;
-	port = s->peer_port;
-	os_unlock(&s->lock);
-	if (sq != NULL) {
-		node = sq->sq_node;
-		port = sq->sq_port;
-	} else if (!connected) {
-		return -ENOTCONN;
-	}
+	size = largest + QMI_HEADER_SIZE;
 	buffer = os_alloc(size);
 	if (buffer == NULL) {
 		return -ENOMEM;
@@ -908,6 +954,27 @@ qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_tx
 	if (length < 0) {
 		os_free(buffer, size);
 		return length;
+	}
+	/* Resolve and bind after allocation/encoding, so a service removed while
+	 * those slept cannot leave a stale connected endpoint in this request. */
+	os_lock(&s->lock);
+	if (find_transaction(s, txn, 0) == NULL || txn->done) {
+		error = -EINVAL;
+	} else if (sq == NULL && !s->connected) {
+		error = -ENOTCONN;
+	} else {
+		node = sq != NULL ? sq->sq_node : s->peer_node;
+		port = sq != NULL ? sq->sq_port : s->peer_port;
+		txn->peer_node = node;
+		txn->peer_port = port;
+		txn->message = (uint16_t)msg_id;
+		txn->bound = true;
+		error = 0;
+	}
+	os_unlock(&s->lock);
+	if (error != 0) {
+		os_free(buffer, size);
+		return error;
 	}
 	error = s->transport->send(s->port, node, port, buffer, (size_t)length);
 	os_free(buffer, size);
@@ -929,6 +996,26 @@ qmi_txn_cancel(struct qmi_txn *txn)
 		*found = txn->next;
 	}
 	os_unlock(&s->lock);
+}
+
+int
+hk_qmi_txn_poll(struct qmi_txn *txn, int *decoded_result)
+{
+	if (!txn || !decoded_result || !txn->qmi) return -EINVAL;
+	struct qmi_state *s = state_of(txn->qmi);
+	if (!s) return -ENOTCONN;
+	os_lock(&s->lock);
+	struct qmi_txn **found = find_transaction(s, txn, 0);
+	int status = 0;
+	if (!found) {
+		status = -ENOENT;
+	} else if (txn->done) {
+		*found = txn->next;
+		*decoded_result = txn->result;
+		status = 1;
+	}
+	os_unlock(&s->lock);
+	return status;
 }
 
 int

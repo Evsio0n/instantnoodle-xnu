@@ -20,7 +20,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef MHI_TEST_SDX55
+#include "modem_mhi.h"
+#else
 #include "mhi_host.h"
+#endif
 
 static unsigned failures, checks;
 
@@ -70,7 +74,13 @@ static struct device {
 	const uint8_t *image;
 	size_t image_length, sbl_length;
 	unsigned event_count;
-	uint64_t er_rp[4];			/* device's write position (iova) on each event ring */
+	unsigned outbound, inbound;
+	unsigned channel_db[128];
+	uint64_t er_rp[MHI_HOST_EVENT_RINGS];	/* device's write position (iova) on each event ring */
+	unsigned event_db[MHI_HOST_EVENT_RINGS];
+	bool sparse;
+	bool reject_hw_count;
+	bool unpaired_command;
 	unsigned events_posted;
 	/* the IPCR channels as the device sees them */
 	uint64_t ch_rp[128];			/* device's read position (iova), by channel */
@@ -190,13 +200,21 @@ check_mmio(void)
 	CHECK(dma_at(ecabap, CTX) != NULL);
 	CHECK(dma_at(crcbap, CTX) != NULL);
 	dev.event_count = *reg(MHI_REG_MHICFG) >> 16 & 0xff;
-	CHECK(dev.event_count == 2);
+	CHECK(dev.event_count == (dev.sparse ? 17u : 2u));
+	CHECK((*reg(MHI_REG_MHICFG) >> 24) == (dev.sparse ? 10u : 0u));
+	CHECK((*reg(MHI_REG_MHICFG) & 0xffff) == 0xff80u);
 	for (unsigned e = 0; e < dev.event_count; e++) {
 		uint64_t ctx = ecabap + (uint64_t)e * CTX, base = ctx_get64(ctx, 12), length = ctx_get64(ctx, 20);
 
-		CHECK(base % length == 0 || (base & (base - 1)) == 0 || base % 512 == 0);
+		if (dev.sparse && e != 0 && e != 1 && e != 7 && e != 8 && !(e == 2 && length != 0)) {
+			const unsigned char zeros[CTX] = { 0 };
+			CHECK(memcmp(dma_at(ctx, CTX), zeros, CTX) == 0 && dev.event_db[e] == 0);
+			continue;
+		}
+		CHECK(length != 0 && base % length == 0);
 		CHECK(ctx_get64(ctx, 28) == base);
-		CHECK(ctx_get64(ctx, 36) == base + length - 16);	/* all elements but one for the device */
+		CHECK(ctx_get64(ctx, 36) == (dev.sparse && e >= 7 ? base : base + length - 16));
+		CHECK(dev.event_db[e] == (unsigned)(!dev.sparse || e < 7));
 		dev.er_rp[e] = base;
 	}
 	CHECK(ctx_get64(crcbap, 28) == ctx_get64(crcbap, 12));
@@ -307,8 +325,8 @@ commands_go(uint64_t wp)
 			uint32_t cfg = ctx_get32(cctx, 0);
 
 			CHECK((cfg & 0xff) == 1);			/* enabled by the host */
-			CHECK(ctx_get32(cctx, 4) == (chan == 21 ? 2u : 1u));
-			CHECK(ctx_get32(cctx, 8) == 1);			/* their completions go to event ring 1 */
+			CHECK(ctx_get32(cctx, 4) == (chan == dev.inbound ? 2u : 1u));
+			CHECK(ctx_get32(cctx, 8) == (dev.sparse && chan == 100 ? 7u : dev.sparse && chan == 101 ? 8u : 1u));
 			CHECK(ctx_get64(cctx, 28) == ctx_get64(cctx, 12));
 			dev.ch_rp[chan] = ctx_get64(cctx, 12);
 			dev.ch_running[chan] = true;
@@ -317,7 +335,13 @@ commands_go(uint64_t wp)
 			code = 0x10;
 		}
 		dev.commands++;
-		post_event(0, rp, code << 24, MHI_TYPE_CMD_DONE << 16 | chan << 24);
+		if (dev.unpaired_command) {
+			/* Right pointer on a data ring, and a real but unposted command slot on the control ring. */
+			post_event(7, rp, code << 24, MHI_TYPE_CMD_DONE << 16 | chan << 24);
+			post_event(0, rp + MHI_ELEMENT, code << 24, MHI_TYPE_CMD_DONE << 16 | chan << 24);
+		} else {
+			post_event(0, rp, code << 24, MHI_TYPE_CMD_DONE << 16 | chan << 24);
+		}
 		rp = rp + 16 == base + length ? base : rp + 16;
 	}
 	ctx_put64(crcbap, 28, rp);
@@ -327,13 +351,14 @@ commands_go(uint64_t wp)
 static bool
 device_send(const void *data, uint32_t length)
 {
-	uint64_t cctx = reg64(MHI_REG_CCABAP) + 21 * CTX, base = ctx_get64(cctx, 12), size = ctx_get64(cctx, 20);
-	uint64_t rp = dev.ch_rp[21], wp = ctx_get64(cctx, 36);
+	unsigned chan = dev.inbound;
+	uint64_t cctx = reg64(MHI_REG_CCABAP) + chan * CTX, base = ctx_get64(cctx, 12), size = ctx_get64(cctx, 20);
+	uint64_t rp = dev.ch_rp[chan], wp = ctx_get64(cctx, 36);
 	uint8_t *e;
 	uint64_t buffer;
 	uint32_t room, word1;
 
-	if (!dev.ch_running[21] || rp == wp || dev.state != MHI_HOST_STATE_M0) {
+	if (!dev.ch_running[chan] || rp == wp || dev.state != MHI_HOST_STATE_M0) {
 		return false;
 	}
 	e = dma_at(rp, 16);
@@ -345,9 +370,9 @@ device_send(const void *data, uint32_t length)
 	CHECK(length <= (room & 0xffff));
 	CHECK(dma_at(buffer, length) != NULL);
 	memcpy(dma_at(buffer, length), data, length);
-	post_event(1, rp, MHI_CODE_EOT << 24 | length, MHI_TYPE_TX << 16 | 21u << 24);
-	dev.ch_rp[21] = rp + 16 == base + size ? base : rp + 16;
-	ctx_put64(cctx, 28, dev.ch_rp[21]);
+	post_event(ctx_get32(cctx, 8), rp, MHI_CODE_EOT << 24 | length, MHI_TYPE_TX << 16 | chan << 24);
+	dev.ch_rp[chan] = rp + 16 == base + size ? base : rp + 16;
+	ctx_put64(cctx, 28, dev.ch_rp[chan]);
 	return true;
 }
 
@@ -359,11 +384,12 @@ channel_go(uint32_t chan, uint64_t wp)
 	CHECK(dev.ch_running[chan]);
 	CHECK(dev.state == MHI_HOST_STATE_M0);		/* (doorbells are rung in M0 only) */
 	CHECK(wp == ctx_get64(cctx, 36));
-	if (chan != 20) {
+	dev.channel_db[chan]++;
+	if (chan != dev.outbound) {
 		return;					/* (channel 21's doorbell: more buffers; device_send() takes them) */
 	}
-	while (dev.ch_rp[20] != wp) {
-		uint64_t rp = dev.ch_rp[20], buffer;
+	while (dev.ch_rp[chan] != wp) {
+		uint64_t rp = dev.ch_rp[chan], buffer;
 		const uint8_t *e = dma_at(rp, 16);
 		uint32_t length, word1;
 
@@ -377,9 +403,9 @@ channel_go(uint32_t chan, uint64_t wp)
 			memcpy(dev.sent[dev.sent_count], dma_at(buffer, length), length);
 			dev.sent_length[dev.sent_count++] = length;
 		}
-		post_event(1, rp, MHI_CODE_EOT << 24 | length, MHI_TYPE_TX << 16 | 20u << 24);
-		dev.ch_rp[20] = rp + 16 == base + size ? base : rp + 16;
-		ctx_put64(cctx, 28, dev.ch_rp[20]);
+		post_event(ctx_get32(cctx, 8), rp, MHI_CODE_EOT << 24 | length, MHI_TYPE_TX << 16 | chan << 24);
+		dev.ch_rp[chan] = rp + 16 == base + size ? base : rp + 16;
+		ctx_put64(cctx, 28, dev.ch_rp[chan]);
 	}
 }
 
@@ -395,7 +421,7 @@ device_write(uint32_t offset, uint32_t value)
 		uint32_t state = value >> 8 & 0xff;
 
 		if (value & MHI_CTRL_RESET) {
-			dev.ch_running[20] = dev.ch_running[21] = false;
+			memset(dev.ch_running, 0, sizeof(dev.ch_running));
 			later(AFTER_RESET, 1000);
 		} else if (state == MHI_HOST_STATE_M0 && dev.state == MHI_HOST_STATE_READY) {
 			check_mmio();
@@ -432,10 +458,11 @@ device_write(uint32_t offset, uint32_t value)
 		} else {
 			channel_go(chan, v);
 		}
-	} else if (offset >= ERDB && offset < ERDB + 8 * 4 && offset % 8 == 0) {
+	} else if (offset >= ERDB && offset < ERDB + 8 * MHI_HOST_EVENT_RINGS && offset % 8 == 0) {
 		uint32_t e = (offset - ERDB) / 8;
 		uint64_t ctx = reg64(MHI_REG_ECABAP) + (uint64_t)e * CTX;
 
+		dev.event_db[e]++;
 		if (dev.event_count != 0) {
 			CHECK(reg64(offset) == ctx_get64(ctx, 36));
 		}
@@ -448,6 +475,13 @@ device_init(const uint8_t *image, size_t length, size_t sbl)
 	pthread_mutex_lock(&dev.lock);
 	memset(dev.regs, 0, sizeof(dev.regs));
 	memset(dev.ch_running, 0, sizeof(dev.ch_running));
+	memset(dev.channel_db, 0, sizeof(dev.channel_db));
+	memset(dev.event_db, 0, sizeof(dev.event_db));
+	dev.sparse = false;
+	dev.reject_hw_count = false;
+	dev.unpaired_command = false;
+	dev.outbound = 20;
+	dev.inbound = 21;
 	dev.ee = MHI_HOST_EE_PBL;
 	dev.state = MHI_HOST_STATE_RESET;
 	dev.ready = false;
@@ -483,6 +517,7 @@ op_read(void *c, uint32_t offset)
 	pthread_mutex_lock(&dev.lock);
 	device_tick();
 	v = offset < sizeof(dev.regs) ? *reg(offset) : 0xffffffffu;
+	if (dev.reject_hw_count && offset == MHI_REG_MHICFG) v &= 0x00ffffffu;
 	pthread_mutex_unlock(&dev.lock);
 	return v;
 }
@@ -567,7 +602,7 @@ op_status(void *c, enum mhi_host_status what)
 static void
 op_receive(void *c, unsigned channel, const void *data, size_t length)
 {
-	CHECK(channel == 21);
+	CHECK(channel == dev.inbound);
 	if (received_count < 256 && length <= 256) {
 		memcpy(received[received_count].data, data, length);
 		received[received_count++].length = length;
@@ -577,6 +612,7 @@ op_receive(void *c, unsigned channel, const void *data, size_t length)
 static const struct mhi_host_ops ops = {
 	op_read, op_write, op_dma_alloc, op_dma_free, op_nanoseconds, op_lock, op_unlock, op_pause, op_random, op_say,
 	op_status, op_receive,
+	.dma_alloc_uncached = NULL,
 };
 
 /* ---- the tests ------------------------------------------------------------------------------------- */
@@ -619,6 +655,8 @@ test_boot(void)
 	CHECK(missions == 1);
 	CHECK(dev.ch_running[20] && dev.ch_running[21]);
 	CHECK(dev.commands == 2);
+	CHECK((ctx_get32(reg64(MHI_REG_CCABAP) + 20 * CTX, 0) >> 8 & 3) == 2);
+	CHECK(dev.channel_db[20] == 0 && dev.channel_db[21] == 1);
 	CHECK(host.state == MHI_HOST_STATE_M0 && host.ee == MHI_HOST_EE_AMSS);
 	printf("boot: %s (%u events)\n", error == 0 ? "the image runs, both channels started" : "FAILED", dev.events_posted);
 }
@@ -649,6 +687,7 @@ test_traffic(void)
 		}
 	}
 	CHECK(dev.sent_count == sent_before + 40);
+	CHECK(dev.channel_db[20] == 40 && dev.channel_db[21] == 151);
 	for (unsigned i = 0; i < 40 && sent_before + i < 64; i++) {
 		size_t length = 16 + i % 100;
 
@@ -781,6 +820,189 @@ test_dead(void)
 	printf("a device that refuses the boot loader: the power-up says EIO\n");
 }
 
+#ifdef MHI_TEST_SDX55
+/* Exercise the flashless modem caller and both send paths. The fixture keeps
+ * its two software event rings; it models only the transfer doorbell protocol. */
+static void
+test_sdx55(void)
+{
+	struct mhi_host_config c = config();
+	static struct mhi_host modem;
+	const unsigned tx = 100, rx = 101;
+	unsigned sent = dev.sent_count, received_before = received_count;
+	uint64_t tx_ctx, rx_ctx, rx_wp;
+
+	device_init(image, sizeof(image), sizeof(image));
+	dev.outbound = c.channels[0].number = tx;
+	dev.inbound = c.channels[1].number = rx;
+	c.channels[2] = (struct mhi_host_channel_config){ 2, 8, 1, false, .ee_mask = 1u << MHI_HOST_EE_SBL };
+	c.channel_count = 3;
+	c.sbl_length = sizeof(image);
+	CHECK(mhi_host_init(&modem, &ops, NULL, &c) == 0);
+	CHECK(mdm_mhi_to_sbl(&modem) == 0);
+	tx_ctx = reg64(MHI_REG_CCABAP) + tx * CTX;
+	rx_ctx = reg64(MHI_REG_CCABAP) + rx * CTX;
+	CHECK(ctx_get32(tx_ctx, 0) == (3u << 8) && ctx_get32(rx_ctx, 0) == (3u << 8));
+	CHECK(!dev.ch_running[tx] && !dev.ch_running[rx]);
+	CHECK(dev.ch_running[2] && (ctx_get32(reg64(MHI_REG_CCABAP) + 2 * CTX, 0) >> 8 & 3) == 2);
+	CHECK(mdm_mhi_send(&modem, 2, "S", 1, false) == 0 && dev.channel_db[2] == 1);
+	dev.ee = MHI_HOST_EE_AMSS;
+	ee_event(dev.ee);
+	set_status();
+	CHECK(mdm_mhi_to_mission(&modem, 500) == 0);
+	CHECK(dev.ch_running[tx] && dev.ch_running[rx]);
+	CHECK(dev.channel_db[tx] == 0 && dev.channel_db[rx] == 1);
+	CHECK(post_event(1, 0, MHI_CODE_OOB << 24, MHI_TYPE_TX << 16 | 2u << 24));
+	mhi_host_interrupt(&modem, -1);
+	CHECK(!modem.channels[2].running && dev.channel_db[2] == 1);
+	/* An assigned data ring with an unposted TRE, or a valid TRE on the
+	 * wrong ring, returns no RX credit and completes no packet. */
+	rx_wp = ctx_get64(rx_ctx, 36);
+	CHECK(post_event(1, rx_wp, MHI_CODE_EOT << 24 | 1, MHI_TYPE_TX << 16 | rx << 24));
+	CHECK(post_event(0, ctx_get64(rx_ctx, 28), MHI_CODE_EOT << 24 | 1, MHI_TYPE_TX << 16 | rx << 24));
+	mhi_host_interrupt(&modem, -1);
+	CHECK(ctx_get64(rx_ctx, 36) == rx_wp && received_count == received_before);
+
+	CHECK(mdm_mhi_send(&modem, tx, "A", 1, true) == 0);
+	CHECK(mhi_host_send(&modem, tx, "B", 1) == 0);
+	CHECK(dev.channel_db[tx] == 1 && dev.sent_count == sent + 1);
+	CHECK(ctx_get64(tx_ctx, 36) != dev.ch_rp[tx]);
+	/* The event on the control ring cannot rearm the data channel. */
+	CHECK(post_event(0, 0, MHI_CODE_DB_MODE << 24, MHI_TYPE_TX << 16 | tx << 24));
+	mhi_host_interrupt(&modem, -1);
+	CHECK(dev.channel_db[tx] == 1);
+	CHECK(post_event(1, 0, MHI_CODE_OOB << 24, MHI_TYPE_TX << 16 | tx << 24));
+	mhi_host_interrupt(&modem, -1);
+	CHECK(dev.channel_db[tx] == 2 && dev.sent_count == sent + 2);
+	CHECK(ctx_get64(tx_ctx, 36) == dev.ch_rp[tx]);
+	mhi_host_interrupt(&modem, -1);	/* retire the completion before the next DB_MODE */
+	CHECK(post_event(1, ctx_get64(tx_ctx, 12), MHI_CODE_EOT << 24 | 1, MHI_TYPE_TX << 16 | tx << 24));
+	CHECK(post_event(1, 0, MHI_CODE_DB_MODE << 24, MHI_TYPE_TX << 16 | tx << 24));
+	mhi_host_interrupt(&modem, -1);
+	CHECK(dev.channel_db[tx] == 2);	/* rearmed but empty */
+	CHECK(modem.channels[0].ring.rp == modem.channels[0].ring.wp);
+	CHECK(mdm_mhi_send(&modem, tx, "C", 1, false) == 0 && dev.channel_db[tx] == 3);
+
+	rx_wp = ctx_get64(rx_ctx, 36);
+	CHECK(device_send("D", 1));
+	mhi_host_interrupt(&modem, -1);
+	CHECK(received_count == received_before + 1 && received[received_before].data[0] == 'D');
+	CHECK(ctx_get64(rx_ctx, 36) != rx_wp && dev.channel_db[rx] == 1);
+	CHECK(mhi_host_send(&modem, tx, "E", 1) == 0 && dev.channel_db[tx] == 3);
+	CHECK(mhi_host_suspend(&modem) == 0 && mhi_host_resume(&modem) == 0);
+	CHECK(dev.channel_db[tx] == 4 && dev.channel_db[rx] == 1);
+	state_event(MHI_HOST_STATE_M0);
+	mhi_host_interrupt(&modem, -1);
+	CHECK(dev.channel_db[tx] == 4 && dev.channel_db[rx] == 1);
+	CHECK(mhi_host_suspend(&modem) == 0);
+	CHECK(post_event(1, 0, MHI_CODE_DB_MODE << 24, MHI_TYPE_TX << 16 | rx << 24));
+	mhi_host_interrupt(&modem, -1);
+	CHECK(dev.channel_db[rx] == 1);	/* service the pending request only in M0 */
+	CHECK(mhi_host_resume(&modem) == 0);
+	CHECK(dev.channel_db[rx] == 2 && dev.channel_db[tx] == 4);
+	CHECK(mhi_host_power_down(&modem) == 0);
+	mhi_host_interrupt(&modem, -1);
+	CHECK(mdm_mhi_send(&modem, tx, "F", 1, false) == ENOTCONN);
+	CHECK(dev.channel_db[tx] == 4 && dev.channel_db[rx] == 2);
+	printf("SDX55 transfer doorbells: SBL/mission, polling WP, OOB/DB_MODE and M0 rearm\n");
+}
+
+static unsigned uncached_allocations;
+static void *
+uncached_alloc(void *context, size_t size, size_t alignment, uint64_t *address)
+{
+	uncached_allocations++;
+	CHECK(size == 2048 * MHI_ELEMENT && alignment == size);
+	return op_dma_alloc(context, size, alignment, address);
+}
+
+static void
+test_sparse_events(void)
+{
+	struct mhi_host_config c = config();
+	static struct mhi_host modem;
+	struct mhi_host_ops uncached_ops = ops;
+	unsigned done = 99, received_before = received_count;
+	unsigned before_alloc = allocations;
+	uint64_t rx_ctx;
+	c.event_count = 17;
+	c.hardware_event_count = 10;
+	c.register_window_size = sizeof(dev.regs);
+	c.timeout_ms = 50;
+	c.events[7] = (struct mhi_host_event_config){ .elements=1024, .vector=5, .moderation_ms=5, .burst=true };
+	c.events[8] = (struct mhi_host_event_config){ .elements=2048, .vector=6, .moderation_ms=5,
+	    .burst=true, .client_managed=true, .uncached=true };
+	c.channels[0].number = 100;
+	c.channels[1].number = 101;
+	c.channels[0].event_ring = 7;
+	c.channels[1].event_ring = 8;
+	CHECK(mhi_host_init(&modem, &ops, NULL, &c) == ENOTSUP && allocations == before_alloc);
+	uncached_ops.dma_alloc_uncached = uncached_alloc;
+	c.channels[0].event_ring = 9;
+	CHECK(mhi_host_init(&modem, &uncached_ops, NULL, &c) == EINVAL && allocations == before_alloc);
+	c.channels[0].event_ring = 7;
+	c.sbl_length = sizeof(image);
+	CHECK(mhi_host_init(&modem, &uncached_ops, NULL, &c) == 0 && uncached_allocations == 1);
+
+	device_init(image, sizeof(image), sizeof(image));
+	dev.sparse = true;
+	*reg(MHI_REG_ERDBOFF) = sizeof(dev.regs) - 8;
+	CHECK(mdm_mhi_to_sbl(&modem) == ERANGE);
+	CHECK(reg64(MHI_REG_ECABAP) == 0 && dev.event_db[7] == 0);
+
+	device_init(image, sizeof(image), sizeof(image));
+	dev.sparse = true;
+	dev.outbound = 100;
+	dev.inbound = 101;
+	CHECK(mdm_mhi_to_sbl(&modem) == 0);
+	CHECK(dev.event_db[7] == 0 && dev.event_db[8] == 0);
+	CHECK(mhi_host_poll_event(&modem, 8, 1, &done) == ENOTCONN && done == 0);
+	CHECK(mhi_host_poll_event(&modem, 7, 1, &done) == EINVAL && done == 0);
+	dev.ee = MHI_HOST_EE_AMSS;
+	set_status();
+	CHECK(mdm_mhi_to_mission(&modem, 100) == ENOTCONN);	/* EE register alone gives no HW credits */
+	CHECK(dev.event_db[7] == 0 && dev.event_db[8] == 0);
+	ee_event(dev.ee);
+	CHECK(mdm_mhi_to_mission(&modem, 100) == 0);
+	CHECK(dev.event_db[7] == 1 && dev.event_db[8] == 1);
+	CHECK(ctx_get32(reg64(MHI_REG_ECABAP) + 7 * CTX, 0) == 5u << 16);
+	CHECK(ctx_get32(reg64(MHI_REG_ECABAP) + 8 * CTX, 8) == 6);
+	rx_ctx = reg64(MHI_REG_ECABAP) + 8 * CTX;
+	CHECK(device_send("1", 1) && device_send("2", 1) && device_send("3", 1));
+	mhi_host_interrupt(&modem, -1);
+	mhi_host_interrupt(&modem, 6);
+	CHECK(received_count == received_before);
+	CHECK(mhi_host_poll_event(&modem, 8, 2, &done) == 0 && done == 2 && received_count == received_before + 2);
+	CHECK(mhi_host_poll_event(&modem, 8, 2, &done) == 0 && done == 1 && received_count == received_before + 3);
+	CHECK(mhi_host_poll_event(&modem, 8, 2, &done) == 0 && done == 0);
+	CHECK(ctx_get64(rx_ctx, 36) == ctx_get64(rx_ctx, 12) + 2 * MHI_ELEMENT);
+	CHECK(dev.event_db[7] == 1 && dev.event_db[8] == 1);
+	CHECK(mhi_host_suspend(&modem) == 0 && mhi_host_resume(&modem) == 0);
+	CHECK(dev.event_db[7] == 1 && dev.event_db[8] == 1);
+	CHECK(mhi_host_power_down(&modem) == 0);
+	CHECK(mhi_host_poll_event(&modem, 8, 2, &done) == ENOTCONN && done == 0);
+	for (unsigned e = 0; e < 17; e++) if (e != 0 && e != 1 && e != 7 && e != 8) {
+		CHECK(dev.event_db[e] == 0 && modem.events[e].base == NULL);
+	}
+	device_init(image, sizeof(image), sizeof(image));
+	dev.sparse = dev.unpaired_command = true;
+	dev.outbound = 100;
+	dev.inbound = 101;
+	CHECK(mdm_mhi_to_sbl(&modem) == 0);
+	dev.ee = MHI_HOST_EE_AMSS;
+	ee_event(dev.ee);
+	set_status();
+	CHECK(mdm_mhi_to_mission(&modem, 100) == ETIMEDOUT && !modem.channels[0].running);
+	CHECK(modem.commands.rp != modem.commands.wp && modem.channels[0].command_status == 0);
+	CHECK(mhi_host_power_down(&modem) == 0);
+	device_init(image, sizeof(image), sizeof(image));
+	dev.sparse = dev.reject_hw_count = true;
+	CHECK(mdm_mhi_to_sbl(&modem) == EIO && !mhi_host_ownership_clean(&modem));
+	for (unsigned e = 0; e < 17; e++) CHECK(dev.event_db[e] == 0);
+	printf("SDX55 sparse ER: 17 contexts, 10 hardware slots, staged credits, client budget and BAR bounds\n");
+}
+#endif
+
 int
 main(int argc, char **argv)
 {
@@ -797,6 +1019,10 @@ main(int argc, char **argv)
 	test_lost_doorbell();
 	test_error();
 	test_dead();
+#ifdef MHI_TEST_SDX55
+	test_sdx55();
+	test_sparse_events();
+#endif
 	printf("mhi-test: %u checks, %u failed\n", checks, failures);
 	free(arena);
 	return failures != 0;

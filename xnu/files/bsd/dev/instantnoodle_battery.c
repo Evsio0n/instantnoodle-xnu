@@ -35,6 +35,7 @@
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <mach/mach_time.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/instantnoodle.h>
@@ -87,6 +88,7 @@ say(const char *format, ...)
 extern int reboot_kernel(int howto, char *message);
 extern void instantnoodle_touch_charger(bool plugged);
 static uint32_t empty_readings, shutdown_on = 1, empty_mv = BATTERY_EMPTY_MV;
+static uint32_t battery_trace;
 static volatile int battery_last_percent = -1, battery_last_external = -1;
 
 /*
@@ -270,18 +272,33 @@ device_type(void)
 	return word(REG_CNTL, &type) == 0 ? type : -1;
 }
 
+/* Continuous time includes sleep. Take it only for the opt-in observer. */
+static uint64_t
+gauge_trace_ns(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_continuous_time(), &ns);
+	return ns;
+}
+
 /* one reading; false when the gauge did not answer */
 static bool
-sample(struct hk_battery_state *b, int *flags_out, uint8_t *charger_state)
+sample(struct hk_battery_state *b, int *flags_out, uint8_t *charger_state, unsigned seq)
 {
 	int soc, mv, ma, temp_dk, flags = 0, rm = 0, fcc = 0, cycles = 0, design = 0;
 	uint8_t usbin = 0, chgr = 0xff;
+	int core_rc, rm_rc, usb_rc;
 
-	if (word(map.soc, &soc) || word(map.volt, &mv) || word(map.ai, &ma) || word(map.temp, &temp_dk)) {
+	if ((core_rc = word(map.soc, &soc)) || (core_rc = word(map.volt, &mv)) ||
+	    (core_rc = word(map.ai, &ma)) || (core_rc = word(map.temp, &temp_dk))) {
+		if (battery_trace == 1) {
+			printf("hk-gauge v=1 seq=%u ns=%llu core_rc=%d end\n", seq, gauge_trace_ns(), core_rc);
+		}
 		return false;
 	}
 	word(map.flags, &flags);
-	word(map.rm, &rm);
+	rm_rc = word(map.rm, &rm);
 	word(map.fcc, &fcc);
 	if (map.cycles) {
 		word(map.cycles, &cycles);
@@ -302,10 +319,16 @@ sample(struct hk_battery_state *b, int *flags_out, uint8_t *charger_state)
 	b->design_uah = design > 1000 && design < 10000 ? design * 1000 : 0;
 	b->cycles = cycles < 10000 ? cycles : 0;
 
-	if (hk_spmi_read(PM8150B_USBIN, USBIN_RT_STS, &usbin, 1) == 0) {
+	usb_rc = hk_spmi_read(PM8150B_USBIN, USBIN_RT_STS, &usbin, 1);
+	if (usb_rc == 0) {
 		b->external = (usbin & USBIN_PLUGIN) != 0;
 	} else {
 		b->external = ma > 0;                   /* the charger cannot be asked: taking charge says it is there */
+	}
+	if (battery_trace == 1) {
+		printf("hk-gauge v=1 seq=%u ns=%llu core_rc=0 rm_rc=%d rm_mah=%d usb_rc=%d usb=%d "
+		    "reported_external=%d mv=%d ma=%d end\n", seq, gauge_trace_ns(), rm_rc, rm_rc ? -1 : rm,
+		    usb_rc, usb_rc ? -1 : (int)((usbin & USBIN_PLUGIN) != 0), (int)b->external, mv, ma);
 	}
 	instantnoodle_touch_charger(b->external != 0);   /* (the touch chip's noise filter for a charger) */
 	if (hk_spmi_read(PM8150B_CHGR, CHGR_STATUS_1, &chgr, 1) == 0) {
@@ -359,7 +382,7 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 	printf("battery: the gauge says device type %#x: %s register map\n", type, map.name);
 
 	for (unsigned tick = 0;; tick++) {
-		if (sample(&b, &flags, &chgr)) {
+		if (sample(&b, &flags, &chgr, tick)) {
 			failed = 0;
 			hk_battery_report(&b);
 			empty_check(&b);
@@ -394,6 +417,7 @@ instantnoodle_battery_init(void)
 		return;
 	}
 	PE_parse_boot_argn("battery", &enabled, sizeof(enabled));
+	PE_parse_boot_argn("battery_trace", &battery_trace, sizeof(battery_trace));
 	PE_parse_boot_argn("battery_shutdown", &shutdown_on, sizeof(shutdown_on));
 	PE_parse_boot_argn("battery_empty_mv", &empty_mv, sizeof(empty_mv));  /* (a test: above the cell's voltage, unplugged) */
 	PE_parse_boot_argn("charge_icl", &icl_on, sizeof(icl_on));

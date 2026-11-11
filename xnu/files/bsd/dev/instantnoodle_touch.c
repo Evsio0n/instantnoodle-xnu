@@ -116,6 +116,10 @@ static uint64_t irq_time;
  */
 static volatile bool touch_dark_wanted;
 static bool touch_dark;
+#include "s6sy771_wake.h"
+static uint32_t tap_wake;
+static struct tw_state tap_state;
+
 static uint32_t touch_darks;
 /* a cable in (1) or not (0), -1 not known: as told (instantnoodle_touch_charger()), and as the chip was told last */
 static volatile int charger_wanted = -1;
@@ -154,7 +158,7 @@ wait_report(void)
 		assert_wait_deadline((event_t)&irq_time, THREAD_UNINT, touch_dark ? 0 : deadline);
 		at = __atomic_exchange_n(&irq_time, 0, __ATOMIC_ACQUIRE);
 		if (touch_dark_wanted != touch_dark || (!touch_dark && charger_wanted != charger_set) ||
-		    (!touch_dark && (at != 0 || !instantnoodle_gpio_level(PIN_IRQ)))) {
+		    ((!touch_dark || tap_state.armed) && (at != 0 || !instantnoodle_gpio_level(PIN_IRQ)))) {
 			clear_wait(current_thread(), THREAD_AWAKENED);
 			return at;
 		}
@@ -199,6 +203,16 @@ static int
 ts_read(uint8_t reg, uint8_t *buf, unsigned n)
 {
 	return instantnoodle_i2c_read(&bus, TS_ADDR, reg, buf, n);
+}
+
+static const struct tw_io tap_io = {ts_write, ts_read, sleep_ms};
+
+static void
+tap_irq_enable(void)
+{
+	wr(irq_pin + IRQ_STATUS, 0);
+	wr(irq_pin + IRQ_CONFIG, rd(irq_pin + IRQ_CONFIG) | IRQ_ENABLE);
+	gic_v3_spi_unmask(TLMM_IRQ);
 }
 
 /* ---- the supplies (RPMh), as bsd/dev/hk_goodix.c --------------------------------------------- */
@@ -695,6 +709,13 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 	}
 	ts_read(CMD_BOOT_STATUS, &boot, 1);
 	ts_read(CMD_FW_INTEGRITY, &fw, 1);
+	/* This unit's measured tuple and firmware application status. */
+	if (tap_wake && (id[0] != 0xac || id[1] != 0x37 || id[2] != 0x71 ||
+	    boot != 0x20 || fw != 0x80)) {
+		tap_wake = 0;
+		printf("touch-wake: controller identity/status mismatch; using reset on display-off\n");
+	}
+
 	printf("touch: device id %02x %02x %02x, boot status %#x (0x20: application), firmware integrity %#x\n", id[0], id[1],
 	    id[2], boot, fw);
 	/* not acknowledged on this phone, harmless (see the top) */
@@ -729,6 +750,18 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 				wr(irq_pin + IRQ_CONFIG, rd(irq_pin + IRQ_CONFIG) & ~IRQ_ENABLE);
 				gic_v3_spi_mask(TLMM_IRQ);
 			}
+			if (tap_wake && use_irq) {
+				if (tw_enter(&tap_state, &tap_io)) {
+					touch_dark = true;
+					touch_darks++;
+					tap_irq_enable();
+					printf("touch-wake: armed mask=ffff power=1 (read back)\n");
+					continue;
+				}
+				tap_wake = 0; /* fail once; restore via normal reset sequence */
+				printf("touch-wake: enter failed stage=%u mask=%x power=%x attempts=%u; reset fallback\n",
+				    tap_state.stage,tap_state.mask,tap_state.power,tap_state.attempts);
+			}
 			instantnoodle_gpio_output(PIN_RESET, false, INSTANTNOODLE_PULL_UP, 8);
 			touch_dark = true;
 			touch_darks++;
@@ -736,6 +769,22 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 		}
 		if (!touch_dark_wanted && touch_dark) {
 			int booted;
+			if (tap_state.armed) {
+				gic_v3_spi_mask(TLMM_IRQ);
+				wr(irq_pin + IRQ_CONFIG, rd(irq_pin + IRQ_CONFIG) & ~IRQ_ENABLE);
+				if (tw_exit(&tap_state, &tap_io)) {
+					touch_dark = false;
+					charger_set = -1;
+					tap_irq_enable();
+					printf("touch-wake: active mask=0 power=0 (read back)\n");
+					continue;
+				}
+				tap_wake = 0;
+				instantnoodle_gpio_output(PIN_RESET, false, INSTANTNOODLE_PULL_UP, 8);
+				sleep_ms(5);
+				printf("touch-wake: exit failed stage=%u mask=%x power=%x; reset fallback\n",
+				    tap_state.stage,tap_state.mask,tap_state.power);
+			}
 
 			instantnoodle_gpio_output(PIN_RESET, true, INSTANTNOODLE_PULL_UP, 8);
 			sleep_ms(140);
@@ -755,6 +804,24 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 			continue;
 		}
 		if (touch_dark) {
+			if (tap_state.armed && touch_dark_wanted) {
+				enum tw_action action = tw_poll(&tap_state, &tap_io);
+				if (instantnoodle_gpio_level(PIN_IRQ)) tap_state.idle_irqs = 0;
+				if (action == TW_RESET) {
+					wr(irq_pin + IRQ_CONFIG, rd(irq_pin + IRQ_CONFIG) & ~IRQ_ENABLE);
+					gic_v3_spi_mask(TLMM_IRQ);
+					instantnoodle_gpio_output(PIN_RESET, false, INSTANTNOODLE_PULL_UP, 8);
+					tap_state.armed = false;
+					tap_wake = 0;
+					printf("touch-wake: dark read failed or IRQ stuck; reset fallback\n");
+				} else {
+					if (action == TW_WAKE && touch_dark_wanted) {
+						hk_touch_post(HK_TOUCH_WAKE, 0, 0, 0);
+						printf("touch-wake: physical tap queued\n");
+					}
+					tap_irq_enable();
+				}
+			}
 			continue;
 		}
 		if (charger_wanted != charger_set) {
@@ -839,6 +906,10 @@ instantnoodle_touch_init(void)
 	PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled));
 	PE_parse_boot_argn("touch_irq", &use_irq, sizeof(use_irq));
 	PE_parse_boot_argn("touch_lat", &trace_latency, sizeof(trace_latency));
+	uint32_t sleep_mode = 1, request = 0;
+	tap_wake = PE_parse_boot_argn("touch_wake", &request, sizeof(request)) && request == 1 &&
+	    PE_parse_boot_argn("syssleep", &sleep_mode, sizeof(sleep_mode)) && sleep_mode == 0 && use_irq;
+
 	if (!enabled) {
 		return;
 	}

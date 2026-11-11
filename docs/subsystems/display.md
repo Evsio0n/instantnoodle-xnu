@@ -229,7 +229,7 @@ way to the loader (backboardd sets level 0 at shutdown; the loader's menu stays 
   SpringBoard Darwin notifications `com.hackios.brightness.{5,20,50,90,100}` (`inject_sb.c`).
 - **Not verified:** that the light changes (nothing here measures light) and the byte order on the panel (no DSI
   read is implemented; the device tree's own `51 0c 7c` is the evidence).
-- There is no ambient light sensor in the port, so auto-brightness has nothing to read, and CoreBrightness's wait
+- There is no usable ambient-light sensor service in the port, so auto-brightness has nothing to read, and CoreBrightness's wait
   for one (`-[BLControl waitForALSArrival]`, five seconds) still happens at window-server start: `inject.c` has a
   `brightness_fixes()` that skips it, but it is switched off because with it backboardd stopped adopting our touch
   service (see [input-peripherals.md](input-peripherals.md)).

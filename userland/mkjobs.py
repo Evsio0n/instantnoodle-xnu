@@ -74,7 +74,7 @@ import sys
 # configurations. And then it dies, every time, on one of two IOKit drivers of the cellular path that this
 # kernel has not got, and each has its own signal. With CommCenter's own log on, the split is clean over
 # 20 crashes: 11 SIGSEGV every one of them right after "Could not find AppleIPAppender service" (matched
-# by name; user client ApplePDPHelperInterface -- PDP contexts, traffic-class flows, dedicated bearers),
+# by IOServiceMatching class; user-side ApplePDPHelperInterface -- PDP contexts, traffic-class flows, dedicated bearers),
 # and 9 SIGABRT every one of them right after "Unable to communicate with AppleBaseband driver"
 # (com.apple.driver.AppleBasebandPCI). That answers the obvious question before anyone spends a week on
 # it: stubbing AppleIPAppender alone would remove the SIGSEGV half and leave the SIGABRT half, so it is

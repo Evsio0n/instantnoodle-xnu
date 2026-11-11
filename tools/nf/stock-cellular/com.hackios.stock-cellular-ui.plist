@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.hackios.stock-cellular-ui</string>
+<key>ProgramArguments</key><array><string>/hackios/bin/stock_cellular_ui</string></array>
+<key>UserName</key><string>mobile</string>
+<key>RunAtLoad</key><true/>
+<key>StandardOutPath</key><string>/dev/console</string>
+<key>StandardErrorPath</key><string>/dev/console</string>
+</dict></plist>

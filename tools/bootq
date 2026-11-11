@@ -33,6 +33,11 @@ DIR = os.environ.get('BOOTQ_DIR') or os.path.join(TMP, 'hackios-bootq')
 LOGS = os.environ.get('BOOTQ_LOGS') or os.path.join(ROOT, 'logs')
 HISTORY = 'history.jsonl'
 OWNER, NORMAL = 0, 1
+sys.path.insert(0, os.path.join(ROOT, 'tools', 'sensors'))
+import quarantine_state as qs
+
+def quarantine():
+    return qs.state(ROOT, DIR, LOGS)
 
 
 class Queue:
@@ -195,7 +200,18 @@ def describe(t):
     return '#%d %s%s: %s%s' % (t['id'], t['who'], owner, t['what'], extra)
 
 
+def cmd_recover(a):
+    if os.environ.get('BOOTQ_TICKET'):
+        sys.exit('bootq: submit recovery outside an existing ticket')
+    if not 1<=a.seconds<=86400 or a.ticket<=0:
+        sys.exit('bootq: expected a positive ticket and 1..86400 seconds')
+    import shlex
+    command='exec '+shlex.join([sys.executable,os.path.join(ROOT,'tools/sensors/recover_hold.py'),'--seconds',str(a.seconds)])
+    return cmd_run(argparse.Namespace(who='recovery',what='verified IN2010 cold recovery',owner=False,
+        preempt=False,no_touch=True,no_boot_ok=True,max=a.seconds+480,wait=0,command=[command],recover_id=a.ticket))
+
 def cmd_run(a):
+    recovery=getattr(a,'recover_id',None)
     command = ' '.join(a.command[1:] if a.command[:1] == ['--'] else a.command)
     if not command:
         sys.exit('bootq: nothing to run')
@@ -205,6 +221,13 @@ def cmd_run(a):
     with Queue() as q:
         t = {'id': q.new_id(), 'who': a.who, 'what': a.what, 'priority': OWNER if a.owner else NORMAL, 'state': 'waiting',
              'pid': os.getpid(), 'queued': time.time(), 'no_touch': a.no_touch, 'max': a.max, 'command': command}
+        if recovery is not None:
+            hold=quarantine()
+            if not hold or hold['ticket']!=recovery:
+                print('bootq: this ticket has no current evidence-bearing IN2010 quarantine',file=sys.stderr)
+                return 1
+            qs.pin(DIR,hold)
+            t.update(priority=-1,recovery_for=recovery,recovery_generation=hold['generation'])
         q.save(t)
     print('bootq: %s queued' % describe(t), flush=True)
 
@@ -230,26 +253,37 @@ def cmd_run(a):
             waiting = [o for o in tickets if o['state'] == 'waiting']
             first = bool(waiting) and waiting[0]['id'] == t['id']
             stopping = []
-            if first and running and a.preempt and a.owner:
+            if first and running and a.preempt and a.owner and not quarantine():
                 # (again every 15 s: a stop that reaches the loader before its kernel is up does nothing, run 100040)
                 stopping = [o for o in running if o['priority'] != OWNER and time.time() - float(o.get('preempted') or 0) > 15]
                 for o in stopping:
                     q.save(dict(o, preempted=time.time()))
             # (only the head asks xl's lock: a probe holds it for an instant, and xl's own `flock -n` could meet that)
-            rest = cooling() if a.owner is False else 0
-            ready = first and not running and not rest and phone_free()
+            hold = quarantine()
+            recovery_ok = recovery is not None and hold and hold['generation']==t['recovery_generation']
+            if recovery is not None and not recovery_ok:
+                q.finish(t,state='stale recovery');return 1
+            rest = cooling() if not a.owner and not recovery_ok else 0
+            ready = (not hold or recovery_ok) and first and not running and not rest and phone_free()
         for o in stopping:
             print('bootq: stopping %s for the owner' % describe(o), flush=True)
             xl_stop()
-        orphan = ready and kernel_running()
+        orphan = ready and recovery is None and kernel_running()
         if ready and not orphan:
             with Queue() as q:
-                # (nobody else can have gone ahead: it takes being first, and this is first until it leaves)
+                # A newly queued priority ticket can arrive during the unlocked loader check.
+                current=q.tickets();head=next((item for item in current if item['state']=='waiting'),None)
+                active_hold=quarantine()
+                if (not head or head['id']!=t['id'] or any(item['state']=='running' for item in current)
+                    or (active_hold and active_hold['generation']!=t.get('recovery_generation'))):
+                    continue
                 t = dict(t, state='running', began=time.time())
                 q.save(t)
             break
         ahead = running + waiting[:[o['id'] for o in waiting].index(t['id'])] if t['id'] in [o['id'] for o in waiting] else running
-        if orphan:
+        if hold and not recovery_ok:
+            now='awaiting verified hardware reset for #%d'%hold['ticket']
+        elif orphan:
             now = 'a kernel is running that nobody is watching: whoever started it ends it, with xl stop'
         elif first and not running and rest:
             now = 'the phone is cooling down'
@@ -276,23 +310,30 @@ def cmd_run(a):
     if rc == 0 and hung:
         rc = 76
     held = run_says(runs, b'cold recovery required')
-    left = phone_free() and kernel_running()
+    left = recovery is None and phone_free() and kernel_running()
     spent = time.time() - t['began']
-    if os.path.exists(os.path.join(DIR, 'cool')) and runs:
-        # half of what it ran, at most 5 minutes
-        with open(os.path.join(DIR, 'cool_until'), 'w') as f:
-            f.write(str(time.time() + min(300, spent * float(os.environ.get('BOOTQ_COOL_SHARE') or 0.5))))
-    if held:
-        # the next kernel could meet a chip that still owns its memory (run 105300): sessions wait until `bootq cool off`
-        with open(os.path.join(DIR, 'cool_until'), 'w') as f:
-            f.write(str(time.time() + 7 * 86400))
     with Queue() as q:
+        if os.path.exists(os.path.join(DIR, 'cool')) and runs:
+            # half of what it ran, at most 5 minutes
+            with open(os.path.join(DIR, 'cool_until'), 'w') as f:
+                f.write(str(time.time() + min(300, spent * float(os.environ.get('BOOTQ_COOL_SHARE') or 0.5))))
+        if held:
+            # the next kernel could meet a chip that still owns its memory (run 105300): sessions wait until `bootq cool off`
+            with open(os.path.join(DIR, 'cool_until'), 'w') as f:
+                f.write(str(time.time() + 7 * 86400))
+        ended=time.time()
+        if held:
+            source=dict(t,ended=ended,runs=runs)
+            h=qs.make_hold(ROOT,DIR,LOGS,source,qs.ordinary_deadline(DIR,source))
+            if h:qs.pin(DIR,h)
         q.finish(t, state='ended', rc=rc, runs=runs, left_running=left)
     if hung:
         print('bootq: #%d: THE KERNEL HUNG in run %s' % (t['id'], ' '.join(runs)), flush=True)
     if held:
-        print('bootq: #%d: its log says cold recovery is required: no session ticket starts until the owner has reset the phone '
-              'and `bootq cool off` has been run' % t['id'], flush=True)
+        if h:
+            print('bootq: #%d: verified IN2010 cold reset required; tools/bootq recover --ticket %d' % (t['id'],t['id']), flush=True)
+        else:
+            print('bootq: #%d: cold recovery required; reset manually then run bootq cool off' % t['id'],flush=True)
     if left:
         print('bootq: #%d ended but a kernel is still running, with nobody watching it. It is yours: keep its log, then xl stop. '
               'The queue waits for it.' % t['id'], flush=True)
@@ -309,10 +350,12 @@ def cmd_status(a):
     with Queue() as q:
         tickets = q.tickets()
         free = phone_free()
+        hold = quarantine()
     running = [t for t in tickets if t['state'] == 'running']
     waiting = [t for t in tickets if t['state'] == 'waiting']
     if a.json:
-        print(json.dumps({'running': running, 'waiting': waiting, 'phone_free': free, 'phone_who': phone_who(), 'cooling': cooling()}))
+        print(json.dumps({'running': running, 'waiting': waiting, 'phone_free': free, 'phone_who': phone_who(), 'cooling': cooling(), 'quarantine': (
+            {key:hold[key] for key in ('ticket','runs','generation')} if hold else None)}))
         return 0
     now = time.time()
     if running:
@@ -322,6 +365,8 @@ def cmd_status(a):
             print('phone: %s, for %d s%s' % (describe(t), spent, late))
     elif not free:
         print('phone: in use outside the queue: %s' % (phone_who() or 'unknown'))
+    elif hold:
+        print('phone: waiting for verified hardware reset for #%d (%s)' % (hold['ticket'], ','.join(hold['runs'])))
     elif kernel_running():
         print('phone: a kernel is running that nobody is watching: whoever started it ends it, with xl stop')
     elif cooling():
@@ -350,13 +395,14 @@ def cmd_cancel(a):
 def cmd_cool(a):
     os.makedirs(DIR, exist_ok=True)
     path = os.path.join(DIR, 'cool')
-    if a.state == 'on':
-        open(path, 'w').close()
-    else:
-        if os.path.exists(path):
-            os.remove(path)
-        with open(os.path.join(DIR, 'cool_until'), 'w') as f:
-            f.write('0')
+    with Queue():
+        held=quarantine()
+        if held:qs.pin(DIR,held)
+        if a.state == 'on':
+            open(path,'w').close()
+        else:
+            if os.path.exists(path):os.remove(path)
+            if not held:qs.atomic(os.path.join(DIR,'cool_until'),'0')
     print('bootq: rests after each run are %s' % a.state)
     return 0
 
@@ -388,6 +434,10 @@ def main():
     r.add_argument('--wait', type=int, default=0, help='give up after so long in the queue')
     r.add_argument('command', nargs=argparse.REMAINDER)
     r.set_defaults(fn=cmd_run)
+    recover=sub.add_parser('recover',help='prove and clear one IN2010 hardware quarantine')
+    recover.add_argument('--ticket',type=int,required=True)
+    recover.add_argument('--seconds',type=int,default=600,help='bound waiting for the initial endpoint')
+    recover.set_defaults(fn=cmd_recover)
     s = sub.add_parser('status')
     s.add_argument('--json', action='store_true')
     s.set_defaults(fn=cmd_status)

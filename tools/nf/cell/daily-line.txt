@@ -1,0 +1,1 @@
+board_gpu_zap=0x8e21a000 fb_panel=amb655uv01 ufs_write=0 fb_hz=90 cpus=8 cpufreq=1 bootcpu=7 gpu=1 gpu_irq=0 gpu_dcvs=0 gpu_sleep=0 gpu_hwcg=0 syssleep=0 ufs=2 root_apfs=ufs_darwin hk_data=2 hk_data_mb=1024 var_store=0 var_data=hfs metal=2 metal_profile=1 camtl=1 metal_backend=vk var_data_format=1 edr=2 mic=4 modem=5 cell=1 iphont=1 iphont_control=1
