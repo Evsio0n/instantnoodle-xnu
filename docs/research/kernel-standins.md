@@ -45,3 +45,11 @@ others' work (symptom: kernel builds and **crashes at boot right after `Stacksho
 - The kernel build "normally ends with an error": `check_all_exports` (IOKit symbols in `config/`; three symbolsets; 217
   `exported name not in import list` about DriverKit RPC names). The kernel is linked by then; judge by the file's date.
 - The path to the repository must not contain spaces (XNU's makefiles do not survive them).
+
+## Cellular TrustZone overlay (2026-11-17 publication)
+
+The cellular overlay can opt into keymaster-backed root-key wrapping with
+`tz_keys=1`; it has RAM reboot/upgrade/refusal evidence. This supersedes any
+older “not started” statement about local hardware wrapping. It does not
+replace the main-tree stand-in, enable a passcode, eliminate fallback, or
+change the installed Daily build. [Implementation and limits](trustzone-keystore.md).

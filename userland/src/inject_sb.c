@@ -28,6 +28,8 @@
  *       com.hackios.unlock      what the lock screen does after "swipe up to open"
  *       com.hackios.layers      write down the layers SpringBoard has on the screen: see layers()
  *       com.hackios.switcher    open the switcher of running applications: see switcher()
+ *       com.hackios.catree      the window server prints its render tree for a third of a second
+ *       com.hackios.rootblack   a question: hide an empty, coloured scene presentation over the root window: see root_black()
  *   - The OnePlus 8's alert slider at the top is Do Not Disturb: see slider_focus().
  *   - Boot-arg sb_clock=N: the status bar's clock is centred N points further right, clear of the OnePlus 8's
  *     camera hole: see statusbar_clock().
@@ -954,6 +956,117 @@ layer_filter(id filter, const char *what, int depth)
 	say("redwood: layers%s: %*s  %s\n", layers_of, 2 * depth, "", line);
 }
 
+/* A description on one line: every run of spaces and newlines one space, no more than fits. */
+static void
+flat_text(const char *from, char *to, size_t size)
+{
+	size_t k = 0;
+
+	while (from != NULL && *from != 0 && k + 1 < size) {
+		if (*from == ' ' || *from == '\n' || *from == '\t' || *from == '\r') {
+			if (k > 0 && to[k - 1] != ' ') {
+				to[k++] = ' ';
+			}
+			from++;
+			continue;
+		}
+		to[k++] = *from++;
+	}
+	to[k] = 0;
+}
+
+/*
+ * What a view that presents a scene (_UIScenePresentationView: another program's windows, or SpringBoard's own, shown
+ * inside a window of SpringBoard's) holds: its instance variables by name, the objects among them by what they say of
+ * themselves -- the presenter names the scene, the presentation context the colours for "hosting" and "not hosting".
+ * For the question a layer dump cannot answer: an opaque black view of this class lay over the whole of
+ * SBRootSceneWindow while the poster switcher was open (2026-11-11, run 191813), and whose scene is it?
+ */
+static void
+scene_view_line(id view, int depth)
+{
+	Class stop = objc_getClass("UIView");
+
+	for (Class c = object_getClass(view); c != NULL && c != stop; c = class_getSuperclass(c)) {
+		unsigned count = 0;
+		Ivar *ivars = class_copyIvarList(c, &count);
+
+		for (unsigned i = 0; ivars != NULL && i < count; i++) {
+			const char *type = ivar_getTypeEncoding(ivars[i]), *name = ivar_getName(ivars[i]);
+			const uint8_t *at = (const uint8_t *)(void *)view + ivar_getOffset(ivars[i]);
+			char flat[700];
+
+			if (type == NULL || name == NULL) {
+				continue;
+			}
+			if (type[0] == '@' && type[1] != '?') {
+				id value = object_getIvar(view, ivars[i]);
+
+				if (value == NULL) {
+					say("redwood: layers%s: %*s  . %s = nil\n", layers_of, 2 * depth, "", name);
+					continue;
+				}
+				flat_text(text_of(value), flat, sizeof(flat));
+				say("redwood: layers%s: %*s  . %s = %s\n", layers_of, 2 * depth, "", name, flat);
+			} else if (type[0] == 'B' || type[0] == 'c' || type[0] == 'C') {
+				say("redwood: layers%s: %*s  . %s = %d\n", layers_of, 2 * depth, "", name, (int)*at);
+			} else if (type[0] == 'q' || type[0] == 'Q') {
+				long long value;
+
+				memcpy(&value, at, sizeof(value));
+				say("redwood: layers%s: %*s  . %s = %lld\n", layers_of, 2 * depth, "", name, value);
+			} else if (type[0] == 'i' || type[0] == 'I') {
+				int value;
+
+				memcpy(&value, at, sizeof(value));
+				say("redwood: layers%s: %*s  . %s = %d\n", layers_of, 2 * depth, "", name, value);
+			}
+		}
+		free(ivars);
+	}
+}
+
+/*
+ * FrontBoard's scenes, as SpringBoard (their host) has them: each by what it says of itself (its identifier, its client's
+ * process, its settings), whether it is active, the state of its content, how many layers its client has given it.
+ * A scene presented and without content is a view of the presentation's "not hosting" colour and nothing else.
+ */
+static void
+scenes(void)
+{
+	Class manager_class = objc_getClass("FBSceneManager");
+	id manager = manager_class && class_getClassMethod(manager_class, sel_registerName("sharedInstance")) ?
+	    SEND(id, manager_class, "sharedInstance") : NULL;
+	id all, list;
+
+	if (manager == NULL || !class_respondsToSelector(object_getClass(manager), sel_registerName("allScenes"))) {
+		return;
+	}
+	all = SEND(id, manager, "allScenes");
+	list = all && class_respondsToSelector(object_getClass(all), sel_registerName("allObjects")) ? SEND(id, all, "allObjects") : all;
+	say("redwood: layers: %ld scenes\n", list ? SEND(long, list, "count") : 0L);
+	for (long i = 0; list != NULL && i < SEND(long, list, "count"); i++) {
+		id scene = SEND1(id, list, "objectAtIndex:", long, i);
+		Class c = object_getClass(scene);
+		id layer_manager = class_respondsToSelector(c, sel_registerName("layerManager")) ? SEND(id, scene, "layerManager") : NULL;
+		id layers = layer_manager && class_respondsToSelector(object_getClass(layer_manager), sel_registerName("layers")) ?
+		    SEND(id, layer_manager, "layers") : NULL;
+		id settings = class_respondsToSelector(c, sel_registerName("settings")) ? SEND(id, scene, "settings") : NULL;
+		char flat[500];
+
+		flat_text(class_respondsToSelector(c, sel_registerName("identifier")) ? text_of(SEND(id, scene, "identifier")) : "?",
+		    flat, sizeof(flat));
+		say("redwood: layers: scene %s: %sactive, content state %ld, %ld layers, %s\n", flat,
+		    class_respondsToSelector(c, sel_registerName("isActive")) && SEND(BOOL, scene, "isActive") ? "" : "NOT ",
+		    class_respondsToSelector(c, sel_registerName("contentState")) ? SEND(long, scene, "contentState") : -1L,
+		    layers ? SEND(long, layers, "count") : -1L,
+		    settings && class_respondsToSelector(object_getClass(settings), sel_registerName("isForeground")) ?
+		    (SEND(BOOL, settings, "isForeground") ? "in the foreground" : "in the background") : "?");
+		flat_text(text_of(scene), flat, sizeof(flat));
+		say("redwood: layers:   %s\n", flat);
+	}
+}
+
 static void
 layer_line(id layer, const char *role, int depth)
 {
@@ -1077,6 +1190,13 @@ layer_line(id layer, const char *role, int depth)
 	}
 	say("redwood: layers%s: %*s%s%s %p \"%s\" %g,%g %gx%g opacity %g%s\n", layers_of, 2 * depth, "", role, class_name, (void *)layer,
 	    text_of(SEND(id, layer, "name")), frame.x, frame.y, frame.w, frame.h, (double)SEND(float, layer, "opacity"), more);
+	{
+		id delegate = SEND(id, layer, "delegate");
+
+		if (delegate != NULL && strstr(object_getClassName(delegate), "ScenePresentationView") != NULL) {
+			scene_view_line(delegate, depth);
+		}
+	}
 	for (long i = 0; filters != NULL && i < SEND(long, filters, "count"); i++) {
 		layer_filter(SEND1(id, filters, "objectAtIndex:", long, i), "filter", depth);
 	}
@@ -1233,7 +1353,60 @@ layers(void)
 	for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
 		web_views(SEND1(id, windows, "objectAtIndex:", long, i), 0);
 	}
+	if (layers_of[0] == 0) {
+		scenes();          /* (SpringBoard is the scenes' host; another program has none to tell of) */
+	}
 	say("redwood: layers%s: end\n", layers_of);
+}
+
+/*
+ * com.hackios.rootblack, a question and not a repair: every view under SBRootSceneWindow that presents a scene, has a
+ * background colour and hosts no layer at all is hidden, and said. If the poster switcher is on the screen once the
+ * opaque black view over the root window is gone, that view is what covered it (2026-11-11); what it presents and why
+ * it has nothing to host is then the thing to find. Nothing is hidden unless the notification is posted.
+ */
+static void
+root_black_under(id view, int depth)
+{
+	id subviews = SEND(id, view, "subviews");
+
+	if (depth > 6) {
+		return;
+	}
+	if (strstr(object_getClassName(view), "ScenePresentationView") != NULL) {
+		id layer = SEND(id, view, "layer");
+		id sublayers = SEND(id, layer, "sublayers");
+		bool empty = sublayers == NULL || SEND(long, sublayers, "count") == 0;
+
+		say("redwood: rootblack: %s %p: %s, %ld sublayers%s\n", object_getClassName(view), (void *)view,
+		    SEND(void *, layer, "backgroundColor") ? "a background colour" : "no background colour",
+		    sublayers ? SEND(long, sublayers, "count") : 0L, SEND(BOOL, view, "isHidden") ? ", hidden already" : "");
+		if (empty && SEND(void *, layer, "backgroundColor") != NULL && !SEND(BOOL, view, "isHidden")) {
+			SEND1(void, view, "setHidden:", BOOL, 1);
+			say("redwood: rootblack: hidden %p\n", (void *)view);
+		}
+		return;
+	}
+	for (long i = 0; subviews != NULL && i < SEND(long, subviews, "count"); i++) {
+		root_black_under(SEND1(id, subviews, "objectAtIndex:", long, i), depth + 1);
+	}
+}
+
+static void
+root_black(void)
+{
+	Class window = objc_getClass("UIWindow");
+	SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+	id windows = window && class_getClassMethod(window, all) ? ((id (*)(Class, SEL, BOOL, BOOL))objc_msgSend)(window, all, 1, 1) : NULL;
+
+	for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
+		id w = SEND1(id, windows, "objectAtIndex:", long, i);
+
+		if (strcmp(object_getClassName(w), "SBRootSceneWindow") == 0) {
+			root_black_under(w, 0);
+		}
+	}
+	say("redwood: rootblack: end\n");
 }
 
 /*
@@ -1647,6 +1820,11 @@ hk_springboard_init(void)
 		notify_register_dispatch("com.hackios.layers", &token, dispatch_get_main_queue(), ^(__unused int t) {
 			layers();
 		});
+		/* (... and on a name SpringBoard does not answer, for a dump of this program alone every so often while somebody
+		   uses the phone: SpringBoard's own dump holds its main thread a good while) */
+		notify_register_dispatch("com.hackios.layers.app", &token, dispatch_get_main_queue(), ^(__unused int t) {
+			layers();
+		});
 		return;
 	}
 	/*
@@ -1689,7 +1867,11 @@ hk_springboard_init(void)
 	plain_vibrancy();
 	original_lock_long_press = (void (*)(id, SEL, id))replace_method("SBLockHardwareButton", "longPress:", 0x1c4f6ab44UL,
 	    (IMP)lock_long_press);
-	poster_switcher = replace_method("SBMainDisplayPolicyAggregator", "_allowsCapabilityPosterSwitcherWithExplanation:",
+	/* [2026-11-11, the owner: 「我们先做锁屏壁纸」. The black screen poster_switcher_allowed() tells of was seen with hk-gl and
+	 * before; the window server composites on Metal now and nobody has looked since. The file poster_switcher in share/probes
+	 * leaves SpringBoard's own answer in place, so that a test root can see what is drawn of PosterBoard's scene today.] */
+	poster_switcher = access("/hackios/share/probes/poster_switcher", F_OK) == 0 ? NULL :
+	    replace_method("SBMainDisplayPolicyAggregator", "_allowsCapabilityPosterSwitcherWithExplanation:",
 	    0x1c507e0fcUL, (IMP)poster_switcher_allowed);
 	original_switcher_wallpaper_overlay = (void (*)(id, SEL))replace_method("SBAppSwitcherPageView",
 	    "_createOrDestroyWallpaperOverlayView", 0x1c4af7860UL, (IMP)switcher_wallpaper_overlay);
@@ -1788,6 +1970,31 @@ hk_springboard_init(void)
 	});
 	notify_register_dispatch("com.hackios.switcher", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		switcher();
+	});
+	notify_register_dispatch("com.hackios.rootblack", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		root_black();
+	});
+	/*
+	 * The window server's own account of what it draws (the notification com.hackios.catree, rwtouch notify): CoreAnimation's
+	 * debug option 5, CA_PRINT_TREE in the table of its switches' names, set in the render server for a third of a second
+	 * and cleared again; the server prints its render tree at each update while it is set. For a layer both programs have
+	 * right and the screen has not (the poster switcher's hosted context, 2026-11-11). The option is read back, since a
+	 * server that does not take debug options from a client says nothing.
+	 */
+	notify_register_dispatch("com.hackios.catree", &token, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(__unused int t) {
+		int (*set)(mach_port_t, int, int) = (int (*)(mach_port_t, int, int))dlsym(RTLD_DEFAULT, "CARenderServerSetDebugOption");
+		int (*get)(mach_port_t, int) = (int (*)(mach_port_t, int))dlsym(RTLD_DEFAULT, "CARenderServerGetDebugOption");
+
+		if (set == NULL || get == NULL) {
+			say("redwood: catree: CoreAnimation has no debug options to set here\n");
+			return;
+		}
+		say("redwood: catree: option 5 (print the tree) reads %d; set\n", get(0, 5));
+		set(0, 5, 1);
+		say("redwood: catree: it now reads %d\n", get(0, 5));
+		usleep(350000);
+		set(0, 5, 0);
+		say("redwood: catree: cleared, it reads %d\n", get(0, 5));
 	});
 	{
 		/* only with photos_import=1 among the kernel's arguments: a test's (any program may post the notification) */

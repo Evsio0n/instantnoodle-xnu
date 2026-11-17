@@ -25,7 +25,7 @@ Updated **2026-11-17**, using device evidence through **2026-11-15** from **one*
 from the phone's own flash with no computer attached. "RAM" means it has only run in a test boot from RAM. Most checks
 were made on RAM boots of the same kernel and libraries as the installed build; the notes say where that matters.
 
-This documentation update summarizes device evidence through **2026-11-15**. **Daily 2026-11-15** is installed: retained user data, UFS write/readback, actual boot and boot-success marker passed. Automatic brightness, native Settings, SIM/carrier display and the third-party installer are integrated; long-term stability remains unqualified. “Daily” is a build label. See the [current status and validation limits](docs/STATUS-2026-11-17.md). This is a documentation publication, with no system image and no claim that the public source reproduces the latest integration.
+This documentation update summarizes device evidence through **2026-11-15**. **Daily 2026-11-15** is installed: retained user data, UFS write/readback, actual boot and boot-success marker passed. Automatic brightness, native Settings, SIM/carrier display and the third-party installer are integrated; long-term stability remains unqualified. “Daily” is a build label. See the [current status and validation limits](docs/STATUS-2026-11-17.md). The follow-up source publication includes driver, userland and integration changes. No system image is distributed; a full clean public build is not yet requalified.
 
 ### Works
 
@@ -96,3 +96,7 @@ phone's `userdata` and removes Android.
 4. Cellular: the driver into the normal build; call volume, hold, keypad tones, MMS
 5. GPS: a fix outdoors, then iOS's location service
 6. Broader app compatibility, removal and persistence; secure storage and hardware ISP remain incomplete
+
+## TrustZone experiment source
+
+Keymaster-backed root wrapping, the AppleKeyStore overlay, reboot records and upgrade handling are published. They are opt-in and RAM-validated, not enabled in Daily; passcode/lock policy and legacy fallback remain incomplete. See [evidence and limits](docs/research/trustzone-keystore.md).

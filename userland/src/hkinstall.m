@@ -9,6 +9,7 @@
  * usage: hkinstall STEP...
  *   alarm SECONDS             the program's end, from now on, instead of 300 s
  *   claim                     what follows registers with TrollStore's signer fields (above)
+ *   system                    what follows uses TrollStore's managed System registration
  *   wait-net SECONDS          until en0 has an address, for at most SECONDS (the address is not printed)
  *   fetch HOST PORT PATH SHA256 FILE   HTTP/1.0 GET into FILE, and its hash checked: tools/ipa/serve.py is the other end. Says how far every 32 MB; a stall starts it again, up to three tries
  *   unpack FILE DIR           a ustar archive under DIR (tools/ipa/pack.sh made it): Payload/NAME.app and ents/BUNDLE.plist, entitlements as the host read them from the signatures
@@ -16,11 +17,14 @@
  *   state BUNDLE              what LaunchServices says of it
  *   open BUNDLE               ask for it to be launched
  *   remove BUNDLE             unregister it and delete its bundle
+ *   documents BUNDLE FILE     stage a new file in the registered app's Documents directory
+ *   component                 register our source-built RAM OS app at its actual /Applications path
  *
  * Says only steps, counts, sizes, paths under /var/containers, and results. It reads no file in the app's data container, so nothing of an account can reach a log from here.
  */
 #import <Foundation/Foundation.h>
 #include <CommonCrypto/CommonDigest.h>
+#include <copyfile.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -36,14 +40,18 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <archive.h>
+#include <archive_entry.h>
 
 #define INSTALLD_UID 33         /* _installd, who owns /var/containers/Bundle on a real phone */
 
 static bool claim_signer;
+static bool system_registration;
 
 @interface NSObject (HKPrivate)
 + (id)defaultWorkspace;
 - (BOOL)registerApplicationDictionary:(NSDictionary *)dictionary;
+- (BOOL)registerApplication:(NSURL *)url;
 - (BOOL)unregisterApplication:(NSURL *)url;
 - (BOOL)openApplicationWithBundleID:(NSString *)bundle;
 + (id)applicationProxyForIdentifier:(NSString *)bundle;
@@ -497,7 +505,7 @@ install(const char *dir)
 	own_the_tree(home);
 
 	entitlements = [NSDictionary dictionaryWithContentsOfFile:[top stringByAppendingFormat:@"/ents/%@.plist", bundle]];
-	description = describe(to, info, entitlements, @"MCMAppDataContainer", @"User");
+	description = describe(to, info, entitlements, @"MCMAppDataContainer", system_registration ? @"System" : @"User");
 	description[@"IsDeletable"] = @YES;
 	if (claim_signer) {
 		description[@"IsAdHocSigned"] = @YES;
@@ -531,6 +539,167 @@ install(const char *dir)
 	}
 	say("install: REGISTERED");
 	return 0;
+}
+
+/* Read the existing XML entitlement slot without changing any signed byte.
+ * iOS apps may contain a thin arm64 executable or an arm64 member of a FAT. */
+static uint32_t be32(const unsigned char *p)
+{
+	return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3];
+}
+static uint32_t le32(const unsigned char *p)
+{
+	return (uint32_t)p[3]<<24 | (uint32_t)p[2]<<16 | (uint32_t)p[1]<<8 | p[0];
+}
+static NSDictionary *
+binary_entitlements(NSString *path)
+{
+	NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:NULL];
+	const unsigned char *p = data.bytes;
+	NSUInteger start=0, size=data.length;
+	if (size<32) return nil;
+	if (be32(p)==0xcafebabe) {
+		uint32_t count=be32(p+4);
+		if (count>64 || 8+(uint64_t)count*20>size) return nil;
+		BOOL found=NO;
+		for (uint32_t i=0;i<count;i++) {
+			const unsigned char *arch=p+8+i*20;
+			if (be32(arch)==0x0100000c) {
+				start=be32(arch+8);size=be32(arch+12);found=YES;break;
+			}
+		}
+		if (!found || start>data.length || size>data.length-start || size<32) return nil;
+		p+=start;
+	}
+	if (le32(p)!=0xfeedfacf || le32(p+4)!=0x0100000c) return nil;
+	uint32_t count=le32(p+16), commands=le32(p+20);
+	if (count>4096 || commands>size-32) return nil;
+	NSUInteger at=32, end=32+commands;
+	for (uint32_t i=0;i<count;i++) {
+		if (at>end || end-at<8) return nil;
+		uint32_t kind=le32(p+at), length=le32(p+at+4);
+		if (length<8 || length>end-at) return nil;
+		if (kind==0x1d && length>=16) {
+			uint32_t off=le32(p+at+8), bytes=le32(p+at+12);
+			if (off>size || bytes>size-off || bytes<12) return nil;
+			const unsigned char *s=p+off;
+			uint32_t total=be32(s+4), n=be32(s+8);
+			if (be32(s)!=0xfade0cc0 || total>bytes || total<12 || n>(total-12)/8) return nil;
+			for (uint32_t j=0;j<n;j++) {
+				if (be32(s+12+j*8)!=5) continue;
+				uint32_t entry=be32(s+16+j*8);
+				if (entry>total || total-entry<8) return nil;
+				uint32_t len=be32(s+entry+4);
+				if (be32(s+entry)!=0xfade7171 || len<8 || len>total-entry || len>1048576) return nil;
+				NSData *xml=[NSData dataWithBytes:s+entry+8 length:len-8];
+				id ent=[NSPropertyListSerialization propertyListWithData:xml options:0 format:NULL error:NULL];
+				return [ent isKindOfClass:NSDictionary.class] ? ent : nil;
+			}
+			return @{};
+		}
+		at+=length;
+	}
+	return nil;
+}
+
+/* The foreground manager hands its private copy to this owner OS helper.
+ * libarchive confines all output to a new staging directory; installation
+ * then reuses the existing MCM/group/plugin and TrollStore registry path. */
+static int
+install_ipa(NSString *file)
+{
+	if (geteuid()!=0) { say("ipa: root helper authorization missing"); return 1; }
+	NSString *stage=[@"/private/var/tmp/hk-ipa-" stringByAppendingString:NSUUID.UUID.UUIDString];
+	NSFileManager *fm=NSFileManager.defaultManager;
+	if (![fm createDirectoryAtPath:stage withIntermediateDirectories:NO attributes:@{NSFilePosixPermissions:@0700} error:NULL]) return 1;
+	int original=open(".",O_RDONLY|O_DIRECTORY), result=1;
+	struct archive *a=archive_read_new();
+	archive_read_support_format_zip(a);
+	BOOL opened=archive_read_open_filename(a,file.fileSystemRepresentation,65536)==ARCHIVE_OK;
+	if (opened && chdir(stage.fileSystemRepresentation)==0) {
+		struct archive_entry *entry;
+		int rc=ARCHIVE_FATAL;
+		unsigned count=0; uint64_t bytes=0;
+		while ((rc=archive_read_next_header(a,&entry))==ARCHIVE_OK) {
+			const char *name=archive_entry_pathname(entry);
+			la_int64_t length=archive_entry_size(entry);
+			if (!name || !safe_name(name) || ++count>200000 || length<0 || (bytes+=(uint64_t)length)>4ULL*1024*1024*1024) break;
+			int flags=ARCHIVE_EXTRACT_PERM|ARCHIVE_EXTRACT_SECURE_SYMLINKS|ARCHIVE_EXTRACT_SECURE_NODOTDOT|ARCHIVE_EXTRACT_SECURE_NOABSOLUTEPATHS;
+			if (archive_read_extract(a,entry,flags)!=ARCHIVE_OK) break;
+		}
+		if (rc==ARCHIVE_EOF) result=0;
+	}
+	if (original>=0) { fchdir(original);close(original); }
+	archive_read_free(a);
+	if (!result) {
+		NSString *payload=[stage stringByAppendingPathComponent:@"Payload"];
+		NSMutableArray *apps=[NSMutableArray array];
+		for (NSString *name in [fm contentsOfDirectoryAtPath:payload error:NULL])
+			if ([name.pathExtension isEqual:@"app"]) [apps addObject:[payload stringByAppendingPathComponent:name]];
+		if (apps.count!=1) result=1;
+		NSString *ents=[stage stringByAppendingPathComponent:@"ents"];
+		[fm createDirectoryAtPath:ents withIntermediateDirectories:NO attributes:nil error:NULL];
+		if (!result) {
+			NSString *plugins=[apps[0] stringByAppendingPathComponent:@"PlugIns"];
+			for (NSString *name in [fm contentsOfDirectoryAtPath:plugins error:NULL])
+				if ([name.pathExtension isEqual:@"appex"]) [apps addObject:[plugins stringByAppendingPathComponent:name]];
+			for (NSString *app in apps) {
+				NSDictionary *info=[NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Info.plist"]];
+				NSString *bid=info[@"CFBundleIdentifier"], *exe=info[@"CFBundleExecutable"];
+				if (![bid isKindOfClass:NSString.class] || [bid containsString:@"/"] || !bid.length ||
+				    [bid hasPrefix:@"com.apple."] || [bid isEqual:@"com.hackios.trollstore-lite"] ||
+				    ![exe isKindOfClass:NSString.class] || [exe containsString:@"/"] || !exe.length) { result=1;break; }
+				NSDictionary *ent=binary_entitlements([app stringByAppendingPathComponent:exe]);
+				if (!ent || ![ent writeToFile:[ents stringByAppendingPathComponent:[bid stringByAppendingString:@".plist"]] atomically:YES]) { result=1;break; }
+			}
+		}
+		if (!result) { claim_signer=true;system_registration=true;result=install(stage.fileSystemRepresentation); }
+	}
+	say("ipa: %s",result ? "FAILED" : "installed with original executable signatures");
+	[fm removeItemAtPath:stage error:NULL];
+	return result;
+}
+
+/* This is the built-in component supplied by the selected HackiOS RAM image,
+ * rather than a downloaded User app. Keep its real path and signer metadata. */
+static int
+register_component(void)
+{
+	NSString *path = @"/Applications/TrollStoreLite.app";
+	NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Info.plist"]];
+	if (![info[@"CFBundleIdentifier"] isEqual:@"com.hackios.trollstore-lite"] ||
+	    ![NSFileManager.defaultManager isExecutableFileAtPath:[path stringByAppendingPathComponent:@"TrollStoreLite"]])
+		return 1;
+	NSDictionary *signature = [NSDictionary dictionaryWithContentsOfFile:@"/hackios/share/trollstore/component-signature.plist"];
+	NSDictionary *ent = signature[@"Entitlements"];
+	if (![ent isKindOfClass:NSDictionary.class]) return 1;
+	id workspace = [NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace];
+	if ([workspace respondsToSelector:@selector(registerApplication:)]) {
+		BOOL scanned = [workspace registerApplication:[NSURL fileURLWithPath:path]];
+		say("component: bundle URL scan %d", scanned);
+		if (scanned) return 0;
+	}
+	NSMutableDictionary *description = describe(path, info, ent, @"MCMAppDataContainer", @"System");
+	description[@"IsDeletable"] = @NO;
+	/* Read back from the host-verified signature of this exact component. */
+	if (!claim_signer) {
+		description[@"SignatureVersion"] = signature[@"SignatureVersion"];
+		description[@"IsAdHocSigned"] = signature[@"IsAdHocSigned"];
+	} else {
+		/* TrollStore's local LaunchServices compatibility description. These
+		 * database fields do not describe the executable's real CMS signer;
+		 * the owner OS build receipt retains its actual signature separately. */
+		description[@"IsAdHocSigned"] = @YES;
+	}
+	description[@"LSInstallType"] = @1;
+	description[@"_LSBundlePlugins"] = @{};
+	description[@"HasMIDBasedSINF"] = @0;
+	description[@"MissingSINF"] = @0;
+	description[@"FamilyID"] = @0;
+	description[@"IsOnDemandInstallCapable"] = @0;
+	BOOL ok = [workspace registerApplicationDictionary:description];
+	say("component: actual OS bundle registration %d, signer fields %s", ok, claim_signer ? "TrollStore compatibility claims" : "omitted");
+	return ok ? 0 : 1;
 }
 
 static int
@@ -615,6 +784,51 @@ remove_app(NSString *bundle)
 	return done ? 0 : 1;
 }
 
+/* Stage an explicitly supplied document in this registered app's container.
+ * Directory descriptors pin the destination across app activity. Publishing a
+ * new hard link leaves an existing user document untouched. */
+static int
+stage_document(NSString *bundle, NSString *source)
+{
+	id proxy = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:bundle];
+	NSURL *home = [proxy dataContainerURL];
+	NSString *name = source.lastPathComponent;
+	if (!home.isFileURL || !name.length || [name isEqualToString:@"."] || [name isEqualToString:@".."]) {
+		say("documents: no registered data container or valid filename");
+		return 1;
+	}
+	int root = open(home.path.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	if (root < 0) return 1;
+	bool made = mkdirat(root, "Documents", 0755) == 0;
+	int directory = openat(root, "Documents", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	close(root);
+	if (directory < 0) return 1;
+	if (made && fchown(directory, 501, 501) != 0) {
+		close(directory);
+		return 1;
+	}
+	int input = open(source.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW);
+	struct stat info;
+	if (input < 0 || fstat(input, &info) != 0 || !S_ISREG(info.st_mode)) {
+		if (input >= 0) close(input);
+		close(directory);
+		return 1;
+	}
+	NSString *temporary = [@".hkinstall-" stringByAppendingString:NSUUID.UUID.UUIDString];
+	int output = openat(directory, temporary.fileSystemRepresentation,
+	                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+	bool copied = output >= 0 && fcopyfile(input, output, NULL, COPYFILE_DATA) == 0 &&
+	              fsync(output) == 0 && fchown(output, 501, 501) == 0 && fchmod(output, 0644) == 0;
+	close(input);
+	if (output >= 0 && close(output) != 0) copied = false;
+	if (copied) copied = linkat(directory, temporary.fileSystemRepresentation,
+	                            directory, name.fileSystemRepresentation, 0) == 0;
+	if (output >= 0) unlinkat(directory, temporary.fileSystemRepresentation, 0);
+	close(directory);
+	say("documents: %s bytes=%lld copied=%d", bundle.UTF8String, (long long)info.st_size, copied);
+	return copied ? 0 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -629,6 +843,8 @@ main(int argc, char **argv)
 				alarm((unsigned)atoi(argv[++i]));
 			} else if (strcmp(argv[i], "claim") == 0) {
 				claim_signer = true;
+			} else if (strcmp(argv[i], "system") == 0) {
+				system_registration = true;
 			} else if (strcmp(argv[i], "wait-net") == 0 && i + 1 < argc) {
 				error = wait_net(atof(argv[++i]));
 			} else if (strcmp(argv[i], "fetch") == 0 && i + 5 < argc) {
@@ -639,12 +855,19 @@ main(int argc, char **argv)
 				i += 2;
 			} else if (strcmp(argv[i], "install") == 0 && i + 1 < argc) {
 				error = install(argv[++i]);
+			} else if (strcmp(argv[i], "ipa") == 0 && i + 1 < argc) {
+				error = install_ipa(@(argv[++i]));
+			} else if (strcmp(argv[i], "component") == 0) {
+				error = register_component();
 			} else if (strcmp(argv[i], "state") == 0 && i + 1 < argc) {
 				error = state(@(argv[++i]));
 			} else if (strcmp(argv[i], "open") == 0 && i + 1 < argc) {
 				error = open_app(@(argv[++i]));
 			} else if (strcmp(argv[i], "remove") == 0 && i + 1 < argc) {
 				error = remove_app(@(argv[++i]));
+			} else if (strcmp(argv[i], "documents") == 0 && i + 2 < argc) {
+				error = stage_document(@(argv[i + 1]), @(argv[i + 2]));
+				i += 2;
 			} else {
 				say("what is %s?", argv[i]);
 				error = 2;

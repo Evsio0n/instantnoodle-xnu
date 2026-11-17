@@ -188,9 +188,15 @@ mount_gnss_bundle(void)
  * its first container: stage0, firmware, mount points; the OS cryptex with the dyld shared cache
  * is its second container) and stage0 has mounted this image on /redwood.  What the big system image changes in iOS (userland/build.sh) is put in place on
  * the volume instead, without writing to it:
- *   - our choice of launchd jobs instead of iOS's 500 (this image's LaunchDaemons, and
- *     nothing for NanoLaunchDaemons, LaunchAngels, nor xpc's launchd.plist, which launchd
- *     would read instead of the directory);
+ *   - our choice of launchd jobs instead of iOS's 500 (this image's LaunchDaemons, its
+ *     LaunchAngels where it has them, and nothing for NanoLaunchDaemons nor xpc's
+ *     launchd.plist, which launchd would read instead of the directories). The angels
+ *     keep their own directory because launchd tells a job's kind by where its file
+ *     lies: one loaded from LaunchDaemons is a daemon to RunningBoard, FrontBoard then
+ *     does not take its process for an application's, and SpringBoard puts every scene
+ *     of such a process over the whole display by itself -- PosterBoard's switcher of
+ *     lock screens came up under an empty black copy of itself (2026-11-11, run 193614;
+ *     docs/KNOWN_ISSUES.md K15). An image without the directory gets the empty one, as before;
  *   - only our audio device among the audio server's plug-ins;
  *   - the applications iOS installs on its first boot (private/var/staged_system_apps)
  *     among the system's own in /Applications: another name for each there (a synthetic
@@ -263,7 +269,8 @@ flash_root(const char *dev)
 	check(synthetic_dir("/flash/hackios"), "a synthetic /hackios on it, for this image");
 	check(bind_dir(in_image("/LaunchDaemons"), "/flash/System/Library/LaunchDaemons") &&
 	    bind_dir(in_image("/empty"), "/flash/System/Library/NanoLaunchDaemons") &&
-	    bind_dir(in_image("/empty"), "/flash/System/Library/LaunchAngels") &&
+	    bind_dir(in_image(lstat(in_image("/LaunchAngels"), &fw_st) == 0 ? "/LaunchAngels" : "/empty"),
+	    "/flash/System/Library/LaunchAngels") &&
 	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
 	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
 	    "our audio device, not Apple's plug-ins");

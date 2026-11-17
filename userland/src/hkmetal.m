@@ -1418,6 +1418,33 @@ struct gem_close { uint32_t handle, pad; };
 @class HKMetalCommandQueue;
 @class HKMetalWork;
 
+/*
+ * A TEXTURE'S LAYOUT IN MEMORY (2026-11-11; docs/KNOWN_ISSUES.md K15, the lock screen's poster switcher).
+ *
+ * What asks, read out of QuartzCore (CA::Render::CompressedImage::new_image_with_texture_data and ::decode,
+ * CA::OGL::MetalContext::update_texture): an image that comes to CoreAnimation as GPU-compressed texture data (the poster
+ * switcher's cards are that: PosterBoard keeps its snapshots as ASTC) is, on a device that MobileGestalt says has ASTC,
+ * not decoded. The client asks the device how a texture of that format, size and number of levels lies in memory
+ * (-newTextureLayoutWithDescriptor:isHeapOrBufferBacked:), takes -size bytes at -alignment, and has the layout copy each
+ * level's blocks in (-copyFromLinearBytes:...toTextureMemory:...); the bytes go to the window server as they are, which
+ * asks its device for the same layout to know how much to take, and then for a texture over that memory
+ * (-newTextureWithBytesNoCopy:length:descriptor:deallocator:). With nil for the layout the client took 0 bytes and still
+ * made its image, and with nil for the texture the window server drew nothing: the switcher was black (run 182523), and
+ * the two previews of Settings' Wallpaper page grey.
+ *
+ * The layout is ours to choose, since nobody but the two calls above reads the memory: the levels one behind the other,
+ * each a row of 16-byte blocks after the other, nothing between. Only what CoreAnimation asks it for: ASTC's LDR formats
+ * (the compiler library has them: tools/mesa/air/air_vk.c), two dimensions, one slice. Anything else gets nil, as before.
+ */
+@interface HKTextureLayout : NSObject {
+@public
+	NSUInteger	_width, _height, _levels;
+	uint32_t	_blockWide, _blockHigh;
+}
+- (NSUInteger)size;
+- (NSUInteger)alignment;
+@end
+
 @interface HKMetalComputePipeline : _MTLComputePipelineState {
 	HKMetalDevice *_owner;
 	struct rwa_compute *_compute;
@@ -1548,6 +1575,27 @@ hk_tracing(void)
  * with where its vertices are, its scissor, and for each texture its surface. Says why a part of a page is not on the
  * screen, which no count of frames can.
  */
+/*
+ * And for a few seconds, one frame in three: while /tmp/hk_frame_dump_now is younger than four seconds (a job list makes it with
+ * ">> /tmp/hk_frame_dump_now" behind any command, just before what is to be looked at). A transition is over in a second
+ * and a still screen redraws only what changed, so "one frame in N from the start" either floods the log or misses it.
+ */
+static bool
+hk_frame_dump_now(void)
+{
+	static _Atomic uint64_t looked;
+	static _Atomic int now;
+	const uint64_t at = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 100000000ull;
+
+	if (atomic_exchange(&looked, at) != at) {
+		struct stat st;
+
+		atomic_store(&now, strcmp(getprogname(), "backboardd") == 0 && stat("/tmp/hk_frame_dump_now", &st) == 0 &&
+		    time(NULL) - st.st_mtime <= 4);
+	}
+	return atomic_load(&now) != 0;
+}
+
 static bool
 hk_frame_dumping(void)
 {
@@ -1556,7 +1604,7 @@ hk_frame_dumping(void)
 	if (answer < 0) {
 		answer = access("/hackios/share/probes/frame_dump", F_OK) == 0 && strcmp(getprogname(), "backboardd") == 0;
 	}
-	return answer != 0;
+	return answer != 0 || hk_frame_dump_now();
 }
 
 static void
@@ -2728,6 +2776,183 @@ static NSUInteger hk_uint_of(id object, const char *name) { return ((NSUInteger 
 static BOOL hk_bool_of(id object, const char *name) { return ((BOOL (*)(id, SEL))objc_msgSend)(object, sel_getUid(name)); }
 static id hk_object_of(id object, const char *name) { return ((id (*)(id, SEL))objc_msgSend)(object, sel_getUid(name)); }
 
+/* ASTC's block for a Metal pixel format (the sRGB ones from 186, the LDR ones from 204; 16 bytes a block, whatever its size). */
+static bool
+hk_astc_block(MTLPixelFormat format, uint32_t *wide, uint32_t *high)
+{
+	static const uint8_t blocks[15][2] = { { 4, 4 }, { 5, 4 }, { 5, 5 }, { 6, 5 }, { 6, 6 }, { 0, 0 }, { 8, 5 }, { 8, 6 }, { 8, 8 },
+		                               { 10, 5 }, { 10, 6 }, { 10, 8 }, { 10, 10 }, { 12, 10 }, { 12, 12 } };
+	NSUInteger index;
+
+	if (format >= 186 && format <= 200) {
+		index = format - 186;
+	} else if (format >= 204 && format <= 218) {
+		index = format - 204;
+	} else {
+		return false;
+	}
+	if (blocks[index][0] == 0) {
+		return false;
+	}
+	*wide = blocks[index][0];
+	*high = blocks[index][1];
+	return true;
+}
+
+@implementation HKTextureLayout
+
+/* Where a level starts, the bytes of one of its rows of blocks, and how many rows it has. */
+- (void)level:(NSUInteger)level at:(NSUInteger *)at row:(NSUInteger *)row rows:(NSUInteger *)rows
+{
+	NSUInteger wide = _width, high = _height, offset = 0;
+
+	for (NSUInteger i = 0;; i++) {
+		*row = (wide + _blockWide - 1) / _blockWide * 16;
+		*rows = (high + _blockHigh - 1) / _blockHigh;
+		if (i == level) {
+			break;
+		}
+		offset += *row * *rows;
+		wide = wide > 1 ? wide / 2 : 1;
+		high = high > 1 ? high / 2 : 1;
+	}
+	*at = offset;
+}
+
+- (NSUInteger)size
+{
+	NSUInteger at = 0, row = 0, rows = 0;
+
+	[self level:_levels - 1 at:&at row:&row rows:&rows];
+	return at + row * rows;
+}
+
+/* (a page: what a texture over the caller's memory has always wanted of that memory) */
+- (NSUInteger)alignment
+{
+	return (NSUInteger)vm_page_size;
+}
+
+- (void)initializeTextureMemory:(void *)memory
+{
+	(void)memory;
+}
+
+- (void)finalizeTextureMemory:(void *)memory
+{
+	(void)memory;
+}
+
+/*
+ * A region of one level, from bytes that lie row after row of blocks with linearBytesPerRow between the rows' starts
+ * (0: as close as they go). The region is in texels and is taken to its blocks; CoreAnimation hands over whole levels.
+ */
+- (void)copyFromLinearBytes:(const void *)bytes linearOffset:(NSUInteger)offset linearBytesPerRow:(NSUInteger)linearRow
+	linearBytesPerImage:(NSUInteger)linearImage toTextureMemory:(void *)memory textureSlice:(NSUInteger)slice
+	       textureLevel:(NSUInteger)level textureRegion:(MTLRegion)region
+{
+	NSUInteger at = 0, row = 0, rows = 0, first, count, left, take;
+
+	(void)linearImage;
+	if (bytes == NULL || memory == NULL || slice != 0 || level >= _levels) {
+		return;
+	}
+	[self level:level at:&at row:&row rows:&rows];
+	RW_ONCE("hkmetal: a texture layout is filled: level %lu of %lux%lu (blocks of %ux%u) from offset %lu, %lu bytes a row there "
+		"and %lu here, the region %lu,%lu %lux%lu\n", (unsigned long)level, (unsigned long)_width, (unsigned long)_height,
+		_blockWide, _blockHigh, (unsigned long)offset, (unsigned long)linearRow, (unsigned long)row,
+		(unsigned long)region.origin.x, (unsigned long)region.origin.y, (unsigned long)region.size.width,
+		(unsigned long)region.size.height);
+	first = region.origin.y / _blockHigh;
+	count = (region.size.height + _blockHigh - 1) / _blockHigh;
+	left = region.origin.x / _blockWide * 16;
+	take = (region.size.width + _blockWide - 1) / _blockWide * 16;
+	if (left >= row || first >= rows) {
+		return;
+	}
+	take = take < row - left ? take : row - left;
+	count = count < rows - first ? count : rows - first;
+	if (linearRow == 0) {
+		linearRow = take;
+	}
+	for (NSUInteger i = 0; i < count; i++) {
+		memcpy((uint8_t *)memory + at + (first + i) * row + left, (const uint8_t *)bytes + offset + i * linearRow,
+		    take < linearRow ? take : linearRow);
+	}
+}
+
+/*
+ * The other way: a region of one level out of the texture's memory into bytes that lie row after row of blocks. Sent in
+ * SpringBoard and PosterBoard (run 200532, 2026-11-11: six times, answered with nothing then, which left the caller's
+ * bytes as they were) by whatever wants a compressed image's blocks back -- to decode it for a picture in main memory, as
+ * a snapshot does. The mirror of the method above.
+ */
+- (void)copyFromTextureMemory:(const void *)memory textureSlice:(NSUInteger)slice textureLevel:(NSUInteger)level
+		textureRegion:(MTLRegion)region toLinearBytes:(void *)bytes linearOffset:(NSUInteger)offset
+	    linearBytesPerRow:(NSUInteger)linearRow linearBytesPerImage:(NSUInteger)linearImage
+{
+	NSUInteger at = 0, row = 0, rows = 0, first, count, left, take;
+
+	(void)linearImage;
+	if (bytes == NULL || memory == NULL || slice != 0 || level >= _levels) {
+		return;
+	}
+	[self level:level at:&at row:&row rows:&rows];
+	RW_ONCE("hkmetal: a texture layout is read back: level %lu of %lux%lu (blocks of %ux%u) to offset %lu, %lu bytes a row there "
+		"and %lu here, the region %lu,%lu %lux%lu\n", (unsigned long)level, (unsigned long)_width, (unsigned long)_height,
+		_blockWide, _blockHigh, (unsigned long)offset, (unsigned long)linearRow, (unsigned long)row,
+		(unsigned long)region.origin.x, (unsigned long)region.origin.y, (unsigned long)region.size.width,
+		(unsigned long)region.size.height);
+	first = region.origin.y / _blockHigh;
+	count = (region.size.height + _blockHigh - 1) / _blockHigh;
+	left = region.origin.x / _blockWide * 16;
+	take = (region.size.width + _blockWide - 1) / _blockWide * 16;
+	if (left >= row || first >= rows) {
+		return;
+	}
+	take = take < row - left ? take : row - left;
+	count = count < rows - first ? count : rows - first;
+	if (linearRow == 0) {
+		linearRow = take;
+	}
+	for (NSUInteger i = 0; i < count; i++) {
+		memcpy((uint8_t *)bytes + offset + i * linearRow, (const uint8_t *)memory + at + (first + i) * row + left,
+		    take < linearRow ? take : linearRow);
+	}
+}
+
+/*
+ * Asked of every layout in SpringBoard and PosterBoard (73 times in run 200532) and answered with 0 until now. What
+ * Apple's drivers mean by it was not found [hypothesis: how far into the memory the texture's bytes reach]; all of this
+ * layout's memory is the texture's, so its size is the answer that leaves nothing out.
+ */
+- (NSUInteger)watermark
+{
+	return [self size];
+}
+
+/*
+ * Apple's layout class has more selectors than the five CoreAnimation sends here, and what else may send one is not
+ * known. An unrecognized selector ends the process; one sent to this object is said once and answered with nothing.
+ */
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector
+{
+	NSMethodSignature *signature = [super methodSignatureForSelector:selector];
+
+	if (signature == nil) {
+		rw_print("hkmetal: a texture layout is sent %s, which it has not got: answered with nothing\n", sel_getName(selector));
+		signature = [NSMethodSignature signatureWithObjCTypes:"v@:"];
+	}
+	return signature;
+}
+
+- (void)forwardInvocation:(NSInvocation *)invocation
+{
+	(void)invocation;
+}
+
+@end
+
 @implementation HKMetalDevice
 
 - (id)newLibraryWithStitchedDescriptor:(id)descriptor error:(NSError **)error
@@ -3477,22 +3702,54 @@ static id hk_object_of(id object, const char *name) { return ((id (*)(id, SEL))o
  * which is what setProtectionOptions: did to the window server and what the first of these just
  * did to mediaserverd.
  *
- * A texture LAYOUT answers bytes-per-row, image stride, size and alignment for a descriptor
- * without allocating anything, so CoreAnimation can size an IOSurface before it has a texture.
- * nil is the honest answer rather than a measured one: CA::Render::new_mtl_texture_layout hands
- * our result straight back to its own caller, and that caller is in no other image of this cache,
- * so whether a nil is tolerated is unknown. If the log says it is not, the next step is a small
- * object over the arithmetic -newTextureWithDescriptor: below already does.
+ * A texture LAYOUT answers size and alignment for a descriptor without allocating anything, and
+ * copies a level's bytes into memory laid out so: HKTextureLayout, above, says who asks and why
+ * nil was the wrong answer for the one case it now serves (ASTC, two dimensions, one slice).
+ * For every other descriptor nil stays the answer, and is said once.
  */
+/*
+ * CAMetalLayer raises 'CAMetalLayerInvalid: unsupported extended range format' for a layer of a ten-bit XR format on a
+ * device that does not say this (QuartzCore, layer_private_check_pixel_format); the Astronomy wallpaper's program ended
+ * on that 22 times in two minutes (run 203444, 2026-11-11). BGR10_XR and BGR10_XR_sRGB are served, as eight bits
+ * (hkdrawable.m, rwd_formats). The probe no_xr10 says no again.
+ */
+- (BOOL)supportsExtendedXR10Formats
+{
+	static int no = -1;
+
+	if (no < 0) {
+		no = access("/hackios/share/probes/no_xr10", F_OK) == 0;
+		rw_print("hkmetal: the ten-bit XR formats: %s\n", no ? "not offered (the probe no_xr10)" : "offered, served as eight bits");
+	}
+	return !no;
+}
+
 - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)descriptor
 			isHeapOrBufferBacked:(BOOL)backed
 {
-	(void)descriptor;
+	HKTextureLayout *layout;
+	uint32_t wide = 0, high = 0;
+
 	(void)backed;
-	RW_ONCE("hkmetal: a texture layout was asked for and this driver has none to give; "
-		"CoreAnimation sizes a surface with it before any texture exists, and nil is the "
-		"answer until a boot says nil is not tolerated\n");
-	return nil;
+	if (descriptor == nil || !hk_astc_block([descriptor pixelFormat], &wide, &high) || [descriptor textureType] != MTLTextureType2D ||
+	    [descriptor depth] > 1 || [descriptor arrayLength] > 1 || [descriptor sampleCount] > 1 || [descriptor width] == 0 ||
+	    [descriptor height] == 0 || access("/hackios/share/probes/no_texture_layout", F_OK) == 0) {
+		RW_ONCE("hkmetal: a texture layout was asked for that this driver has none for (format %lu, type %lu): nil; "
+			"it has one for ASTC in two dimensions\n", (unsigned long)[descriptor pixelFormat],
+			(unsigned long)[descriptor textureType]);
+		return nil;
+	}
+	layout = [[HKTextureLayout alloc] init];
+	layout->_width = [descriptor width];
+	layout->_height = [descriptor height];
+	layout->_levels = [descriptor mipmapLevelCount] != 0 ? [descriptor mipmapLevelCount] : 1;
+	layout->_blockWide = wide;
+	layout->_blockHigh = high;
+	RW_ONCE("hkmetal: a texture layout: format %lu, %lux%lu, %lu levels: %lu bytes (CoreAnimation's compressed images; the "
+		"levels one behind the other, rows of 16-byte blocks)\n", (unsigned long)[descriptor pixelFormat],
+		(unsigned long)layout->_width, (unsigned long)layout->_height, (unsigned long)layout->_levels,
+		(unsigned long)[layout size]);
+	return layout;
 }
 
 /*
@@ -3529,25 +3786,58 @@ static id hk_object_of(id object, const char *name) { return ((id (*)(id, SEL))o
  * is a line in the log -- mediaserverd died 43 times on the one above this before it was
  * answered at all.
  *
- * nil and not a texture, because the contract has no call for it. rwa_texture_from_surface takes
- * an IOSurface, which the kernel hands over as a buffer (kHKSurface); a bare pointer into
- * the caller's address space is a different import, and a texture made by copying instead would
- * be wrong in a way nothing would report: the caller writes to its own pages and expects the
- * texture to change.
+ * The one caller that is known, and what it hands over (HKTextureLayout, above): memory laid out
+ * by this driver's own layout for the descriptor, filled once and never written again (a
+ * compressed image's bytes). For that the contract needs no import of a bare pointer: a texture of
+ * the descriptor is made and each level written from where the layout says it lies, which is the
+ * call CoreAnimation itself makes for its images that are not laid out
+ * (-replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:). It is a copy: a caller
+ * that went on writing to its pages would not see the texture follow, and none is known that does.
+ * The deallocator, if there is one, is called as soon as the copy is made: the memory is not
+ * needed after it. For anything this driver has no layout for the answer is nil, as it was.
  */
 - (id)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length
 		     descriptor:(MTLTextureDescriptor *)descriptor
 		    deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-	(void)bytes;
-	(void)length;
-	(void)descriptor;
-	(void)deallocator;
-	RW_ONCE("hkmetal: a texture over the caller's own memory was asked for, and the "
-		"contract has no import for a bare pointer -- only for an IOSurface. Copying "
-		"instead would be worse than nil: the caller writes to its pages and expects the "
-		"texture to follow\n");
-	return nil;
+	HKTextureLayout *layout;
+	id<MTLTexture> texture;
+
+	if (bytes == NULL || access("/hackios/share/probes/no_texture_nocopy", F_OK) == 0) {
+		layout = nil;
+	} else {
+		layout = [self newTextureLayoutWithDescriptor:descriptor isHeapOrBufferBacked:NO];
+	}
+	if (layout == nil || [layout size] > length) {
+		RW_ONCE("hkmetal: a texture over the caller's own memory was asked for (format %lu, %lu bytes) and this driver "
+			"has no layout for it: nil\n", (unsigned long)[descriptor pixelFormat], (unsigned long)length);
+		[layout release];
+		return nil;
+	}
+	texture = [self newTextureWithDescriptor:descriptor];
+	if (texture != nil) {
+		NSUInteger at = 0, wide = layout->_width, high = layout->_height;
+
+		for (NSUInteger level = 0; level < layout->_levels; level++) {
+			const NSUInteger row = (wide + layout->_blockWide - 1) / layout->_blockWide * 16;
+			const NSUInteger rows = (high + layout->_blockHigh - 1) / layout->_blockHigh;
+
+			[texture replaceRegion:MTLRegionMake2D(0, 0, wide, high) mipmapLevel:level slice:0
+				     withBytes:(const uint8_t *)bytes + at bytesPerRow:row bytesPerImage:0];
+			at += row * rows;
+			wide = wide > 1 ? wide / 2 : 1;
+			high = high > 1 ? high / 2 : 1;
+		}
+		RW_ONCE("hkmetal: a texture over the caller's own memory: format %lu, %lux%lu, %lu levels, written from the "
+			"layout's %lu bytes (a copy: CoreAnimation's compressed images)\n", (unsigned long)[descriptor pixelFormat],
+			(unsigned long)layout->_width, (unsigned long)layout->_height, (unsigned long)layout->_levels,
+			(unsigned long)[layout size]);
+	}
+	[layout release];
+	if (deallocator != NULL) {
+		deallocator(bytes, length);
+	}
+	return texture;
 }
 
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
@@ -4422,6 +4712,97 @@ hk_420_line(const uint8_t *yl, const uint8_t *near, const uint8_t *far, NSUInteg
 }
 
 /*
+ * A 420 SURFACE'S COPY, KEPT FOR WHEN IT IS ASKED FOR AGAIN (T40, the stutter of daily use). CoreAnimation lets go of
+ * a surface's texture when its layer leaves the screen and asks for a new one when it comes back: the wallpaper's
+ * surface (1105x1160) at every opening and closing of an application, and each time the copy was made again from
+ * nothing, 62 to 77 ms in the floats of the first copy (runs 131351 and 132748: one every application phase of the
+ * tour, and of the display's missed refreshes the time spent in these goes with them most, r 0.68). So the copy of
+ * a surface stays here a while, with the surface it is of; asked for again it is the same texture, which looks at
+ * its surface's seed when it is drawn with (hkBiplanarLook) as it always did. Six at most, the one longest unused
+ * out first, and none that was not asked for in the last 3000 commits. The file biplanar_nokeep in share/probes
+ * turns it off.
+ */
+#define HK_BIPLANAR_KEPT 6
+static struct {
+	uint32_t surface_id;
+	NSUInteger width, height;
+	id texture;                     /* retained */
+	uint64_t used;                  /* hk_commits when it was last asked for */
+} hk_biplanar_kept[HK_BIPLANAR_KEPT];
+static _Atomic(uint64_t) hk_commits;
+
+static bool
+hk_biplanar_keeps(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		on = access("/hackios/share/probes/biplanar_nokeep", F_OK) != 0;
+	}
+	return on != 0;
+}
+
+/* The kept copy of this surface at this size, retained for the caller, or nil; and what was not asked for in a long while goes. */
+static id
+hk_biplanar_kept_take(void *surface, NSUInteger width, NSUInteger height)
+{
+	uint32_t (*id_of)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+	const uint64_t now = atomic_load(&hk_commits);
+	id found = nil;
+
+	if (id_of == NULL || !hk_biplanar_keeps()) {
+		return nil;
+	}
+	const uint32_t sid = id_of(surface);
+
+	@synchronized([NSProcessInfo class]) {
+		for (unsigned i = 0; i < HK_BIPLANAR_KEPT; i++) {
+			if (hk_biplanar_kept[i].texture == nil) {
+				continue;
+			}
+			if (found == nil && hk_biplanar_kept[i].surface_id == sid && hk_biplanar_kept[i].width == width &&
+			    hk_biplanar_kept[i].height == height) {
+				hk_biplanar_kept[i].used = now;
+				found = [hk_biplanar_kept[i].texture retain];
+			} else if (now - hk_biplanar_kept[i].used > 3000) {
+				[hk_biplanar_kept[i].texture release];
+				hk_biplanar_kept[i].texture = nil;
+			}
+		}
+	}
+	return found;
+}
+
+static void
+hk_biplanar_kept_put(void *surface, NSUInteger width, NSUInteger height, id texture)
+{
+	uint32_t (*id_of)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+
+	if (id_of == NULL || texture == nil || !hk_biplanar_keeps()) {
+		return;
+	}
+	@synchronized([NSProcessInfo class]) {
+		unsigned at = 0;
+
+		for (unsigned i = 0; i < HK_BIPLANAR_KEPT; i++) {
+			if (hk_biplanar_kept[i].texture == nil) {
+				at = i;
+				break;
+			}
+			if (hk_biplanar_kept[i].used < hk_biplanar_kept[at].used) {
+				at = i;
+			}
+		}
+		[hk_biplanar_kept[at].texture release];
+		hk_biplanar_kept[at].surface_id = id_of(surface);
+		hk_biplanar_kept[at].width = width;
+		hk_biplanar_kept[at].height = height;
+		hk_biplanar_kept[at].texture = [texture retain];
+		hk_biplanar_kept[at].used = atomic_load(&hk_commits);
+	}
+}
+
+/*
  * MTLPixelFormatYCBCR8_420_2P (M5d), which CoreAnimation asks for by name for a 420f or 420v surface:
  * the stock wallpaper's Head.HEIC decodes to one, and without it the layer's mask is what shows, as a
  * red shape. A texture of one format over two planes needs a VkSamplerYcbcrConversion in an immutable
@@ -4454,6 +4835,14 @@ hk_420_line(const uint8_t *yl, const uint8_t *near, const uint8_t *far, NSUInteg
 			planes != NULL ? (unsigned long)planes(s) : 0ul);
 		return nil;
 	}
+	if (!raw) {
+		/* (A 420 SURFACE'S COPY, KEPT: the same texture again, which follows its surface's seed by itself) */
+		id kept = hk_biplanar_kept_take(s, w, h);
+
+		if (kept != nil) {
+			return kept;
+		}
+	}
 	uint8_t *rgba = malloc(w * h * 4);
 
 	if (rgba == NULL || lock(s, 1 /* kIOSurfaceLockReadOnly */, NULL) != 0) {
@@ -4467,8 +4856,24 @@ hk_420_line(const uint8_t *yl, const uint8_t *near, const uint8_t *far, NSUInteg
 	const bool video = pixel_format != NULL && (pixel_format(s) & 0xff) == 'v';
 	const float y_scale = video ? 255.0f / 219.0f : 1.0f, y_base = video ? 16.0f : 0.0f;
 	const float c_scale = video ? 255.0f / 224.0f : 1.0f;
+	/*
+	 * (T40) The first copy of format 500 by the lines every later copy of it is made by (hk_420_line: 16-bit fixed
+	 * point, chroma centred up and down only), a few ms where the floats below took 51 to 77 for the wallpaper's
+	 * surface. Format 540's raw values stay with the floats, which is what real Metal's rows were compared with;
+	 * the file biplanar_float in share/probes gives format 500 the floats back, to compare.
+	 */
+	static int floats = -1;
 
-	for (NSUInteger j = 0; j < h; j++) {
+	if (floats < 0) {
+		floats = access("/hackios/share/probes/biplanar_float", F_OK) == 0;
+	}
+	for (NSUInteger j = 0; !raw && !floats && j < h; j++) {
+		const NSUInteger c0 = j / 2;
+		const NSUInteger c1 = (j & 1) ? MIN(c0 + 1, ch - 1) : (c0 > 0 ? c0 - 1 : 0);
+
+		hk_420_line(y + j * ys, uv + c0 * uvs, uv + c1 * uvs, w, video, rgba + j * w * 4);
+	}
+	for (NSUInteger j = 0; (raw || floats) && j < h; j++) {
 		const uint8_t *yl = y + j * ys;
 		/* centred chroma, half a texel each way: 3/4 of the near row and 1/4 of the far */
 		const NSUInteger c0 = j / 2;
@@ -4521,6 +4926,7 @@ hk_420_line(const uint8_t *yl, const uint8_t *near, const uint8_t *far, NSUInteg
 		uint32_t (*seed_of)(void *) = dlsym(RTLD_DEFAULT, "IOSurfaceGetSeed");
 
 		[made hkBiplanarOf:s seed:seed_of != NULL ? seed_of(s) : 0 sum:hk_420_sum(y, ys, w, h)];
+		hk_biplanar_kept_put(s, w, h, made);
 	}
 	unlock(s, 1, NULL);
 	atomic_fetch_add(&hk_stat.biplanar, 1);
@@ -6389,14 +6795,35 @@ rw_texture_read(struct rwa_texture *t, unsigned level, unsigned slice, const uns
 
 @end
 
-/* (WHAT A FRAME PUT WHERE, above) */
+/* (WHAT A FRAME PUT WHERE, above) One frame in 300, or in as many as the file frame_dump says in digits (a screen that is
+ * only up for a few seconds, as the poster switcher's black one of run 184929, has no three hundredth frame). */
+static uint64_t
+hk_frame_dump_every(void)
+{
+	static uint64_t every;
+
+	if (every == 0) {
+		char digits[16] = { 0 };
+		const int file = open("/hackios/share/probes/frame_dump", O_RDONLY);
+
+		every = 300;
+		if (file >= 0) {
+			if (read(file, digits, sizeof(digits) - 1) > 0 && strtoul(digits, NULL, 10) >= 1) {
+				every = strtoul(digits, NULL, 10);
+			}
+			close(file);
+		}
+	}
+	return every;
+}
+
 static void
 hk_note_frame_draw(HKMetalWork *work)
 {
 	const uint64_t frame = atomic_load(&hk_commits);
 
-	if (!hk_frame_dumping() || frame % 300 != 0) {
-		return;
+	if (!hk_frame_dumping() || frame % (hk_frame_dump_now() ? 3 : hk_frame_dump_every()) != 0) {
+		return;                         /* (one frame in three of those few seconds: every one would be 3000 lines a second) */
 	}
 	NSString *label = [work->render label] ?: @"(none)";
 	id target = work->colorCount > 0 ? work->color[0] : nil;

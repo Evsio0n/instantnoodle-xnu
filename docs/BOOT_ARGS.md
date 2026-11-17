@@ -591,3 +591,11 @@ Serving System Events enable. The observation window lasts 12 seconds
 after the enable ACK. An explicit clear precedes port retirement on the
 normal path. The 15-second command deadlines and the existing mission
 teardown apply. Default zero sends no fixture traffic.
+
+## TrustZone key-store experiment (cellular overlay; not enabled in Daily)
+
+- `tz_keys=1`: opt into Qualcomm keymaster-backed root-record handling and AES key wrapping. RAM validation only; fallback/legacy behavior remains.
+- `tz_keys=2` / `3`: diagnostic record/log modes; may emit private key records or secure-world logs. Never publish their output.
+- `tz_patch=YYYYMM`: test the configured keymaster patch level and record upgrade/refusal behavior; not a daily configuration recommendation.
+
+See [TrustZone key-store scope and limits](research/trustzone-keystore.md).

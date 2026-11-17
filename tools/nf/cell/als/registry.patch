@@ -1,0 +1,69 @@
+--- a/hk_slpi_boot.c
++++ b/hk_slpi_boot.c
+@@ -1447,19 +1447,23 @@
+  thread_block(THREAD_CONTINUE_NULL);
+ }
+ static bool cell_als_coefficient_served(void);
++extern void hk_front_light_begin(void);
++extern void hk_front_light_sample(uint64_t now, uint64_t tick, unsigned seq, unsigned status, uint32_t lux);
++extern void hk_front_light_tick(uint64_t now);
++extern void hk_front_light_end(void);
+ #include "slpi_glink_probe.inc"
+ static void slpi_dma_arena_trial(unsigned mode);
+ static bool slpi_load_configs(void);
+ static void slpi_unload_configs(void);
+ static void lc_native_broker_receipt(void);
+ static void slpi_boot_thread(void *parameter,wait_result_t result){
+- if(!slpi_wait_firmware(NULL,boot_metadata_ready,boot_clock_ms,boot_wait_ms)){tell("slpi: /hackios/fw/slpi.mdt unavailable/cancelled within60s; NO hardware mutation\n");thread_terminate(current_thread());return;}
++ if(!slpi_wait_firmware(NULL,boot_metadata_ready,boot_clock_ms,boot_wait_ms)){tell("slpi: /hackios/fw/slpi.mdt unavailable/cancelled within60s; NO hardware mutation\n");hk_front_light_end();thread_terminate(current_thread());return;}
+  if(link_probe_enabled==12 && !slpi_load_configs()){
+-  tell("slpi-std: verified registry pack unavailable\n");thread_terminate(current_thread());return;
++  tell("slpi-std: verified registry pack unavailable\n");hk_front_light_end();thread_terminate(current_thread());return;
+  }
+  struct slpi_boot_evidence e={1,1,1,1,1};
+  lck_mtx_lock(&dsp_lock);
+- if(os_atomic_load(&boot_cancelled,acquire)){lck_mtx_unlock(&dsp_lock);slpi_unload_configs();thread_terminate(current_thread());return;}
++ if(os_atomic_load(&boot_cancelled,acquire)){lck_mtx_unlock(&dsp_lock);slpi_unload_configs();hk_front_light_end();thread_terminate(current_thread());return;}
+  int ready=slpi_boot_start_once(&boot_once,&boot_ops,&e);
+  tell("slpi: boot-only result READY=%d phase=%s owned=%u poisoned=%u\n",ready,boot_once.last?boot_once.last:"none",boot_once.owned_running,boot_once.poisoned);
+  if(ready&&link_probe_enabled>=7)slpi_dma_arena_trial(link_probe_enabled>=10?5:4);
+@@ -1473,7 +1477,7 @@
+  }
+  lc_native_broker_receipt();
+  tell("slpi: ended; active=%u floors-held=%u poisoned=%u; COLD REBOOT before next DSP attempt\n",boot_once.owned_running,boot_once.proxy_held,boot_once.poisoned);
+- lck_mtx_unlock(&dsp_lock);slpi_unload_configs();thread_terminate(current_thread());
++ lck_mtx_unlock(&dsp_lock);slpi_unload_configs();hk_front_light_end();thread_terminate(current_thread());
+ }
+ /* Snapshot only the global MMU-500 stream routing registers. A stream with no
+  * match says nothing about ownership of a context bank or page-table memory. */
+@@ -1901,7 +1905,11 @@
+   link_probe_enabled=12;oem130_enabled=1;oem130_attrs=2;oem130_wise=1;
+   new_from=~0u;pause_ms=0;step=7;
+   tell("cell-als: front STK33502 bring-up requested; coexisting cell=1\n");
+-  if(kernel_thread_start(slpi_boot_thread,NULL,&thread)==KERN_SUCCESS)thread_deallocate(thread);
++  hk_front_light_begin();
++  if (kernel_thread_start(slpi_boot_thread, NULL, &thread) == KERN_SUCCESS)
++      thread_deallocate(thread);
++  else
++      hk_front_light_end();
+   return;
+  }
+  uint32_t arena_trial=0;
+--- a/slpi_glink_probe.inc
++++ b/slpi_glink_probe.inc
+@@ -183,6 +183,7 @@
+     if(lc_fresh==1)tell("light-source: first seq=%u tick=%llu flag=%u group4=%u group5=%u ack=%x events=%x\n",
+        src->count,(unsigned long long)m->ticks,lc_policy_enabled,path,factory,sensor_link.registry.ack_ok,sensor_link.registry.received);
+     if(lc_policy_enabled==1 && path && factory && cell_als_coefficient_served() && !sensor_link.registry.invalidated){
++     hk_front_light_sample(now_us(), m->ticks, src->count, m->status, m->lux_bits);
+      lc_called++;hk_light_panel_sample(now_us(),m->ticks,src->config.source.lo,src->config.source.hi,src->count,m->status,m->lux_bits);
+      if(!i_live && hk_light_panel_is_armed()){
+       i_live=now_us();tell("cell-als: live_front=1 panel_owner=1 us=%llu tick=%llu\n",
+@@ -191,6 +192,7 @@
+     }
+    }
+   }
++  if (lc_policy_enabled == 1) hk_front_light_tick(now_us());
+   if(lc_policy_enabled==1 && sensor_link.wise_stream)hk_light_panel_tick(now_us());
+   if(pumped<32 && sg_registry_reads_done(&sensor_link)){
+    struct sd_state *deps=&sensor_link.deps;

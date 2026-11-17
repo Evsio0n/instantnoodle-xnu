@@ -102,3 +102,25 @@ __pycache__/
 /tools/nf/cell/ref-pro/
 /tools/wifi-sleep/run-*/
 /tools/wifi-sleep/control-host-*/
+
+# Private identity material and run/build output never belong in a publication.
+/xnuloader/owner_key.h
+/out/
+/logs/
+/archives/
+/backup/
+/backups/
+/fw-wifi/
+/fw-camera/
+/fw-audio/
+/userland/obj/
+.DS_Store
+._*
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+*.mobileprovision
+*.pcap
+*.pcapng

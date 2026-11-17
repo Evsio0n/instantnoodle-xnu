@@ -1,5 +1,6 @@
 #!/bin/bash
 # mk_userland.sh: the user-space pieces of the cellular system, built in the oneplus8-build container from userland/src into userland/obj:
+#   cellular-settings.dylib  the read-only current-network row in the Cellular Settings page
 #   hk_commcenter           the stand-in for CommCenter: CoreTelephony's two Mach services answered from the kernel's kern.hackios.* (signal, carrier,
 #                           SMS both ways, calls through CallKit as com.apple.coretelephony: its Info.plist is a section of the program, and it is
 #                           signed with the entitlements CallKit asks a telephony provider for)
@@ -13,9 +14,12 @@ SDK=$THEOS/sdks/iPhoneOS16.5.sdk; LDID=$THEOS/toolchain/linux/iphone/bin/ldid   
 xnu-clang -arch arm64 -isysroot $SDK -O1 -fobjc-arc -Wall -Wno-unused-function -Wno-deprecated-declarations -framework Foundation -framework CallKit \
 	-Wl,-sectcreate,__TEXT,__info_plist,src/hk_commcenter.info.plist -o obj/hk_commcenter src/hk_commcenter.m
 $LDID -Ssrc/hk_commcenter.entitlements obj/hk_commcenter
+xnu-clang -arch arm64 -isysroot "$SDK" -O1 -fobjc-arc -Wall -Wextra -dynamiclib \
+    -install_name /hackios/lib/cellular-settings.dylib -framework Foundation -o obj/cellular-settings.dylib src/settings_cellular_network.m
+$LDID -S obj/cellular-settings.dylib
 xnu-clang -arch arm64 -isysroot $SDK -O1 -fobjc-arc -Wall -dynamiclib -install_name /hackios/lib/libhackios-call.dylib -framework Foundation \
 	-o obj/libhackios-call.dylib src/inject_call.m
 xnu-clang -arch arm64 -isysroot $SDK -O1 -Wall -o obj/oslog src/oslog.c
 $LDID -Ssrc/oslog.entitlements obj/oslog
-ls -la obj/hk_commcenter obj/libhackios-call.dylib obj/oslog | awk "{print \$5, \$9}"
+ls -la obj/hk_commcenter obj/cellular-settings.dylib obj/libhackios-call.dylib obj/oslog | awk "{print \$5, \$9}"
 '

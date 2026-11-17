@@ -51,3 +51,5 @@ screenshots in [images/](images/).
 ## Documentation rules
 Which file to update for which change is in [../AGENTS.md](../AGENTS.md#keeping-documentation-current). Status vocabulary: *verified on phone*, *built (QEMU/host-tested)*, *unverified*; tags in research pages: *observed*, *source*, *inferred*, *hypothesis*.
 The sibling directories next to the workspace (`ios-instantnoodle/`, `ios-topaz/`, `unixnu/`, `UniXNU-instantnoodle/`, `uefi-instantnoodle/`, `hackios-ref/`) are other or abandoned projects and snapshots, **not** part of this documentation.
+
+- [TrustZone key wrapping](research/trustzone-keystore.md): opt-in cellular overlay, RAM evidence, upgrade handling and security limits.

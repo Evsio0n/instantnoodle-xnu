@@ -4,7 +4,8 @@
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE/../../.."
-K=$(cat out/cell-kernel.txt)
+# (CELL_KERNEL=FILE: that kernel and not the one build.py made last)
+K=${CELL_KERNEL:-$(cat out/cell-kernel.txt)}
 TAG=$1; SECS=$2; MORE=${3:-}
 case $SECS in ''|*[!0-9]*) echo "boot.sh: SECS is '$SECS': nothing started"; exit 1 ;; esac
 ROOT=${CELL_ROOT:-out/stock-cellular-ui-888873f6614dd16d87257b39597e418acf3442ca9e6fb70baa46b5b6bc24720a.apfs}
@@ -17,9 +18,19 @@ PREFIX=$(wc -c < ../oneplus8-audit/gpu-plan/observed-loader-prefix.txt)
 [ $(( ${#FULL} + PREFIX )) -le 607 ] || { echo "command line $(( ${#FULL} + PREFIX )) bytes, the loader takes 607"; exit 1; }
 echo "kernel $(shasum -a 256 "$K" | cut -c1-8) root $(shasum -a 256 $ROOT | cut -c1-8) bytes $(( ${#FULL} + PREFIX )) args: $LINE"
 export PATH=/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH
-export XL_KERNEL=$K XL_RAMDISK=$ROOT XL_SECS=$SECS XL_FOLLOW=2 XL_FOLLOW_KEEP=1 XL_SB_DELAY=8 XL_CMDLINE="$LINE"
+export XL_KERNEL=$K XL_RAMDISK=$ROOT XL_SECS=$SECS XL_FOLLOW=2 XL_FOLLOW_KEEP=${CELL_FOLLOW_KEEP-1} XL_SB_DELAY=8 XL_CMDLINE="$LINE"
+# CELL_FOLLOW_KEEP="": retain only the current live snapshot (default keeps history).
 # (CELL_DONE=REGEX: the run ends as soon as the kernel's log says it; SECS is then only the longest it may take)
 [ -n "${CELL_DONE:-}" ] && export XL_DONE="$CELL_DONE"
 OUT=logs/cell-$TAG.out
-exec tools/bootq run --who cell --what "cellular, the Pro's driver: $TAG" --no-touch --max $((SECS + 420)) -- \
-	"bash '$HERE/inner.sh' > $OUT 2>&1; rc=\$?; tail -4 $OUT | cut -c1-200; exit \$rc"
+# (CELL_BESIDE=COMMAND: run beside the boot, on the computer, and ended with it: a watcher that takes screenshots at the run's marks.
+# CELL_THEN=COMMAND: run after a boot that ended well, with the phone back in the stock fastboot: the installed system started again.
+# CELL_WHAT=TEXT: what the queue says the ticket is.)
+BESIDE=${CELL_BESIDE:+"( $CELL_BESIDE ) > logs/cell-$TAG.beside 2>&1 & B=\$!; "}
+UNBESIDE=${CELL_BESIDE:+"kill \$B 2>/dev/null; "}
+THEN=${CELL_THEN:+"[ \$rc -eq 0 ] && { $CELL_THEN; } >> $OUT 2>&1; "}
+WHAT=${CELL_WHAT:-}; [ -n "$WHAT" ] || WHAT="cellular, the Pro's driver: $TAG"
+# (CELL_HANDS=1: somebody uses the phone during the run: the queue does not say "no touching")
+NOTOUCH=--no-touch; [ -n "${CELL_HANDS:-}" ] && NOTOUCH=
+exec tools/bootq run --who cell --what "$WHAT" $NOTOUCH --max $((SECS + 420 + ${CELL_ENTER_WAIT:-120})) -- \
+	"${BESIDE}bash '$HERE/inner.sh' > $OUT 2>&1; rc=\$?; ${UNBESIDE}${THEN}tail -4 $OUT | cut -c1-200; exit \$rc"

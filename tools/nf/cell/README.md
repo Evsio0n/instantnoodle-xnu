@@ -1,3 +1,7 @@
+## Current installed daily release (2026-11-15)
+
+Daily2026-11-15 is installed in UFS bundle slot1, readback and actual UFS bootok verified. Current receipt/pins are `out/daily-installed.json` and `out/daily-*-installed.txt`; workflow and limitations are in `daily/README.md`. Legacy cell-installed pointers below remain frozen control artifacts for old builders, not current phone status. Do not stop the untimed installed kernel as an unattended test.
+
 # The cellular path (boot-arg `cell=1`)
 
 The OnePlus 8's modem is a Snapdragon X55 on PCIe 2, a chip of its own beside the SoC. This directory holds the kernel
@@ -22,6 +26,10 @@ The port is a script, so it can be made again from a newer copy of the Pro's fil
 | `port.py REF_DIR OUT_DIR` | Makes `instantnoodle_cell.c`, `hk_mhi.c`, `hk_mhi.h`, `cell_net.c`, `cell_net.h` from them. Every change to the Pro's files is a named replacement in this script, and it stops if a place it changes is not found exactly once |
 | `voice_port.py` | Makes the audio drivers in `overlay/` from this tree's (`voice-base/`) plus the Pro's call additions |
 | `cell_dt.cpp` | Written here: adds the `baseband` entry iOS looks for in the device tree |
+| `hk_tz.c` | Written here, and not the modem's: TrustZone asked (boot-arg `tz=`, a probe in steps) and the root key its key master keeps for the key store's stand-in (`tz_keys=`). [docs/research/trustzone-keystore.md](../../../docs/research/trustzone-keystore.md) |
+| `hk_keywrap.c`, `.h` | AES key wrap (RFC 3394) under that root key, the cipher written out; its test is at the file's end (`cc -DHK_KEYWRAP_TEST hk_keywrap.c`) |
+| `overlay/xnu/files/iokit/Kernel/MiniAppleKeyStore.cpp` | The tree's key store stand-in with the wrapping under the root key (`MiniDrivers.h` beside it is the tree's, unchanged) |
+| `tz_keep.py` | Makes a file of the record a test boot printed (`tz=7`'s kept key, `--root` the root key's), for the next boot's root image |
 
 `python3 port.py ref-pro .` and `python3 voice_port.py` give back exactly the sources in this directory.
 

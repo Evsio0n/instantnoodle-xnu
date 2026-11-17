@@ -1,0 +1,87 @@
+--- a/bsd/dev/hk_apple80211.c
++++ b/bsd/dev/hk_apple80211.c
+@@ -36,6 +36,8 @@
+ #include <kern/locks.h>
+ #include <kern/thread_call.h>
+ #include <libkern/libkern.h>
++#include <net/kpi_interface.h>
++#include <sys/hk_awdl_provider.h>
+ #include <sys/errno.h>
+ #include <sys/kern_event.h>
+ #include <sys/kernel.h>
+@@ -210,6 +212,44 @@
+ 
+ static LCK_GRP_DECLARE(apple80211_lock_group, "hk-apple80211");
+ static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
++static LCK_MTX_DECLARE(awdl_provider_lock, &apple80211_lock_group);
++#define HK_AWDL_LOCK() lck_mtx_lock(&awdl_provider_lock)
++#define HK_AWDL_UNLOCK() lck_mtx_unlock(&awdl_provider_lock)
++
++static uint64_t
++hk_awdl_client_id(void)
++{
++	return proc_uniqueid(current_proc());
++}
++
++static bool
++hk_awdl_name_attached(const char *name)
++{
++	ifnet_t interface = NULL;
++	if (ifnet_find_by_name(name, &interface) || interface == NULL) {
++		return false;
++	}
++	ifnet_release(interface);
++	return true;
++}
++
++static bool
++hk_awdl_address_matches(const char *name, const uint8_t requested[6])
++{
++	ifnet_t interface = NULL;
++	uint8_t actual[6];
++	if (ifnet_find_by_name(name, &interface) || interface == NULL)
++		return false;
++	int error = ifnet_lladdr_copy_bytes(interface, actual, sizeof(actual));
++	ifnet_release(interface);
++	printf("awdl-create: explicit address match=%u\n", !error && !memcmp(actual, requested, 6));
++	return !error && !memcmp(actual, requested, 6);
++}
++
++#include "apple80211_control.inc"
++#undef HK_AWDL_LOCK
++#undef HK_AWDL_UNLOCK
++
+ static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
+ static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+ static unsigned room_least = ~0u, elements_cut; /* the least room for elements a scan's result was given, and how often it was short */
+@@ -347,6 +374,10 @@
+ 		for (unsigned i = 0; i < sizeof(has); i++) {
+ 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
+ 		}
++		if (request->req_val == HK_AWDL_DIAG_GUARD) request->req_val = HK_AWDL_DIAG_ACK;
++		if (awdl_capable(request->req_if_name)) {
++			bits[4] |= 1u; /* 20F66 capability 32 */
++		}
+ 		return give(request, bits, sizeof(bits));
+ 	}
+ 	case 19: {                              /* the radio's power: one radio. Until the driver is up it counts as on: it */
+@@ -356,6 +387,8 @@
+ 
+ 		return give(request, &answer, sizeof(answer));
+ 	}
++	case 244:
++		return awdl_channels(request);
+ 	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
+ 		request->req_val = 1;
+ 		return 0;
+@@ -625,6 +658,10 @@
+ set(const struct apple80211req *request, char *said, size_t said_size)
+ {
+ 	switch (request->req_type) {
++	case 94:
++		return awdl_create(request);
++	case 95:
++		return awdl_delete(request);
+ 	case 20:
+ 		return set_join(request, said, said_size);
+ 	case 22:                                /* leave the network */

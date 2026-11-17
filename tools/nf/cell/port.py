@@ -4,6 +4,7 @@ second cellular path of our tree, behind boot-arg cell=1. REF_DIR holds pro_mode
 as fetched; OUT_DIR gets instantnoodle_cell.c, hk_mhi.c, hk_mhi.h and cell_net.h. Every change is made here, so the port can be
 made again from a newer copy of the Pro's file. It stops if a place it changes is not found exactly once."""
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1572,6 +1573,8 @@ cell_sms_ring_sysctl(__unused struct sysctl_oid *oid, __unused void *arg1, __unu
 }
 """)
 (OUT / 'instantnoodle_cell.c').write_text(t, encoding='utf-8')
+subprocess.run(['patch', '-s', '-p1', '-i', str(Path(__file__).resolve().parent / 'sim/sim-state.patch')],
+               cwd=OUT, check=True)
 
 m = (REF / 'pro_hk_mhi.c').read_text(encoding='utf-8')
 m = once(m, '#include <sys/hk_mhi.h>\n', '#include "hk_mhi.h"\n')

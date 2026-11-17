@@ -279,7 +279,7 @@ No screen rotation, motion, compass, proximity, light, barometer; no auto-bright
 ## K11 App Store, Apple ID, iCloud, push, FairPlay — all · **Unsupported (blocked)** · S2
 App Store shows LOADING for ever (the bag request is built but never resolved; an AMS thread waits on `fairplayd.H2`, which exits 0 immediately every 10 s). No Apple ID sign-in, no `apsd` push courier (identity needs the Secure Enclave), `mobileactivationd` answers "Device is not activated".
 Safari, Settings, Sileo/Procursus (apt, tweaks) work. `nsurlsessiond` must run or Sileo downloads sit "Queued". Work: T15.
-- **Why it is blocked:** activation, Apple ID and the push courier need the device to sign with keys that Apple put into a real iPhone's Secure Enclave and registered on its servers. This phone has neither the chip nor the keys, and forging a device's identity is not done in this project. Qualcomm's TrustZone could give the keychain and a passcode real local protection (not started, T28); it cannot stand in for those keys.
+- **Why it is blocked:** activation, Apple ID and the push courier need the device to sign with keys that Apple put into a real iPhone's Secure Enclave and registered on its servers. This phone has neither the chip nor the keys, and forging a device's identity is not done in this project. Qualcomm TrustZone root-key wrapping has now been tested in opt-in RAM builds; passcode and lock enforcement remain incomplete. It cannot stand in for Apple factory keys. See [TrustZone scope](research/trustzone-keystore.md).
 - **What it means in use:** no iMessage or FaceTime, and a third-party app gets its messages only while it is open. Calls, SMS and notifications made on the phone itself (alarms, reminders, the SMS banner) do not pass through Apple's push and work.
 
 ## K12 Location — all · **Partial** · S2
@@ -355,3 +355,10 @@ The libvulkan on the phone is a day older than the source that was read.
 | Absent | Tessellation, mesh shaders, indirect command buffers, ray tracing, sparse textures | nobody in these boots |
 | Ignored | Depth bias, depth clamp, fill mode, more than one viewport, indirect draws | nobody in these boots; a 3D app would show it (inferred) |
 | Speed | No precompiled pipeline library is found for this GPU; a refused pipeline is asked for again every frame | the compositor, chronod |
+
+### TrustZone clarification — 2026-11-17
+
+Keymaster-backed wrapping and record upgrades exist in the cellular overlay
+and have RAM evidence. They are not installed or enabled in Daily. Legacy
+read/fallback and missing passcode/lock enforcement prevent treating this as
+a fully protected iPhone keychain. See [research/trustzone-keystore.md](research/trustzone-keystore.md).

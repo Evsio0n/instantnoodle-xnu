@@ -26,6 +26,8 @@
 #import <objc/runtime.h>
 #include <dlfcn.h>
 #include <stdarg.h>
+#include <pthread.h>
+#include <notify.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -86,8 +88,11 @@ say(const char *format, ...)
 
 /* ---- what the kernel says ------------------------------------------------------------------------------------------ */
 
-static struct {
-	int registered, bars, dbm, data;
+enum hk_sim_state { SIM_UNKNOWN, SIM_ABSENT, SIM_PRESENT, SIM_READY, SIM_PIN, SIM_PUK };
+static pthread_mutex_t cell_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct radio_state {
+    enum hk_sim_state sim;
+    int registered, bars, dbm, data;
 	char oper[64];
 } now;
 
@@ -100,24 +105,67 @@ sys_int(const char *name)
 	return sysctlbyname(name, &v, &n, NULL, 0) == 0 ? v : 0;
 }
 
-/* true if anything changed */
 static bool
-read_state(void)
+sim_present(enum hk_sim_state sim)
 {
-	typeof(now) was = now;
-	size_t n = sizeof(now.oper) - 1;
+    return sim >= SIM_PRESENT && sim <= SIM_PUK;
+}
 
-	now.registered = sys_int("kern.hackios.cellular_registered");
-	now.bars = sys_int("kern.hackios.cellular_bars");
-	now.dbm = sys_int("kern.hackios.cellular_dbm");
-	now.data = sys_int("kern.hackios.cellular_data");
-	memset(now.oper, 0, sizeof(now.oper));
-	if (sysctlbyname("kern.hackios.cellular_operator", now.oper, &n, NULL, 0) != 0) {
-		now.oper[0] = 0;
-	}
-	/* (the dBm moves all the time and is nobody's notification: a change of it alone tells no one) */
-	was.dbm = now.dbm;
-	return memcmp(&was, &now, sizeof(now)) != 0;
+static struct radio_state
+radio_state_snapshot(void)
+{
+    pthread_mutex_lock(&cell_state_lock);
+    struct radio_state snapshot = now;
+    pthread_mutex_unlock(&cell_state_lock);
+    return snapshot;
+}
+
+static NSString *
+sim_status(enum hk_sim_state sim)
+{
+    switch (sim) {
+    case SIM_ABSENT: return @"kCTSIMSupportSIMStatusNotInserted";
+    case SIM_PRESENT: return @"kCTSIMSupportSIMStatusInserted";
+    case SIM_READY: return @"kCTSIMSupportSIMStatusReady";
+    case SIM_PIN: return @"kCTSIMSupportSIMStatusPINLocked";
+    case SIM_PUK: return @"kCTSIMSupportSIMStatusPUKLocked";
+    default: return @"kCTSIMSupportSIMStatusNotReady";
+    }
+}
+
+/* The physical tray position is independent of an empty UIM slot. */
+static NSString *
+tray_status(enum hk_sim_state sim)
+{
+    return sim_present(sim) ? @"kCTSIMSupportSIMTrayInsertedWithSIM" : @"kCTSIMSupportSIMTrayStatusUnknown";
+}
+
+static bool
+read_state(bool *carrier_changed)
+{
+    struct radio_state next = {0};
+    int sim = sys_int("kern.hackios.cellular_sim_state");
+    next.sim = sim >= SIM_ABSENT && sim <= SIM_PUK ? (enum hk_sim_state)sim : SIM_UNKNOWN;
+    if (next.sim == SIM_READY && sys_int("kern.hackios.cellular_up") == 1) {
+        next.registered = sys_int("kern.hackios.cellular_registered") == 1;
+        next.bars = sys_int("kern.hackios.cellular_bars");
+        next.dbm = sys_int("kern.hackios.cellular_dbm");
+        next.data = sys_int("kern.hackios.cellular_data");
+        if (next.registered) {
+            size_t n = sizeof(next.oper);
+            if (sysctlbyname("kern.hackios.cellular_operator", next.oper, &n, NULL, 0) != 0 ||
+                n == 0 || n > sizeof(next.oper) || next.oper[n - 1] != 0) next.oper[0] = 0;
+        }
+    }
+    pthread_mutex_lock(&cell_state_lock);
+    struct radio_state previous = now;
+    now = next;
+    pthread_mutex_unlock(&cell_state_lock);
+    if (carrier_changed)
+        *carrier_changed = previous.sim != next.sim || previous.registered != next.registered ||
+            strcmp(previous.oper, next.oper) != 0;
+    previous.dbm = next.dbm;
+    return memcmp(&previous, &next, sizeof(next)) != 0;
 }
 
 /* ---- QMI through the kernel's modem thread (sysctl kern.hackios.modem_qmi) ---------------------------------------- */
@@ -298,59 +346,67 @@ put(id object, NSString *key, id value)
 }
 
 static id
+slot_context(enum hk_sim_state sim)
+{
+    /* A physical slot is available as the subject of a removal notification.
+     * Published objects are never mutated while NSXPC serializes them. */
+    static id saved[SIM_PUK + 1];
+    Class c = objc_getClass("CTXPCServiceSubscriptionContext");
+    if (!c) return nil;
+    @synchronized (c) {
+        if (!saved[sim]) {
+            id ctx = ((id (*)(Class, SEL, long long))objc_msgSend)(c, sel_registerName("contextWithSlot:"), 1);
+            put(ctx, @"labelID", @"hk-sim-1");
+            put(ctx, @"label", @"Primary");
+            put(ctx, @"userDataPreferred", @(sim_present(sim)));
+            put(ctx, @"userDefaultVoice", @(sim_present(sim)));
+            put(ctx, @"isSimPresent", @(sim_present(sim)));
+            put(ctx, @"isSimGood", @(sim == SIM_READY));
+            saved[sim] = ctx;
+        }
+        return saved[sim];
+    }
+}
+static id
 context(void)
 {
-	static id ctx;
-
-	if (ctx == nil) {
-		Class c = objc_getClass("CTXPCServiceSubscriptionContext");
-
-		/* (+contextWithSlot: is the way: the 8 Pro's notes say initWithUUID:andSlot: crashes) */
-		ctx = c != Nil ? ((id (*)(Class, SEL, long long))objc_msgSend)(c, sel_registerName("contextWithSlot:"), 1) : nil;
-		put(ctx, @"labelID", @"hk-sim-1");
-		put(ctx, @"label", @"Primary");
-		put(ctx, @"userDataPreferred", @YES);
-		put(ctx, @"userDefaultVoice", @YES);
-		put(ctx, @"isSimPresent", @YES);
-		put(ctx, @"isSimGood", @YES);
-	}
-	return ctx;
+    return slot_context(radio_state_snapshot().sim);
 }
-
+static id
+active_context(void)
+{
+    enum hk_sim_state sim = radio_state_snapshot().sim;
+    return sim_present(sim) ? slot_context(sim) : nil;
+}
 static id
 subscription_info(void)
 {
-	id info = make("CTXPCServiceSubscriptionInfo"), ctx = context();
-
-	if (ctx != nil) {
-		put(info, @"subscriptions", @[ctx]);
-		put(info, @"subscriptionsInUse", @[ctx]);
-		put(info, @"subscriptionsValid", @[ctx]);
-	}
-	return info;
+    enum hk_sim_state sim = radio_state_snapshot().sim;
+    id info = make("CTXPCServiceSubscriptionInfo"), ctx = slot_context(sim);
+    NSArray *active = ctx && sim_present(sim) ? @[ctx] : @[];
+    put(info, @"subscriptions", ctx ? @[ctx] : @[]);
+    put(info, @"subscriptionsInUse", active);
+    put(info, @"subscriptionsValid", sim == SIM_READY ? active : @[]);
+    return info;
 }
-
 static id
 contexts(void)
 {
-	/*
-	 * CTXPCContexts' subscriptions are CTXPCContextInfo, not the subscription context itself: with the context in the list SpringBoard
-	 * could not decode the reply ("value for key 'NS.objects' was of unexpected class"), never had a SIM to ask about and showed SOS
-	 * (2026-11-10; read from SpringBoard's own log, OS_ACTIVITY_DT_MODE=YES in its job).
-	 */
-	id all = make("CTXPCContexts"), ctx = context();
-	Class c = objc_getClass("CTXPCContextInfo");
-	NSUUID *uuid = [ctx valueForKey:@"uuid"] ?: [[NSUUID alloc] initWithUUIDString:@"00000000-0000-0000-0000-000000000001"];
-	id info = c != Nil ? ((id (*)(Class, SEL, id, id, long long))objc_msgSend)(c, sel_registerName("contextWithUUID:andAccountID:andSlot:"), uuid, @"hk-sim-1", 1) : nil;
-
-	put(info, @"labelID", @"hk-sim-1");
-	put(info, @"label", @"Primary");
-	if (info != nil) {
-		put(all, @"subscriptions", @[info]);
-	}
-	put(all, @"dataPreferred", uuid);
-	put(all, @"voicePreferred", uuid);
-	return all;
+    id all = make("CTXPCContexts"), ctx = active_context();
+    if (!ctx) {
+        put(all, @"subscriptions", @[]);
+        return all;
+    }
+    /* CTXPCContexts requires CTXPCContextInfo elements on 20F66. */
+    Class c = objc_getClass("CTXPCContextInfo");
+    NSUUID *uuid = [ctx valueForKey:@"uuid"] ?: [[NSUUID alloc] initWithUUIDString:@"00000000-0000-0000-0000-000000000001"];
+    id info = c ? ((id (*)(Class, SEL, id, id, long long))objc_msgSend)(c, sel_registerName("contextWithUUID:andAccountID:andSlot:"), uuid, @"hk-sim-1", 1) : nil;
+    put(info, @"labelID", @"hk-sim-1");
+    put(info, @"label", @"Primary");
+    put(all, @"subscriptions", info ? @[info] : @[]);
+    put(all, @"dataPreferred", uuid);
+    put(all, @"voicePreferred", uuid);
+    return all;
 }
 
 static id
@@ -372,7 +428,7 @@ data_status(void)
 
 	/* (the numbers are the 8 Pro's, read there from the classes' own descriptions: radio technology LTE 7, indicator "4G" 7, bearer LTE 4) */
 	put(d, @"attached", @(now.registered != 0));
-	put(d, @"dataSim", @YES);
+	put(d, @"dataSim", @(radio_state_snapshot().sim == SIM_READY));
 	put(d, @"indicator", @(now.registered ? 7 : 0));
 	put(d, @"radioTechnology", @(now.registered ? 7 : 0));
 	put(d, @"dataBearerTechnology", @(now.registered ? 4 : 0));
@@ -387,10 +443,10 @@ data_status(void)
 static NSString *
 registration(void)
 {
-#ifdef ALWAYS_HOME
-	return @"kCTRegistrationStatusRegisteredHome";         /* (an experiment: what the status bar does when it never hears anything else) */
-#endif
-	return now.registered ? @"kCTRegistrationStatusRegisteredHome" : @"kCTRegistrationStatusSearching";
+    struct radio_state v = radio_state_snapshot();
+    if (v.sim == SIM_UNKNOWN) return @"kCTRegistrationStatusUnknown";
+    if (v.sim != SIM_READY) return @"kCTRegistrationStatusNotRegistered";
+    return v.registered ? @"kCTRegistrationStatusRegisteredHome" : @"kCTRegistrationStatusSearching";
 }
 
 static id
@@ -419,7 +475,7 @@ static id
 descriptor(void)
 {
 	Class c = objc_getClass("CTServiceDescriptor");
-	id ctx = context();
+	id ctx = active_context();
 
 	if (c == Nil || ctx == nil) {
 		return nil;
@@ -447,19 +503,43 @@ nr_status(void)
 static id
 mcc(void)
 {
-	return facts.mcc >= 0 ? [NSString stringWithFormat:@"%03d", facts.mcc] : (id)NSNull.null;
+	return radio_state_snapshot().registered && facts.mcc >= 0 ? [NSString stringWithFormat:@"%03d", facts.mcc] : (id)NSNull.null;
 }
 
 static NSString *
 oper(void)
 {
-	return now.oper[0] ? @(now.oper) : @"";
+	struct radio_state v = radio_state_snapshot();
+    return v.registered && v.oper[0] ? [NSString stringWithUTF8String:v.oper] ?: @"" : @"";
 }
 
 /*
  * What a selector's reply block is called with: objects (each goes to the first parameter of its class that is still
  * empty) and, under "n", numbers for the parameters that are not objects, in their order. Nothing here: nil and zero.
  */
+static NSDictionary *
+carrier_bundle_value(NSInvocation *request)
+{
+    __unsafe_unretained id slot = nil, keys = nil, bundle = nil;
+    [request getArgument:&slot atIndex:2];
+    [request getArgument:&keys atIndex:3];
+    [request getArgument:&bundle atIndex:4];
+    SEL slotID = sel_registerName("slotID"), type = sel_registerName("type");
+    if (![keys isKindOfClass:NSArray.class] || ![keys isEqual:@[@"CarrierName"]]) return nil;
+    BOOL primary = [slot isKindOfClass:objc_getClass("CTXPCServiceSubscriptionContext")] &&
+        [slot respondsToSelector:slotID] && ((long long (*)(id, SEL))objc_msgSend)(slot, slotID) == 1;
+    BOOL carrierBundle = [bundle isKindOfClass:objc_getClass("CTBundle")] &&
+        [bundle respondsToSelector:type] && ((long long (*)(id, SEL))objc_msgSend)(bundle, type) == 1;
+    NSString *name = primary && carrierBundle ? oper() : nil;
+    static unsigned reported;
+    unsigned bit = 1u << (primary | (carrierBundle << 1) | ((name.length > 0) << 2));
+    if (!(__atomic_fetch_or(&reported, bit, __ATOMIC_RELAXED) & bit)) {
+        say("CarrierName request primary=%d carrier_bundle=%d has_name=%d\n", primary, carrierBundle, name.length > 0);
+    }
+    if (!primary || !carrierBundle) return nil;
+    return @{ @"o": name.length ? @[name] : @[] };
+}
+
 static NSDictionary *
 answers_for(NSString *name)
 {
@@ -470,12 +550,12 @@ answers_for(NSString *name)
 		table = @{
 			@"getSubscriptionInfo:": ^{ return @{ @"o": @[subscription_info()] }; },
 			@"getActiveContexts:": ^{ return @{ @"o": @[contexts()] }; },
-			@"getCurrentDataSubscriptionContext:": ^{ return @{ @"o": @[context()] }; },
-			@"getPreferredDataSubscriptionContext:": ^{ return @{ @"o": @[context()] }; },
-			@"getUserDefaultVoiceSubscriptionContext:": ^{ return @{ @"o": @[context()] }; },
-			@"getSIMStatus:completion:": ^{ return @{ @"o": @[@"kCTSIMSupportSIMStatusReady"] }; },
-			@"getSIMTrayStatus:": ^{ return @{ @"o": @[@"kCTSIMSupportSIMTrayInsertedSIM"] }; },
-			@"isAnySimReadyWithCompletion:": ^{ return @{ @"n": @[@1] }; },
+			@"getCurrentDataSubscriptionContext:": ^{ return @{ @"o": @[active_context() ?: NSNull.null] }; },
+			@"getPreferredDataSubscriptionContext:": ^{ return @{ @"o": @[active_context() ?: NSNull.null] }; },
+			@"getUserDefaultVoiceSubscriptionContext:": ^{ return @{ @"o": @[active_context() ?: NSNull.null] }; },
+			@"getSIMStatus:completion:": ^{ return @{ @"o": @[sim_status(radio_state_snapshot().sim)] }; },
+			@"getSIMTrayStatus:": ^{ return @{ @"o": @[tray_status(radio_state_snapshot().sim)] }; },
+			@"isAnySimReadyWithCompletion:": ^{ return @{ @"n": @[@(radio_state_snapshot().sim == SIM_READY)] }; },
 			@"getSignalStrengthInfo:completion:": ^{ return @{ @"o": @[signal_info()] }; },
 			@"getPublicSignalStrength:completion:": ^{ return @{ @"o": @[signal_info()] }; },
 			@"copyRegistrationStatus:completion:": ^{ return @{ @"o": @[registration()] }; },
@@ -485,7 +565,7 @@ answers_for(NSString *name)
 			@"copyAbbreviatedOperatorName:completion:": ^{ return @{ @"o": @[oper()] }; },
 			@"copyIsInHomeCountry:completion:": ^{ return @{ @"n": @[@1], @"o": @[@YES] }; },
 			@"copyIsDataAttached:completion:": ^{ return @{ @"n": @[@(now.registered)], @"o": @[@(now.registered != 0)] }; },
-			@"copyRadioAccessTechnology:completion:": ^{ return @{ @"o": @[@"kCTRadioAccessTechnologyLTE"] }; },
+			@"copyRadioAccessTechnology:completion:": ^{ return @{ @"o": radio_state_snapshot().registered ? @[@"kCTRadioAccessTechnologyLTE"] : @[] }; },
 			@"getDataStatus:completion:": ^{ return @{ @"o": @[data_status()] }; },
 			@"getConnectionState:connectionType:completion:": ^{ return @{ @"o": @[connection_status()] }; },
 			@"getInternationalDataAccess:completion:": ^{ return @{ @"n": @[@0] }; },
@@ -501,10 +581,10 @@ answers_for(NSString *name)
 			@"getSupports5GStandalone:completion:": ^{ return @{ @"o": @[@NO] }; },
 			@"copyMobileCountryCode:completion:": ^{ return @{ @"o": @[mcc()] }; },
 			@"copyLastKnownMobileCountryCode:completion:": ^{ return @{ @"o": @[mcc()] }; },
-			@"copyMobileNetworkCode:completion:": ^{ return @{ @"o": @[facts.mnc >= 0 ? [NSString stringWithFormat:@"%02d", facts.mnc] : (id)NSNull.null] }; },
+			@"copyMobileNetworkCode:completion:": ^{ return @{ @"o": @[radio_state_snapshot().registered && facts.mnc >= 0 ? [NSString stringWithFormat:@"%02d", facts.mnc] : (id)NSNull.null] }; },
 			@"smartDataMode:completion:": ^{ return @{ @"n": @[@0] }; },
 			/* SMS can be sent and received (the kernel does both) */
-			@"getSmsReadyState:completion:": ^{ return @{ @"n": @[@1], @"o": @[@YES] }; },
+			@"getSmsReadyState:completion:": ^{ NSNumber *ready = @(radio_state_snapshot().sim == SIM_READY); return @{ @"n": @[ready], @"o": @[ready] }; },
 			@"getSupportDynamicDataSimSwitch:": ^{ return @{ @"n": @[@0] }; },
 		};
 	});
@@ -638,7 +718,8 @@ answer(NSInvocation *request, NSUInteger index, const char *extended, NSString *
 	__unsafe_unretained id block = nil;
 	char type[128], cls[96], inner[512] = "", bare[96] = "v@?";
 	const char *s = extended;
-	NSDictionary *have = answers_for(name);
+	NSDictionary *have = [name isEqualToString:@"copyCarrierBundleValueWithDefault:keyHierarchy:bundleType:completion:"]
+        ? carrier_bundle_value(request) : answers_for(name);
 	NSMutableArray *objects = [(have[@"o"] ?: @[]) mutableCopy], *numbers = [(have[@"n"] ?: @[]) mutableCopy];
 	NSMutableArray *keep = [NSMutableArray array];
 	NSMutableString *shape = [NSMutableString string];
@@ -952,12 +1033,12 @@ process_name(pid_t pid)
 	}
 	one(@"subscriptionInfoDidChange", @[]);
 	one(@"activeSubscriptionsDidChange", @[]);
-	one(@"simStatusDidChange:status:", @[ctx, @"kCTSIMSupportSIMStatusReady"]);
+	one(@"simStatusDidChange:status:", @[ctx, sim_status(radio_state_snapshot().sim)]);
 	one(@"displayStatusChanged:status:", @[ctx, display_status()]);
 	one(@"operatorNameChanged:name:", @[ctx, oper()]);
 	one(@"signalStrengthChanged:info:", @[ctx, signal_info()]);
-	one(@"currentDataSimChanged:", @[ctx]);
-	one(@"preferredDataSimChanged:", @[ctx]);
+	one(@"currentDataSimChanged:", @[active_context() ?: NSNull.null]);
+	one(@"preferredDataSimChanged:", @[active_context() ?: NSNull.null]);
 	one(@"dataStatus:dataStatusInfo:", @[ctx, data_status()]);
 	one(@"connectionStateChanged:connection:dataConnectionStatusInfo:", @[ctx, @0, connection_status()]);
 }
@@ -1329,7 +1410,7 @@ legacy_message(xpc_connection_t peer, xpc_object_t message, NSString *client)
 		return true;
 	});
 	if (request != NULL && strcmp(request, "kSubscriberGetSimState") == 0) {
-		xpc_dictionary_set_string(reply, "kSubscriberSimState", "kCTSIMSupportSIMStatusReady");
+		xpc_dictionary_set_string(reply, "kSubscriberSimState", sim_status(radio_state_snapshot().sim).UTF8String);
 	}
 	if (request != NULL && strcmp(request, "kRadioModuleGetProperty") == 0) {
 		/* (CoreTelephony's GetRadioModuleProperty reads the value only if the reply says it is valid; without this SpringBoard asked
@@ -2131,7 +2212,7 @@ main(int argc, char **argv)
 		seen = [NSMutableDictionary dictionary];
 		described = [NSMutableSet set];
 		responders = [NSMutableArray array];
-		read_state();
+		read_state(NULL);
 		say("started: registered %d, bars %d, data %d, an operator name of %zu letters; a context %s\n", now.registered, now.bars, now.data, strlen(now.oper),
 		    context() != nil ? "made" : "NOT made");
 		say("the context: %s; the contexts: %s\n", [[context() description] UTF8String], [[contexts() description] UTF8String]);
@@ -2168,14 +2249,18 @@ main(int argc, char **argv)
 				});
 			}
 			sms_poll();
-			if (read_state()) {
+			bool carrier_changed;
+			if (read_state(&carrier_changed)) {
 				NSArray *all;
 
-				say("now: registered %d, bars %d, data %d\n", now.registered, now.bars, now.data);
+				if (carrier_changed) notify_post("com.hackios.telephony.public-state-changed");
+
+				say("now: SIM state %d, registered %d, bars %d, data %d\n", now.sim, now.registered, now.bars, now.data);
 				@synchronized (responders) {
 					all = [responders copy];
 				}
 				for (Responder *r in all) {
+					if (carrier_changed && context()) [r tellOne:@"carrierBundleChange:" arguments:@[context()]];
 					[r tell];
 				}
 			}

@@ -1,0 +1,21 @@
+{
+  "MiniAppleARMBacklight.cpp": "b9f315ccd90bc88a9628f70d8bf3c9c7dac022de0ebc20a1968306cc32278f57",
+  "MiniIOMobileFramebuffer.cpp": "05929e5e22b180170577dd9cbc2c38bff58355469faa85cbca32e655d243f530",
+  "hk_adsp.c": "bdd896833daa2300a5420e4bd7b50c0f909891b2cae5e1b7058d962469aeeb33",
+  "hk_front_diag.h": "7a3d2548cb0fc8b1b1e61d38bd7f3d82f4bd1c7fa8efecd9bcfd696131ba2b8f",
+  "hk_light_policy.h": "2f1585ddfe7c5b08d8b91e1b86a4b3424d3c1e7b119229b9e9d8693056b60018",
+  "hk_registry_read.h": "a2f2e28f1a5b0dbb2dd65b2245d36f14670e7b5e44146df9030e8f730d7875e0",
+  "hk_see_light.h": "4163895d226bf34af7df341c6f8d2d8f1ddbbc79c8da3f199c3cea22e2155c7b",
+  "hk_sensor_dependencies.h": "e86efa50bcab67b89fac01cd8e141214513901e4f92046f5368e096143ff9539",
+  "hk_slpi_boot.c": "95e0a3c102fcc58efedd178cae6824733f409a9bc99baa341f2d918282998902",
+  "hk_user_preference.h": "7e8a49d3af9fc7c871be28b3e43dbd2d4df63d51925027d19b9cb84788682901",
+  "hk_vendor_attributes.h": "7baad3384296f39c2b8b166f92f5291c46e1c24e31ae524dcb409a7985805f14",
+  "hk_wise_sample.h": "b5728ef20cfaa5ae0f8ba66e5af5d6e24426c6ed83fe4d13749a78999bad2504",
+  "lp_tables.h": "1b2c02f7c7ed4740c93b638a804c4804d4626df99a61d7b4bca47a570a877f19",
+  "panel_trial.inc": "9cda5bab08b0707cc068ef799bca70bc9dd645b9d9b153b43b516c7fc26671d1",
+  "registry_keys.h": "67677e30529178758fad20cd0ed5bc3f4ba10057b934ae4f3f2983724892bc37",
+  "slpi_apps_std.h": "725efe97709cd1bccbdf5a428abaf4eee9fb7858233919cad663b35b9e771446",
+  "slpi_dma_route.h": "f8cfb5130cb3f1358e1d78c2a954d7f4a45f893edf25ff4653a9956c9e6dfdd5",
+  "slpi_glink_core.h": "5ffe1c554f2481703eb21202a63f07f1481021fd4d5f382284c9704834905294",
+  "slpi_glink_probe.inc": "bb6d70e96ddd0c8aedf3c84999521045627071f67dabdb7704a21938e58f641e"
+}

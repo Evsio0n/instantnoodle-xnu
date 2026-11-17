@@ -1,0 +1,15 @@
+# SIM state for the OnePlus 8 cell=1 kernel
+
+`kern.hackios.cellular_sim_state` is a read-only integer. Its ABI values are 0 unknown, 1 physically absent, 2 present but not ready, 3 ready, 4 PIN required, and 5 PUK required. It describes the handset's aggregate SIM state. Only an intact, current UIM physical slot report in which every returned slot explicitly says absent can establish 1. No ATR, an empty logical application list, an invalid slot, a transport timeout and lack of NAS registration cannot establish physical absence.
+
+UIM Get Card Status (0x2F) decodes every logical slot and application and honors the optional per-slot validity array. The primary GW application index takes priority. Without a binding the decoder selects a usable SIM/USIM across slots. UIM Get Slot Status (0x47) supplies physical presence and logical mapping. The existing private provisioner still receives a complete app identifier when it fits its private buffer. The public field and observation log contain only state. UIM Card Status (0x32) and Slot Status (0x48) indications on this client's current UIM peer trigger a fresh paired read. The event registration requests mask 0x11. Periodic reads continue on the service worker, including while NAS remains unregistered. A departed UIM peer or modem restart invalidates prior evidence and resets the public field to unknown.
+
+Run `python3 tools/nf/cell/sim/test.py` to exercise the production decoder, polling logic and indication branch with synthetic in-memory replies under ASan/UBSan and check regeneration from the pinned donor. The ALS archive builder accepts `--settings --sim-state-patch` with this directory's `sim-state.patch`. It applies the change in the archived `tools/nf/cell` directory. The combined kernel, patch hash and input provenance are recorded in `out/cell-settings-sim-kernel.json`.
+
+## Registration after insertion
+
+Ticket 406 recorded the initial registration loop finishing at modem time 331.271 seconds and the CMHK card first becoming present at 490.464 seconds. The original service then continued UIM polling without re-entering normal registration.
+
+On confirmed physical absence the startup loop now hands back to the mission worker. After insertion, the worker can perform one ordinary registration iteration per refresh while the SIM is present or ready and the service is still down. It uses the existing DMS operating-mode check, UIM primary GW activation and NAS registration query. Successful registration follows the existing data setup. Physical removal of a started service invalidates its public state immediately; the worker retires the previous local data session and IMS address outside QRTR dispatch. Recovery does not trigger startup SMS diagnostics or PIN verification. A new confirmed removal resets the bounded provisioning counter for the next card.
+
+The in-memory owner test exercises the production routine after a simulated ten-minute no-card interval and again after removal. Physical recovery requires a separate runtime observation of the new candidate.

@@ -45,6 +45,7 @@
 
 #include <lx_os.h>
 #include "lx.h"
+#include "lx_awdl_rx.h"
 #include "lx_sae.h"
 #include "lx_wpa.h"
 
@@ -111,6 +112,8 @@ struct lx_radio {
 	/* a scan */
 	volatile int scan;			/* 0: none, 1: running, 2: over, 3: given up by the driver */
 	unsigned frames, others;		/* received in all, and of them neither beacon nor probe response */
+	bool awdl_observe;
+	unsigned awdl_actions, awdl_psf, awdl_mif;
 	unsigned heard_count, heard_lost;
 	struct lx_heard heard[HEARD_MOST];
 	uint8_t want[32], want_length;		/* the name of the network that is wanted ... */
@@ -241,6 +244,10 @@ linuxkpi_ieee80211_ifattach(struct ieee80211_hw *hw)
 	struct lx_radio *radio = radio_of(hw);
 	char bands[96] = "";
 
+	radio->awdl_observe = lx_os_option("wifi_awdl_observe") == 1;
+	if (radio->awdl_observe)
+		lx_tell("awdl: observing existing radio RX, station filters unchanged\n");
+
 	for (unsigned band = 0; band < NUM_NL80211_BANDS; band++) {
 		if (hw->wiphy->bands[band] != NULL) {
 			snprintf(bands + strlen(bands), sizeof(bands) - strlen(bands), " %d in band %u,", hw->wiphy->bands[band]->n_channels,
@@ -266,6 +273,11 @@ linuxkpi_ieee80211_unregister_hw(struct ieee80211_hw *hw)
 	while (radio->applying != 0) {
 		lx_os_sleep(&radio->applying, 5 * 1000000ull);
 	}
+	if (radio->awdl_observe)
+		lx_tell("awdl: radio detached, RX actions=%u psf=%u mif=%u\n",
+		    __atomic_load_n(&radio->awdl_actions, __ATOMIC_RELAXED),
+		    __atomic_load_n(&radio->awdl_psf, __ATOMIC_RELAXED),
+		    __atomic_load_n(&radio->awdl_mif, __ATOMIC_RELAXED));
 	if (the_radio == radio) {
 		the_radio = NULL;
 	}
@@ -1348,6 +1360,16 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 		heard(radio, skb->data, skb->len, status->freq, status->signal);
 	} else if (skb->len >= 24 && (skb->data[0] & 0x0c) == 0x00) {
 		radio->others++;
+		if (radio->awdl_observe && skb->data[0] == 0xd0 &&
+		    !(status->flag & (RX_FLAG_FAILED_FCS_CRC | RX_FLAG_FAILED_PLCP_CRC))) {
+			__atomic_fetch_add(&radio->awdl_actions, 1, __ATOMIC_RELAXED);
+			enum lx_awdl_action kind = lx_awdl_action_kind(skb->data, skb_headlen(skb));
+			unsigned *count = kind == LX_AWDL_PSF ? &radio->awdl_psf :
+			    kind == LX_AWDL_MIF ? &radio->awdl_mif : NULL;
+			if (count && __atomic_fetch_add(count, 1, __ATOMIC_RELAXED) == 0)
+				lx_tell("awdl: first RX header kind=%s frequency_mhz=%u\n",
+				    kind == LX_AWDL_PSF ? "PSF" : "MIF", status->freq);
+		}
 		management_received(radio, skb->data, skb->len);
 	} else if (to_ethernet(skb, (status->flag & RX_FLAG_IV_STRIPPED) != 0)) {
 		ethernet_received(radio, skb);

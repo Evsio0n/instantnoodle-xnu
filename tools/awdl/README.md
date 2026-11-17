@@ -1,0 +1,42 @@
+## Frozen result — 2026-11-15 (published 2026-11-17)
+
+This directory is experimental source, excluded from Daily. Native Mac small-file
+reception and file/hash equality were verified; real iPhone photo finalization
+and stable discovery remain unresolved. Earlier entries below are dated research
+history, not the current acceptance result. No tests are automatically scheduled.
+See [public status](../../docs/STATUS-2026-11-17.md).
+
+# AWDL transport probes
+
+`interface_probe.c` reads BSD interface flags and counts IPv6 and link-local addresses for en0 and awdl0. It opens no capture or wireless-control session. `awdl_flag=-1` means the flag was unavailable. The probe builds for the host macOS SDK and the arm64 iPhoneOS SDK.
+
+`wifi_awdl_observe=1` enables two header counters at ordinary ath11k RX ingress. The counters require an unprotected 802.11 management action with an intact AWDL 1.0 PSF or MIF header. Frequency is printed on the first match of each type. The totals are printed when the radio is unregistered. In IN2010 run #416, the driver reported two management actions, zero PSF and zero MIF at detach. The receiver kept its ordinary station filters and channel. [#416 receipt](../../out/airdrop-ui/416-transport.json) · [OWL wire header](https://github.com/seemoo-lab/owl/blob/0ee3263f944ea721c355f826aa90d636d012a512/src/frame.h#L29-L57).
+
+The private ROC candidate also accepts `wifi_awdl_observe=6`, `44` or `149`. After an actual STA association it requests one passive 500 ms dwell on that social channel, using the driver's advertised runtime channel table and excluding disabled/radar channels. The home and target frequencies must differ. The station owner serializes it with ordinary scanning. WMI events are matched to the current ROC VDEV, request and scan ID. The result distinguishes scan start, firmware foreign-channel confirmation, AWDL headers during that interval, firmware scan completion, stack expiry and driver idle. A retained home channel context indicates software ownership. A later frame on the original frequency from the associated BSS gives separate evidence that the radio returned. The experiment publishes no virtual interface.
+
+`python3 tools/awdl/build_roc.py` uses a private copy of the known cellular ath11k build in the existing build container. It writes the object and SHA-256 receipt under `out/awdl-kernel/`. The existing private cellular linker accepts that object through `CELL_ATH11K_OBJ`. Native AWDL data adaptation in `wifi/lx/src/lx_awdl_data.h` supports ordinary IPv6 in short and tagged AWDL envelopes. Peer admission, a dedicated VDEV, negotiated availability windows and attachment to an actual BSD data interface are separate transport work.
+
+In #417 the associated STA (VDEV 0) received the firmware foreign-channel event at 5220 MHz while its home channel was 5240 MHz. The 500 ms ROC ended with firmware reason 1 (`WMI_SCAN_REASON_CANCELLED`), a stack expiry, an idle scan owner and a fresh beacon from the original AP at the home frequency. The pinned ath11k queues its abort worker for the end of the requested duration. The target-frequency RX counters were all zero. [Radio receipt](../../logs/104402-run.log.live.13#L6617).
+
+`build_p2p.py` extends that exact ROC build. Value `wifi_awdl_observe=46` requests one driver-advertised secondary address and one WMI STA/P2P_DEVICE VDEV while preserving the already associated STA. Each eligible social channel (6, 44, 149) is visited once through that VDEV. A following dwell requires a matched foreign-channel event and completion, stack expiry, idle driver state, unchanged home ownership and a subsequent home-frequency frame. VDEV release checks the matching firmware delete response and the original allocation map. The result records counters and VDEV numbers only. #418 obtained P2P VDEV 1 alongside station VDEV 0, received 9 target-tagged frames on 6 and zero on 44 and 149, and captured no PSF or MIF. A real return on each dwell preceded deletion, with one matching firmware response and the original allocation map restored. [#418 kernel window](../../logs/105807-run.log.live.7).
+
+`build_rx_provenance.py` builds a separate candidate with the same P2P and ROC behavior. Its `ingress` line partitions callback arrivals during the firmware foreign-channel interval by the driver's reported frequency (zero, home, target or other), RX format and error status. The `wmi_clock` line counts nonzero hardware TSF values from the received WMI management header. Only a target-frequency PSF/MIF can increment the matching timestamp count. These counters do not change the dwell schedule. In #419, channel 6 had 15 callback arrivals (eight tagged home, seven target), 44 had zero and 149 had one tagged target. All frequency labels were present. The 14 management events across those windows had zero in the WMI absolute RX TSF field and none matched the AWDL header. [#419 first window](../../logs/111345-run.log.live.5) · [#419 final windows](../../logs/111345-run.log.live.6). [QCA6390 capabilities](https://github.com/torvalds/linux/blob/v7.0/drivers/net/wireless/ath/ath11k/core.c) · [AWDL data format](https://github.com/seemoo-lab/owl/blob/0ee3263f944ea721c355f826aa90d636d012a512/src/tx.c#L40-L49) · [Tagged data format](https://github.com/wireshark/wireshark/blob/04a9466b6b5ace6ff3de5e65166383104a4c4fbb/epan/dissectors/packet-awdl.c#L1457-L1504).
+
+`build_psf.py` adds one normal, locally generated broadcast PSF for `wifi_awdl_observe=47` on channel 6. It uses the secondary VDEV's own advertised address and one sample of the host monotonic clock. It announces an independent initial clock and a bounded local availability sequence. No peer identity or service name is taken from disk or sent in the announcement. A channel flagged NO_IR, disabled or radar is ineligible for transmission. The driver receives a normal management SKB. The issuing WMI worker checks the approved frequency, current ROC, VDEV and deadline again. The firmware completion is matched to the same descriptor and original SKB before the owner releases the VDEV. `local_submit` reports the hand-off, `wmi_result_seen` reports the WMI submit return, and `fw_complete` records the genuine firmware event. A broadcast has no receiver ACK. [OWL PSF composition](https://github.com/seemoo-lab/owl/blob/0ee3263f944ea721c355f826aa90d636d012a512/src/tx.c#L363-L382) · [Action frame timestamp source](https://github.com/seemoo-lab/owl/blob/0ee3263f944ea721c355f826aa90d636d012a512/src/tx.c#L52-L65).
+
+In #420, the ch6 P2P ROC submitted one 254-byte PSF to the native management queue. Firmware completed its matched descriptor with status 0 after 5.54 ms, released the original SKB and acknowledged VDEV deletion. Five of the 15 RX callbacks in the window were tagged ch6 and none matched PSF or MIF. The packet used host-monotonic time, with no prior peer synchronization. Its reception on the Mac remains unverified. [#420 TX receipt](../../logs/112219-run.log.live.6).
+
+`peer_windows.h` can initialize a local clock before peer discovery. An independently validated peer sync/sequence observation can anchor a guarded availability estimate in the host RX monotonic time domain. The estimate expires after one advertised sequence cycle. OBSERVED RX time, hardware TSF and completed packet delivery remain separate facts. [OWL host clock at RX](https://github.com/seemoo-lab/owl/blob/0ee3263f944ea721c355f826aa90d636d012a512/src/rx.c#L471-L475) · [OWL window conversion](https://github.com/seemoo-lab/owl/blob/0ee3263f944ea721c355f826aa90d636d012a512/src/sync.c#L60-L72).
+
+
+Native end-to-end status (2026-11-14): RAM run527 delivered the generated
+58-byte test file through the original iOS picker and Mac acceptance flow.
+Directly read sender and receiver bytes and SHA256 match. Discovery and
+connection latency remain unresolved. Exact private evidence/pins are in
+[HANDOFF](../../docs/HANDOFF.md); avoid using early probe counts as current
+feature status. The latency candidates preserve actual ROC grants and real
+peer windows: `build_wmi_vdev_window.py` matches data ROC to secondary VDEV;
+`build_wmi_peer_batch.py` batches same-peer queue entries with a bounded
+rotation quantum; `build_wmi_home_carrier.py` prefers an eligible real shared
+infrastructure channel on selection and otherwise keeps the prior fallback.
+Home-carrier behavior is built/host-tested, not yet verified on hardware.

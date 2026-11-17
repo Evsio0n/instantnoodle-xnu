@@ -1,0 +1,598 @@
+--- a/hk_adsp.c
++++ b/hk_adsp.c
+@@ -882,6 +882,7 @@
+ }
+ 
+ /* The two rails at that level (Linux's proxy request), or given back (level 0). True: RPMh has said done. */
++extern bool hk_cell_als_floor_held(void);
+ static bool
+ rails(uint32_t level)
+ {
+@@ -914,7 +915,14 @@
+ 		hk_rpmh_release();
+ 		return false;
+ 	}
+-	printf("adsp: %u: about to ask RPMh, through TCS %u, for lcx.lvl (%#x) = %u and lmx.lvl (%#x) = %u (level %u%s)\n", step,
++	/* These two resources are shared AP votes. Re-evaluate ownership after
++     * hk_rpmh_claim() so a simultaneous SLPI acquire cannot be overwritten. */
++    if (!level && hk_cell_als_floor_held()) {
++        hk_rpmh_release();
++        printf("adsp: released its request; SLPI still owns the same maximum LCX/LMX floors\n");
++        return true;
++    }
++    printf("adsp: %u: about to ask RPMh, through TCS %u, for lcx.lvl (%#x) = %u and lmx.lvl (%#x) = %u (level %u%s)\n", step,
+ 	    RPMH_TCS, addresses[0], values[0], addresses[1], values[1], level, level == 0 ? ": given back" : "");
+ 	snprintf(last_write, sizeof(last_write), "step %u asked RPMh for the audio DSP's rails at level %u", step, level);
+ 	hold();
+--- a/hk_slpi_boot.c
++++ b/hk_slpi_boot.c
+@@ -1358,6 +1358,8 @@
+  for(vm_offset_t line=metadata_page;line<metadata_page+PAGE_SIZE;line+=64)__asm__ volatile("dc civac, %0"::"r"(line):"memory");
+  settle();return 1;
+ }
++static bool cell_als_floor;
++bool hk_cell_als_floor_held(void) { return __atomic_load_n(&cell_als_floor,__ATOMIC_ACQUIRE); }
+ static int boot_proxy_acquire(void *unused){
+  const uint8_t *db=(const uint8_t *)ml_io_map_unmappable(CMD_DB_PHYS,CMD_DB_SIZE,VM_WIMG_WCOMB);
+  if(!db)return 0;int valid=slpi_proxy_plan(db,CMD_DB_SIZE,proxy_cmd);ml_io_unmap((vm_offset_t)db,CMD_DB_SIZE);
+@@ -1368,6 +1370,7 @@
+  if(!rsc.base||!ipcc.base||!aoss.base||!smem_lock.base)return 0;
+  if(!hk_rpmh_claim(true))return 0;
+  if(rd(rsc.base+RSC_TCS(RPMH_TCS)+TCS_STATUS)==0){hk_rpmh_release();return 0;}
++ __atomic_store_n(&cell_als_floor,true,__ATOMIC_RELEASE);
+  for(unsigned i=0;i<3;i++)tell("slpi: DIAGNOSTIC RETAINED vote address=%x value=%u (cold reboot releases)\n",proxy_cmd[i].address,proxy_cmd[i].value);
+  wr(rsc.base+RSC_IRQ_CLEAR,1u<<RPMH_TCS);
+  for(unsigned i=0;i<3;i++){
+@@ -1443,6 +1446,7 @@
+  assert_wait_timeout((event_t)&boot_cancelled,THREAD_UNINT,ms,NSEC_PER_MSEC);
+  thread_block(THREAD_CONTINUE_NULL);
+ }
++static bool cell_als_coefficient_served(void);
+ #include "slpi_glink_probe.inc"
+ static void slpi_dma_arena_trial(unsigned mode);
+ static bool slpi_load_configs(void);
+@@ -1530,12 +1534,13 @@
+     wr((vm_offset_t)base + offset, value);
+     settle();
+ }
+-static bool slpi_route_flush(void *base)
+-{
+-    slpi_route_write(base, 0x86610, 6);
+-    slpi_route_write(base, 0x867f0, 1);
++static bool slpi_route_flush(void *base, unsigned bank)
++{
++    unsigned page=0x80000+bank*0x1000;
++    slpi_route_write(base, page+0x610, bank);
++    slpi_route_write(base, page+0x7f0, 1);
+     uint64_t start = now_us();
+-    while (slpi_route_read(base, 0x867f4) & 1) {
++    while (slpi_route_read(base, page+0x7f4) & 1) {
+         if (now_us() - start >= 100000) return false;
+         __builtin_arm_yield();
+     }
+@@ -1557,6 +1562,19 @@
+ 
+ #include "slpi_apps_std.h"
+ static struct ssc_session slpi_files;
++static bool cell_als_coefficient_served(void) {
++ unsigned n=slpi_files.cal_file.size;
++ if(!slpi_files.calibration || !n || n>10 || !slpi_files.cal_opened || !slpi_files.cal_reads ||
++    slpi_files.cal_coverage!=((1u<<n)-1))return false;
++ unsigned digits=0;uint32_t value=0;
++ for(unsigned i=0;i<n;i++) {
++  unsigned c=slpi_files.calibration[i];
++  if((c==0 || c=='\n') && i+1==n)break;
++  if(c<'0'||c>'9'||value>(UINT32_MAX-(c-'0'))/10)return false;
++  value=value*10+c-'0';digits++;
++ }
++ return digits>0 && value>0;
++}
+ static void lc_native_broker_receipt(void){
+  if(oem130_wise){
+   uint32_t value=0,digits=0,size=slpi_files.cal_file.size;bool valid=!!slpi_files.calibration && size>0 && size<=10;
+@@ -1710,6 +1728,7 @@
+ {
+     /* Other clients see a valid stream and an enabled bank while this
+      * thread services GLINK. dsp_lock owns the entire remoteproc lifecycle. */
++    tell("cell-als: owned FastRPC mapping active; releasing allocator for other drivers\n");
+     lck_mtx_unlock(&hk_smmu_lock);
+     struct slpi_attach_params *params = owner;
+     sensor_link.rpc_owner = params;
+@@ -1805,6 +1824,7 @@
+         struct slpi_attach_params params = {&msg, args};
+         struct slpi_route_result r = slpi_route_run(&io, hk_display_context, pa[0], mode != 3,
+             mode >= 4 ? slpi_attach_while_mapped : NULL, &params);
++        tell("cell-als: route bank=%u slot=%u mapped=%u reclaimed=%u\n",r.bank,r.slot,r.mapped,r.reclaimable);
+         if (r.reclaimable) __atomic_store_n(&slpi_dma_busy, 0, __ATOMIC_RELEASE);
+         lck_mtx_unlock(&hk_smmu_lock);
+         ml_io_unmap(regs, 0x100000);
+@@ -1870,6 +1890,20 @@
+ 
+ void hk_slpi_boot_init(void){
+  static bool dispatched;uint32_t enable=0,cold=0,hold_votes=0,legacy=0;thread_t thread;
++ uint32_t als=0,cell=0;
++ if(PE_parse_boot_argn("als",&als,sizeof(als)) && als==1){
++  PE_parse_boot_argn("cell",&cell,sizeof(cell));
++  if(dispatched || cell!=1 || !instantnoodle_board() || pe_arm_get_soc_base_phys()!=HK_SOC_BASE ||
++     SLPI_LOAD_BASE+SLPI_LOAD_BYTES!=0x91b00000u)return;
++  dispatched=true;
++  /* Board-specific normal input init. Firmware validation and an empty
++   * PID0/PID3 remote partition are checked before requests to the DSP. */
++  link_probe_enabled=12;oem130_enabled=1;oem130_attrs=2;oem130_wise=1;
++  new_from=~0u;pause_ms=0;step=7;
++  tell("cell-als: front STK33502 bring-up requested; coexisting cell=1\n");
++  if(kernel_thread_start(slpi_boot_thread,NULL,&thread)==KERN_SUCCESS)thread_deallocate(thread);
++  return;
++ }
+  uint32_t arena_trial=0;
+  if(PE_parse_boot_argn("slpi_dma_arena",&arena_trial,sizeof(arena_trial)) && (arena_trial>=1 && arena_trial<=3)){
+   if(arena_trial>=2 && !slpi_route_isolated(false))return;
+--- a/hk_wise_sample.h
++++ b/hk_wise_sample.h
+@@ -3,19 +3,19 @@
+ #ifndef HK_WISE_SAMPLE_H
+ #define HK_WISE_SAMPLE_H
+ #include "hk_vendor_attributes.h"
+-enum { VW_TXN=0x4500,VW_MAX=1600 };
++enum { VW_TXN=0x4500,VW_MAX=8 };
+ struct vw_sample {uint64_t ticks;uint32_t status,lux_bits,c_bits,period_bits;unsigned fields;};
+ struct vw_state {
+  struct sl_config config;unsigned sent,accepted,rejected,invalid,count,bad_events;
+- struct vw_sample samples[VW_MAX];
++ struct vw_sample latest;
+ };
+ static bool vw_mode(const struct va_state *v,struct sl_config *out)
+ {
+  const struct sl_attrs *a=&v->attrs[0];
+- const uint32_t need=sl_bit(SL_NAME)|sl_bit(SL_TYPE)|sl_bit(SL_AVAILABLE)|sl_bit(SL_STREAM);
++ const uint32_t need=sl_bit(SL_NAME)|sl_bit(SL_VENDOR)|sl_bit(SL_PHYSICAL)|sl_bit(SL_TYPE)|sl_bit(SL_AVAILABLE)|sl_bit(SL_STREAM);
+  if(!(v->ack&v->received&1)||(v->invalid&1)||v->count[0]!=1||
+     !sl_nonzero(v->uid[0])||!sl_equal(a->source,v->uid[0])||
+-    (a->present&need)!=need||!a->available||strcmp(a->type,"wise_light"))return false;
++    (a->present&need)!=need||!a->available||!a->physical||strcmp(a->name,"stk33502")||strcmp(a->vendor,"oplus")||strcmp(a->type,"wise_light"))return false;
+  struct sl_config cfg={.source=a->source};
+  if(a->stream==1)cfg.mode=SL_ON_CHANGE;
+  else if(a->stream==0){
+@@ -68,11 +68,14 @@
+     current.mode!=s->config.mode||current.rate_binary32!=s->config.rate_binary32){s->invalid=1;return;}
+  struct sl_events events;
+  if(!sl_indication(p,n,&events)||events.client!=reg->client_id||!sl_equal(events.source,s->config.source))return;
+- for(unsigned i=0;i<events.count && s->count<VW_MAX;i++){
++ for(unsigned i=0;i<events.count;i++){
+   if(events.event[i].id!=1025)continue;
+   struct vw_sample m;
+   if(!vw_decode(&events.event[i],&m)){s->bad_events++;continue;}
+-  if(!s->count||m.ticks>s->samples[s->count-1].ticks)s->samples[s->count++]=m;
++  if(!s->count || m.ticks>s->latest.ticks){
++   s->latest=m;
++   if(s->count!=UINT32_MAX)s->count++;
++  }
+  }
+ }
+ #endif
+--- a/slpi_dma_route.h
++++ b/slpi_dma_route.h
+@@ -6,11 +6,11 @@
+     void *context;
+     uint32_t (*read)(void *, unsigned);
+     void (*write)(void *, unsigned, uint32_t); /* includes device barrier */
+-    bool (*flush_asid6)(void *);
++    bool (*flush_asid)(void *, unsigned bank);
+ };
+ struct slpi_route_result {
+     bool attempted, enabled, mapped, restored, reclaimable;
+-    unsigned failed_at, rollback_at;
++    unsigned failed_at, rollback_at, bank, slot;
+     uint32_t expected, observed, rollback_expected, rollback_observed;
+ };
+ struct slpi_bank_setting {
+@@ -36,33 +36,36 @@
+     return false;
+ }
+ 
+-/* Only the specific MMU geometry and address range already observed here.
+- * CB6 has been exercised by the native-board Wi-Fi driver. Never search
+- * arbitrary context banks (some belong to the secure display). */
++/* Only use banks exercised by normal drivers on this board: Wi-Fi, cell,
++ * audio and IFE recorded CB6..CB9. Enumerate hardware routes under the
++ * existing shared allocator lock; never touch a display or an occupied bank. */
+ static inline bool
+-slpi_route_slot(const struct slpi_route_io *io, unsigned display_cb, unsigned *slot)
++slpi_route_slot(const struct slpi_route_io *io, unsigned display_cb, unsigned *slot, unsigned *bank)
+ {
+     void *c = io->context;
+-    if (display_cb == 6 || io->read(c, 0x20) != 0x4c017e57 ||
+-        io->read(c, 0x24) != 0x6000004a || (io->read(c, 0) & 0x409) != 0x400)
+-        return false;
+-    unsigned free_slot = 87;
+-    for (unsigned i = 0; i < 87; i++) {
+-        uint32_t smr = io->read(c, 0x800 + 4*i);
+-        uint32_t route = io->read(c, 0xc00 + 4*i);
+-        if (!(smr >> 31)) {
+-            if (free_slot == 87 && !smr && route == 0x200ff) free_slot = i;
++    if (io->read(c, 0x20) != 0x4c017e57 || io->read(c, 0x24) != 0x6000004a ||
++        (io->read(c, 0) & 0x409) != 0x400 || io->read(c, 0x48)) return false;
++    unsigned free_slot=87, used=0;
++    for (unsigned i=0; i<87; i++) {
++        uint32_t smr=io->read(c, 0x800+4*i), route=io->read(c, 0xc00+4*i);
++        if (!(smr>>31)) {
++            if (free_slot==87 && !smr && route==0x200ff) free_slot=i;
+             continue;
+         }
+-        if ((route & 255) == 6) return false;
+-        for (unsigned sid = 0x541; sid <= 0x543; sid++)
+-            if (((sid ^ smr) & ~(smr >> 16) & 0x7fff) == 0) return false;
++        unsigned active=route&255;
++        if (active>=6 && active<=9) used|=1u<<active;
++        for (unsigned sid=0x541;sid<=0x543;sid++)
++            if (((sid^smr) & ~(smr>>16) & 0x7fff)==0) return false;
+     }
+-    if (free_slot == 87 || (io->read(c, 0x86000) & 1) ||
+-        (io->read(c, 0x86058) & 0xc00001feu) || io->read(c, 0x48) ||
+-        io->read(c, 0x86020) || io->read(c, 0x86024)) return false;
+-    *slot = free_slot;
+-    return true;
++    if (free_slot==87) return false;
++    for (unsigned n=9;n>=6;n--) {
++        if (n==display_cb || (used & (1u<<n))) continue;
++        unsigned page=0x80000+n*0x1000;
++        if (io->read(c,page)&1 || io->read(c,page+0x58)&0xc00001feu ||
++            io->read(c,page+0x20) || io->read(c,page+0x24)) continue;
++        *slot=free_slot;*bank=n;return true;
++    }
++    return false;
+ }
+ 
+ static inline struct slpi_route_result
+@@ -70,20 +73,22 @@
+                bool (*operate_until_stopped)(void *), void *owner)
+ {
+     struct slpi_route_result result = { .restored = true, .reclaimable = true };
+-    unsigned slot;
++    unsigned slot,bank;
+     if (!root_pa || (root_pa & ~UINT64_C(0xffffff000)) ||
+-        !slpi_route_slot(io, display_cb, &slot)) return result;
++        !slpi_route_slot(io, display_cb, &slot, &bank)) return result;
+     void *c = io->context;
+-    const unsigned ctl = 0x86000, smr = 0x800 + 4*slot, s2cr = 0xc00 + 4*slot;
++    result.bank=bank;result.slot=slot;
++    const unsigned page=0x80000+0x1000*bank;
++    const unsigned ctl = page, smr = 0x800 + 4*slot, s2cr = 0xc00 + 4*slot;
+     const uint32_t old_ctl = io->read(c, ctl);
+     const struct slpi_bank_setting settings[] = {
+-        {0x1818, 1, ~0u}, {0x1018, 0x1f300, ~0u},
+-        {0x86010, 0x38011, ~0x60u}, /* RES1 in native readback */
+-        {0x86030, 0x803519, ~0u},
+-        {0x86020, (uint32_t)root_pa, ~0u},
+-        {0x86024, (6u << 16) | (uint32_t)(root_pa >> 32), ~0u},
+-        {0x86028, 0, ~0u}, {0x8602c, 0, ~0u},
+-        {0x86038, 0xf404ff44, ~0u}, {0x8603c, 0, ~0u}
++        {0x1800+bank*4, 1, ~0u}, {0x1000+bank*4, 0x1f300, ~0u},
++        {page+0x10, 0x38011, ~0x60u}, /* RES1 in native readback */
++        {page+0x30, 0x803519, ~0u},
++        {page+0x20, (uint32_t)root_pa, ~0u},
++        {page+0x24, (bank << 16) | (uint32_t)(root_pa >> 32), ~0u},
++        {page+0x28, 0, ~0u}, {page+0x2c, 0, ~0u},
++        {page+0x38, 0xf404ff44, ~0u}, {page+0x3c, 0, ~0u}
+     };
+     enum { N = sizeof(settings)/sizeof(settings[0]) };
+     uint32_t saved[N];
+@@ -104,29 +109,29 @@
+             goto rollback;
+         }
+     }
+-    if (!io->flush_asid6(c)) {result.failed_at = 0x867f4; goto rollback;}
++    if (!io->flush_asid(c,bank)) {result.failed_at = page+0x7f4; goto rollback;}
+     switched = true;
+     io->write(c, ctl, 0x1127);
+     if ((io->read(c, ctl) & ~0x1000u) != 0x127) {result.failed_at = ctl; goto rollback;}
+     result.enabled = true;
+-    if (!slpi_route_readback(io, &result, 0x86058, 0, 0xc00001feu, false) ||
++    if (!slpi_route_readback(io, &result, page+0x58, 0, 0xc00001feu, false) ||
+         !slpi_route_readback(io, &result, 0x48, 0, ~0u, false) || !connect_stream)
+         goto rollback;
+     route_written = true;
+-    io->write(c, s2cr, 6);
+-    if (io->read(c, s2cr) != 6) {result.failed_at = s2cr; goto rollback;}
++    io->write(c, s2cr, bank);
++    if (io->read(c, s2cr) != bank) {result.failed_at = s2cr; goto rollback;}
+     io->write(c, smr, 0x80000541);
+     result.mapped = slpi_route_readback(io, &result, smr, 0x80000541, ~0u, false) &&
+-        slpi_route_readback(io, &result, 0x86058, 0, 0xc00001feu, false) &&
++        slpi_route_readback(io, &result, page+0x58, 0, 0xc00001feu, false) &&
+         slpi_route_readback(io, &result, 0x48, 0, ~0u, false);
+     if (result.mapped && operate_until_stopped) {
+         /* The mapping is owned until the peer has been positively stopped,
+          * even on timeout, malformed response or cancelled transaction. */
+         if (!operate_until_stopped(owner)) return result;
+         if (!slpi_route_readback(io,&result,smr,0x80000541,~0u,false) ||
+-            !slpi_route_readback(io,&result,s2cr,6,~0u,false) ||
+-            !slpi_route_readback(io,&result,0x86020,(uint32_t)root_pa,~0u,false) ||
+-            !slpi_route_readback(io,&result,0x86024,(6u<<16)|(uint32_t)(root_pa>>32),~0u,false))
++            !slpi_route_readback(io,&result,s2cr,bank,~0u,false) ||
++            !slpi_route_readback(io,&result,page+0x20,(uint32_t)root_pa,~0u,false) ||
++            !slpi_route_readback(io,&result,page+0x24,(bank<<16)|(uint32_t)(root_pa>>32),~0u,false))
+             return result;
+     }
+ rollback:
+@@ -140,7 +145,7 @@
+         io->write(c, ctl, 0);
+         if (!slpi_route_readback(io, &result, ctl, 0, 1, true)) return result;
+     }
+-    if (touched && !io->flush_asid6(c)) {result.rollback_at = 0x867f4; return result;}
++    if (touched && !io->flush_asid(c,bank)) {result.rollback_at = page+0x7f4; return result;}
+     /* Context configuration uses CBA2R before CBAR, just as on setup.
+      * Restore bank-local registers before switching its format back. */
+     unsigned configured = touched;
+@@ -165,7 +170,7 @@
+             result.rollback_observed = value;
+         }
+         exact = false;
+-        if (!(settings[i].offset == 0x1018 && saved[i] == 0 && value == 0x1f300))
++        if (!(settings[i].offset == 0x1000+bank*4 && saved[i] == 0 && value == 0x1f300))
+             inert = false;
+     }
+     if (!slpi_route_readback(io, &result, ctl, old_ctl, ~0u, true) ||
+@@ -174,13 +179,13 @@
+     for (unsigned i = 0; i < 87; i++) {
+         uint32_t active = io->read(c, 0x800 + 4*i);
+         if (!(active >> 31)) continue;
+-        if ((io->read(c, 0xc00 + 4*i) & 255) == 6 ||
++        if ((io->read(c, 0xc00 + 4*i) & 255) == bank ||
+             ((active ^ 0x541) & ~(active >> 16) & 0x7fff) == 0) return result;
+     }
+     result.restored = exact;
+-    result.reclaimable = inert && !(io->read(c, 0x86000) & 1) &&
+-        io->read(c, 0x86020) == 0 && io->read(c, 0x86024) == 0 &&
+-        !(io->read(c, 0x86058) & 0xc00001feu) && !io->read(c, 0x48);
++    result.reclaimable = inert && !(io->read(c, page+0x0) & 1) &&
++        io->read(c, page+0x20) == 0 && io->read(c, page+0x24) == 0 &&
++        !(io->read(c, page+0x58) & 0xc00001feu) && !io->read(c, 0x48);
+     return result;
+ }
+ static inline struct slpi_route_result
+--- a/slpi_glink_core.h
++++ b/slpi_glink_core.h
+@@ -51,7 +51,8 @@
+  bool foreground_armed, module_start, foreground_reusable;
+  bool (*prepare_module_start)(void *, struct hk_fastrpc_invoke *);
+  uint32_t rpc_tgid; bool listener_started, next_started, rpc_reusable;
+- unsigned callbacks;
++ unsigned callbacks;          /* saturating diagnostic count */
++ uint32_t callback_sequence;   /* tag for the next single in-flight reply */
+  bool (*reply_callback)(void *,struct hk_fastrpc_invoke *,unsigned);
+  void *rpc_owner; bool (*prepare_next)(void *, struct hk_fastrpc_invoke *);
+  unsigned lookup,lookup_sent,lookup_node,lookup_port,reply_count,query_base;
+@@ -67,6 +68,23 @@
+ };
+ static void sg16(uint8_t*p,unsigned v){p[0]=v;p[1]=v>>8;}
+ static void sg32(uint8_t*p,uint32_t v){for(unsigned i=0;i<4;i++)p[i]=v>>(8*i);}
++/* Setup inventories have budgets. Once a calibrated front stream is
++ * subscribed, valid packets and listener calls belong to a resident client.
++ * Absolute counters cannot decide transport lifetime. */
++static bool sg_resident_light(const struct sg_core *g) {
++ return g->wise_stream && g->wise.accepted && g->wise.count &&
++        !g->wise.invalid && !g->wise.rejected && !g->registry.invalidated;
++}
++static bool sg_listener_budget(const struct sg_core *g) {
++ return sg_resident_light(g) || g->callbacks < SG_REGISTRY_CALLBACK_LIMIT;
++}
++static uint32_t sg_next_callback_sequence(struct sg_core *g) {
++ /* Previous reply and its TX are both complete before this is called. Slots
++  * 0..5 are reserved for attach/module setup, never reused by the listener. */
++ if(g->callback_sequence<6 || g->callback_sequence==UINT32_MAX)g->callback_sequence=6;
++ else ++g->callback_sequence;
++ return g->callback_sequence;
++}
+ static int sg_fail(struct sg_core*g){g->broken=1;return 0;}
+ static int sg_emit(struct sg_core*g,unsigned cmd,unsigned p1,uint32_t p2,const void*body,unsigned n){
+  uint8_t b[256];unsigned bytes=(8+n+7)&~7u;if(n>sizeof(b)-8||g->broken)return sg_fail(g);
+@@ -91,7 +109,8 @@
+  else return sg_fail(g);
+  if(at>n||!size||size>n-at||n-at-size>3||confirm>1||(tonode!=1&&tonode!=~0u))return sg_fail(g);
+  for(unsigned i=at+size;i<n;i++)if(b[i])return sg_fail(g);
+- if(++g->qrtr_in>2048)return sg_fail(g);
++ if(g->qrtr_in!=UINT32_MAX)++g->qrtr_in;
++ if(!sg_resident_light(g) && g->qrtr_in>2048)return sg_fail(g);
+  if(confirm&&type!=7){uint32_t w[5]={7,tonode,toport,0,0};if(!sg_queue(g,7,fromnode,toport,fromport,w))return 0;}
+  if(type==7)return 1;
+  if(toport!=SG_CTRL){
+@@ -135,7 +154,7 @@
+    }else if(qmi[0] != 4 || (message != 0x21 && message != 0x22))return 1;
+    if(size>1100)return sg_fail(g);
+    /* The parser above remains live after the bounded diagnostic capture fills. */
+-   if(g->reply_count>=1850){g->capture_dropped++;return 1;}
++   if(g->reply_count>=1850){if(g->capture_dropped!=UINT32_MAX)++g->capture_dropped;return 1;}
+    unsigned i=g->reply_count++;g->reply_size[i]=size;
+    for(unsigned j=0;j<size;j++)g->replies[i][j]=b[at+j];
+    g->note(g->ctx,24,i,size,fromnode,fromport);
+@@ -303,11 +322,11 @@
+ {
+     struct sg_rpc_call *call = &g->rpc;
+     if(g->rpc_probe==8 && g->next_started && g->module_start && g->foreground.tx_done &&
+-       call->completed && call->tx_done && !call->retval && g->callbacks<SG_REGISTRY_CALLBACK_LIMIT){
++       call->completed && call->tx_done && !call->retval && sg_listener_budget(g)){
+         bool reuse=g->callbacks?g->rpc_reusable:g->foreground_reusable;
+-        if(!g->reply_callback || !g->reply_callback(g->rpc_owner,&call->message,6+g->callbacks))
++        if(!g->reply_callback || !g->reply_callback(g->rpc_owner,&call->message,sg_next_callback_sequence(g)))
+             return sg_fail(g);
+-        g->callbacks++;
++        if(g->callbacks!=UINT32_MAX)++g->callbacks;
+         call->sent=call->completed=call->tx_done=false;
+         call->flags=call->early=call->stale=0;
+         if(!reuse){
+@@ -397,7 +416,9 @@
+     return 1;
+ }
+ static int sg_receive(struct sg_core*g,const uint8_t*b,unsigned n){
+- if(n<8||g->broken||++g->received>(g->rpc_probe==8?3u*SG_REGISTRY_CALLBACK_LIMIT+512u:4096u))return sg_fail(g);int framed=sg_frame_length(b,n,65536);if(framed<0||(unsigned)framed!=n)return sg_fail(g);
++ if(n<8||g->broken)return sg_fail(g);
++ if(g->received<UINT32_MAX)g->received++;
++ if(!sg_resident_light(g) && g->received>(g->rpc_probe==8?3u*SG_REGISTRY_CALLBACK_LIMIT+512u:4096u))return sg_fail(g);int framed=sg_frame_length(b,n,65536);if(framed<0||(unsigned)framed!=n)return sg_fail(g);
+  unsigned c=slpi_u16(b),p1=slpi_u16(b+2);uint32_t p2=slpi_u32(b+4);
+  /* Diagnostic channel 2 only exchanges GLINK channel control. Record peer
+   * intents separately. This channel has no local receive intents or DMA arena. */
+--- a/slpi_glink_probe.inc
++++ b/slpi_glink_probe.inc
+@@ -7,11 +7,7 @@
+ extern void hk_light_panel_tick(uint64_t);
+ extern void hk_light_panel_end(void);
+ extern bool hk_light_panel_is_armed(void);
+-static uint64_t iui_verified,i_live,i_lastcheck;
+-static bool i_has_home(void){
+- vnode_t v=NULLVP;if(vnode_lookup("/private/var/root/brightness-ui-ready",VNODE_LOOKUP_NOFOLLOW,&v,vfs_context_kernel()))return false;
+- bool ok=vnode_vtype(v)==VREG;vnode_put(v);return ok;
+-}
++static uint64_t i_live;
+ static uint32_t lc_policy_enabled;
+ static unsigned lc_fresh,lc_flag,lc_path,lc_factory,lc_called;
+ static LCK_MTX_DECLARE(lc_diag_lock,&slpi_lock_group);
+@@ -21,7 +17,7 @@
+ static int lc_user_preference SYSCTL_HANDLER_ARGS{
+  (void)arg1;(void)arg2;
+  int value=0,mode=0;PE_parse_boot_argn("als",&mode,sizeof(mode));
+- if(mode!=3)return ENOTSUP;
++ if(mode!=1)return ENOTSUP;
+  if(!req->newptr)return EINVAL;
+  int rc=sysctl_handle_int(oidp,&value,0,req);
+  if(rc)return rc;if(value<0||value>2)return EINVAL;
+@@ -102,7 +98,7 @@
+  /* Static packet/intents storage is deliberately not freed on panic. */
+ }
+ static int slpi_glink_probe(unsigned lookup){
+- struct slpi_report r;uint32_t size=0;uint64_t began=now_us();int success=0;
++ struct slpi_report r;uint32_t size=0;uint64_t began=now_us();int success=0;const char *exit_reason="bootstrap";
+  if(!boot_once.owned_running||!boot_once.ready||os_atomic_load(&boot_cancelled,acquire)||!link_inventory(&r))return 0;
+  for(unsigned slot=3;slot<6;slot++){uint32_t off=0,n=0;int found=link_peer_item(&r,slot,&off,&n);tell("slpi-link: after READY item%u present=%d offset=%x bytes=%u\n",475+slot,found,off,n);}
+  if(!link_make(478,32)||!link_make(479,16384))goto done;
+@@ -126,14 +122,14 @@
+  if(!link_indices(&th,&tt,&rh,&rt)||rt!=0){tell("slpi-link: invalid indices after RX acquisition; no reset\n");goto done;}
+  tell("slpi-link: descriptor=%x TX=%x/%u RX=%x/%u indices=%u,%u,%u,%u (no reset)\n",link_descriptor,link_tx,link_tx_size,link_rx,link_rx_size,tt,th,rt,rh);
+  wr(ipcc.base+IPCC_ENABLE,IPCC_SLPI<<16|IPCC_GLINK);link_irq_enabled=true;
+- while(now_us()-began<(sensor_link.rpc_probe==8?315000000:lookup?30000000:10000000)&&!sensor_link.broken&&!os_atomic_load(&boot_cancelled,acquire)){
+-  struct smp2p words;if(dsp_words(&words)){dsp_listen(&words);if(dsp_state(&words)&DSP_FATAL){sensor_link.broken=1;tell("slpi-link: DSP FATAL during inventory\n");break;}}
++ while((sg_resident_light(&sensor_link) || now_us()-began<(sensor_link.rpc_probe==8?155000000:lookup?30000000:10000000))&&!sensor_link.broken&&!os_atomic_load(&boot_cancelled,acquire)){
++  struct smp2p words;if(dsp_words(&words)){dsp_listen(&words);if(dsp_state(&words)&DSP_FATAL){exit_reason="dsp-fatal";sensor_link.broken=1;tell("slpi-link: DSP FATAL during inventory\n");break;}}
+   doorbells();unsigned pumped=0;
+   for(;pumped<32;pumped++){
+-   if(!link_indices(&th,&tt,&rh,&rt)){sensor_link.broken=1;break;}
++   if(!link_indices(&th,&tt,&rh,&rt)){exit_reason="ring-indices";sensor_link.broken=1;break;}
+    unsigned available=sg_ring_used(link_rx_size,rh,rt);if(available<8)break;
+    link_peek(rt,link_frame,available<16?available:16);int n=sg_frame_length(link_frame,available,link_rx_size);
+-   if(n<0||(unsigned)n>sizeof(link_frame)){sensor_link.broken=1;break;}if(!n)break;
++   if(n<0||(unsigned)n>sizeof(link_frame)){exit_reason="frame-length";sensor_link.broken=1;break;}if(!n)break;
+    link_peek(rt,link_frame,(unsigned)n);
+    /* Advance AP-consumed tail once a bounded complete frame is captured. */
+    smem_poke(link_descriptor+8,(rt+(uint32_t)n)%link_rx_size);settle();
+@@ -148,6 +144,7 @@
+      tell("slpi-link: RX intent%u size=%u id=%u\n",j,slpi_u32(link_frame+8+8*j),slpi_u32(link_frame+12+8*j));
+    }
+    if(!sg_receive(&sensor_link,link_frame,(unsigned)n)){
++    exit_reason="frame-rejected";
+     tell("slpi-link: rejected RX cmd=%u channel=%u arg=%u bytes=%u received=%u\n",
+      slpi_u16(link_frame),slpi_u16(link_frame+2),slpi_u32(link_frame+4),(unsigned)n,sensor_link.received);
+     break;
+@@ -161,15 +158,15 @@
+    sensor_link.lookup=3;sensor_link.lookup_sent=0;
+    tell("slpi-see: late inventory after registry activity; callbacks=%u\n",sensor_link.callbacks);
+   }
+-  if(!sg_tick(&sensor_link))break;
+-  uint64_t ino=now_us();
+-  if(!iui_verified && ino-i_lastcheck>=500000){i_lastcheck=ino;if(i_has_home()){
+-   iui_verified=ino;tell("brightness-interactive: received verified full Home/Settings marker us=%llu\n",(unsigned long long)ino);
+-  }}
++  if(sensor_link.broken)break;
++  if(sensor_link.wise_stream && (sensor_link.registry.invalidated || sensor_link.wise.invalid || sensor_link.wise.rejected)){
++   exit_reason="source-invalidated";sensor_link.broken=1;break;
++  }
++  if(!sg_tick(&sensor_link)){exit_reason="transport-tick";break;}
+   if(sensor_link.wise_stream && sensor_link.wise.accepted && sensor_link.wise.count && !sensor_link.wise.invalid &&
+       !sensor_link.wise.rejected && !sensor_link.registry.invalidated){
+    const struct vw_state *src=&sensor_link.wise;
+-   const struct vw_sample *m=&src->samples[src->count-1];
++   const struct vw_sample *m=&src->latest;
+    bool fresh=false;
+    lck_mtx_lock(&lc_diag_lock);
+    if(lc_latest.see_ticks<m->ticks){
+@@ -182,23 +179,24 @@
+    lck_mtx_unlock(&lc_diag_lock);
+    if(fresh){
+     const bool path=sr_values_match(&sensor_link.registry,SR_DEVINFO_ALS);
+-    const bool factory=(sensor_link.registry.received & sensor_link.registry.ack_ok & (1u<<SR_FAC_ALS))!=0;
++    const bool factory=sr_values_match(&sensor_link.registry,SR_FAC_ALS);
+     lc_fresh++;
+-    if(lc_policy_enabled==3)lc_flag++;
++    if(lc_policy_enabled==1)lc_flag++;
+     if(path)lc_path++;
+     if(factory)lc_factory++;
++    if(lc_fresh==1 || (lc_fresh%100)==0)tell("cell-als: front seq=%u lux_bits=%x status=%u ticks=%llu path=%u factory=%u coefficient_served=%u\n",src->count,m->lux_bits,m->status,(unsigned long long)m->ticks,path,factory,cell_als_coefficient_served());
+     if(lc_fresh==1)tell("light-source: first seq=%u tick=%llu flag=%u group4=%u group5=%u ack=%x events=%x\n",
+        src->count,(unsigned long long)m->ticks,lc_policy_enabled,path,factory,sensor_link.registry.ack_ok,sensor_link.registry.received);
+-    if(iui_verified && lc_policy_enabled==3 && path && factory && !sensor_link.registry.invalidated){
++    if(lc_policy_enabled==1 && path && factory && cell_als_coefficient_served() && !sensor_link.registry.invalidated){
+      lc_called++;hk_light_panel_sample(now_us(),m->ticks,src->config.source.lo,src->config.source.hi,src->count,m->status,m->lux_bits);
+      if(!i_live && hk_light_panel_is_armed()){
+-      i_live=now_us();tell("brightness-interactive: READY full_home=1 stock_Settings=1 live_sensor=1 panel_baseline=1 minimum_seconds=145 us=%llu tick=%llu\n",
++      i_live=now_us();tell("cell-als: live_front=1 panel_owner=1 us=%llu tick=%llu\n",
+           (unsigned long long)i_live,(unsigned long long)m->ticks);
+      }
+     }
+    }
+   }
+-  if(lc_policy_enabled==3 && sensor_link.wise_stream)hk_light_panel_tick(now_us());
++  if(lc_policy_enabled==1 && sensor_link.wise_stream)hk_light_panel_tick(now_us());
+   if(pumped<32 && sg_registry_reads_done(&sensor_link)){
+    struct sd_state *deps=&sensor_link.deps;
+    uint64_t now=now_us();
+@@ -211,15 +209,16 @@
+    }else if(sd_window_done(deps,now) &&
+              (!sensor_link.vendor_attrs || va_terminal(&sensor_link.vendor) || now-deps->started_us>=8000000) &&
+              (!sensor_link.wise_stream || sensor_link.wise.invalid || sensor_link.wise.rejected ||
+-              (i_live && now-i_live>=154000000) || (!i_live && now-began>=155000000))){
++              (!sensor_link.wise.count && now-began>=155000000))){
++    exit_reason="inventory-complete";
+     tell("slpi-deps: observation ended elapsed_ms=%llu terminal=%u\n",
+          (unsigned long long)((now-deps->started_us)/1000),sd_terminal(deps));
+     break;
+    }
+   }
+   if(sensor_link.rpc_probe>=3 && sensor_link.rpc.completed && sensor_link.rpc.tx_done &&
+-     (sensor_link.rpc_probe==3 || (sensor_link.rpc_probe==4 && sensor_link.listener_started) || (sensor_link.next_started && (sensor_link.rpc_probe!=8 || sensor_link.callbacks>=SG_REGISTRY_CALLBACK_LIMIT)) || sensor_link.rpc.retval))break;
+-  boot_wait_ms(NULL,2);
++     (sensor_link.rpc_probe==3 || (sensor_link.rpc_probe==4 && sensor_link.listener_started) || (sensor_link.next_started && (sensor_link.rpc_probe!=8 || !sg_listener_budget(&sensor_link))) || sensor_link.rpc.retval)){exit_reason=sensor_link.rpc.retval?"rpc-error":"inventory-budget";break;}
++  boot_wait_ms(NULL,sensor_link.wise.accepted ? 20 : 2);
+  }
+  success=!os_atomic_load(&boot_cancelled,acquire)&&sensor_link.agreed&&sensor_link.open&&sensor_link.hello_received&&!sensor_link.broken;
+  if(sensor_link.rpc_probe){
+@@ -274,10 +273,10 @@
+    tell("slpi-wise: sent=%u accepted=%u rejected=%u invalid=%u samples=%u malformed=%u uid=%llx,%llx\n",
+     w->sent,w->accepted,w->rejected,w->invalid,w->count,w->bad_events,(unsigned long long)w->config.source.lo,
+     (unsigned long long)w->config.source.hi);
+-   for(unsigned i=0;i<w->count;i++){
+-    const struct vw_sample *m=&w->samples[i];
+-    tell("slpi-wise: sample=%u ticks=%llu status=%u n=%u lux_bits=%x c_bits=%x period_ms_bits=%x\n",
+-     i,(unsigned long long)m->ticks,m->status,m->fields,m->lux_bits,m->c_bits,m->period_bits);
++   if(w->count){
++    const struct vw_sample *m=&w->latest;
++    tell("slpi-wise: latest seq=%u ticks=%llu status=%u n=%u lux_bits=%x c_bits=%x period_ms_bits=%x\n",
++     w->count,(unsigned long long)m->ticks,m->status,m->fields,m->lux_bits,m->c_bits,m->period_bits);
+    }
+   }
+   if(sensor_link.vendor_attrs){
+@@ -310,11 +309,14 @@
+   }
+  }
+  if(sensor_link.wise_stream){
+-  tell("brightness-interactive: end ui=%u ready=%u live_seconds=%llu\n",iui_verified!=0,i_live!=0,(unsigned long long)(i_live?(now_us()-i_live)/1000000:0));
++  tell("cell-als: source-exit reason=%s qrtr=%u frames=%u listener_calls=%u accepted_samples=%u invalid=%u\n",
++      os_atomic_load(&boot_cancelled,acquire)?"stop-request":exit_reason,sensor_link.qrtr_in,sensor_link.received,
++      sensor_link.callbacks,sensor_link.wise.count,sensor_link.wise.invalid || sensor_link.registry.invalidated);
++  tell("cell-als: end ready=%u live_seconds=%llu\n",i_live!=0,(unsigned long long)(i_live?(now_us()-i_live)/1000000:0));
+   tell("light-source: gates fresh=%u enabled=%u path_match=%u factory_event=%u panel_called=%u group4=%u group5=%u ack=%x events=%x\n",
+     lc_fresh,lc_flag,lc_path,lc_factory,lc_called,sr_values_match(&sensor_link.registry,SR_DEVINFO_ALS),
+     (sensor_link.registry.received&sensor_link.registry.ack_ok&(1u<<SR_FAC_ALS))!=0,sensor_link.registry.ack_ok,sensor_link.registry.received);
+-  if(lc_policy_enabled==3)hk_light_panel_end();
++  if(lc_policy_enabled==1)hk_light_panel_end();
+  }
+  lck_mtx_lock(&lc_diag_lock);lc_latest.active=0;lck_mtx_unlock(&lc_diag_lock);
+  slpi_link_quiesce();return success;

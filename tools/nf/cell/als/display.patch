@@ -1,0 +1,419 @@
+--- a/MiniAppleARMBacklight.cpp
++++ b/MiniAppleARMBacklight.cpp
+@@ -30,6 +30,8 @@
+  * reports. Brightness below 2 nits, the table's first point, is not asked for.
+  */
+ static TUNABLE(uint32_t, gEdr, "edr", 0);
++static TUNABLE(uint32_t, gCellALS, "als", 0);
++extern "C" void hk_light_slider_position(uint64_t);
+ #define NITS(n)                 ((unsigned long long)(n) << 16)
+ #define EDR_USER_MAX_NITS       430
+ #define EDR_HARDWARE_MAX_NITS   600
+@@ -193,6 +195,18 @@
+ 		}
+ 		OSSafeReleaseNULL(text);
+ 		if (value != NULL && gEdr && key->isEqualTo("DisplayBrightness")) {
++            /* This field reports the normalized OS slider independent of the
++             * actual panel nits during a display fade. Observe it only. */
++            if (gCellALS == 1) {
++                OSDictionary *state=OSDynamicCast(OSDictionary,value);
++                OSNumber *slider=state?OSDynamicCast(OSNumber,state->getObject("Brightness")):NULL;
++                if (slider && (slider->numberOfBits()==31 || slider->numberOfBits()==63)) {
++                    double value=slider->doubleValue();
++                    uint64_t bits=0;
++                    memcpy(&bits,&value,sizeof(bits));
++                    hk_light_slider_position(bits);
++                }
++            }
+ 			/*
+ 			 * Not kept (edr=1): its nits are CFNumbers of floating point, which the kernel's OSNumber holds as their bits
+ 			 * (an integer of size 31); read back, CoreBrightness says "Unexpected nits type" and takes the brightness back
+--- a/MiniIOMobileFramebuffer.cpp
++++ b/MiniIOMobileFramebuffer.cpp
+@@ -1191,6 +1191,7 @@
+ 		displayWrite(INTF1_TEAR_INTR_EN, displayReg(gDPU, INTF1_TEAR_INTR_EN) & ~TEAR_RD_PTR);
+ 		__atomic_store_n(&gTeTime, 0, __ATOMIC_RELEASE);
+ 		gPanelOff = true;
++		lpPowerTransitionLocked(false,sent==1,false);
+ 		IOLockUnlock(gPanelLock);
+ 		displayLog("display: the panel dark (%u command, %llu ms)\n", sent, micros(mach_absolute_time() - began) / 1000);
+ 		hk_power_display(false);
+@@ -1200,12 +1201,13 @@
+ 	static const uint8_t kOn[] = { 0x05, 0, 1, 0x29, 0 };
+ 	unsigned sent = dsiSequence(kOn);
+ 
+-	backlightSendLocked();          /* (the brightness iOS had set, before the first lit frame) */
++	bool wake_acked=backlightSendLocked() && lpFreshDone; /* replay the OS brightness before the first lit frame */
+ 	displayWrite(INTF1_TEAR_INTR_CLEAR, TEAR_RD_PTR);
+ 	if (gPushIrq) {
+ 		displayWrite(INTF1_TEAR_INTR_EN, displayReg(gDPU, INTF1_TEAR_INTR_EN) | TEAR_RD_PTR);
+ 	}
+ 	gPanelOff = false;
++	lpPowerTransitionLocked(true,sent==1,wake_acked);
+ 	pushFrameLocked(gPushId, loader_screen[0] != 0 ? loader_screen[0] : vinfo.v_physaddr);    /* the latest frame */
+ 	IOLockUnlock(gPanelLock);
+ 	displayLog("display: the panel lit (%u command, %llu ms)\n", sent, micros(mach_absolute_time() - began) / 1000);
+@@ -1224,7 +1226,7 @@
+ 
+ 	if (gPanelLock != NULL) {
+ 		IOLockLock(gPanelLock);
+-		lpOwnerLocked();
++		lpOwnerLocked(dcs);
+ 		gBacklight = dcs;
+ 		if (gHbmOn && dsiReady()) {
+ 			sent = hbmSend(false);  /* (iOS's brightness ends high brightness, and is sent with its end: hk_hbm.c) */
+@@ -1255,7 +1257,7 @@
+ 
+ 	if (gPanelLock != NULL) {
+ 		IOLockLock(gPanelLock);
+-		lpOwnerLocked();
++		lpOwnerLocked(dcs);
+ 		gBacklight = dcs;
+ 		if (!gHbmOn) {
+ 			sent = backlightSendLocked();
+--- a/hk_light_policy.h
++++ b/hk_light_policy.h
+@@ -2,15 +2,36 @@
+ #define HK_LIGHT_POLICY_H
+ #include <stdint.h>
+ #include <stdbool.h>
+-enum { LP_FLOOR=256,LP_MAX=2047,LP_STEP=24,LP_DEADBAND=8,LP_REQUIRED=3,LP_MAX_WRITES=240 };
++enum { LP_FLOOR=256,LP_MAX=2047,LP_STEP_PER_SECOND=384,LP_RAMP_MIN_US=16000,LP_RAMP_MAX_US=24000,LP_STALE_US=1500000 };
+ struct lp_state {
+  unsigned baseline,current,writes,band,stable,source;
+  uint64_t start,last_apply,last_sample,last_tick,lo,hi;
+  bool armed,terminal,touched;
+- unsigned reference,goal,stable_goal,nits_x10000;uint64_t stable_since;
++ unsigned reference,goal,stable_goal,nits_x10000;uint64_t stable_since,light_seen;
++ uint32_t filtered,accepted,initial_low,initial_high;
++ uint32_t sample_sequence,sample_bits,ramp_fraction;
++ uint64_t ramp_clock;
++ int crossing;bool initialized,accepted_light;
+ };
+ struct lp_point {uint32_t x,y;};
+ #include "lp_tables.h"
++struct lp_slider_state {uint32_t anchor;bool seen;};
++static inline bool lp_slider_changed(struct lp_slider_state *slider,uint64_t bits,bool lit) {
++ if(!lit || bits>UINT64_C(0x3ff0000000000000))return false;
++ unsigned exponent=(unsigned)(bits>>52);
++ uint32_t q16=0;
++ if(exponent>=1006){
++  uint64_t significand=(bits&UINT64_C(0x000fffffffffffff))|UINT64_C(0x0010000000000000);
++  unsigned shift=1059-exponent;
++  q16=(uint32_t)((significand+(UINT64_C(1)<<(shift-1)))>>shift);
++ }
++ if(!slider->seen){slider->seen=true;slider->anchor=q16;return false;}
++ unsigned delta=q16>slider->anchor?q16-slider->anchor:slider->anchor-q16;
++ /* Small representation noise around 0.5 was present throughout the actual
++  * OS fade. Track cumulative motion relative to the last accepted anchor. */
++ if(delta<64)return false;
++ slider->anchor=q16;return true;
++}
+ static inline uint32_t lp_interp(uint32_t x,const struct lp_point *p,unsigned n){
+  if(x<=p[0].x)return p[0].y;
+  for(unsigned i=1;i<n;i++)if(x<=p[i].x){
+@@ -28,29 +49,71 @@
+  uint64_t scaled=(uint64_t)((bits&0x7fffff)|0x800000)*1000;
+  return (uint32_t)((scaled+(((uint64_t)1)<<(shift-1)))>>shift);
+ }
+-static inline unsigned lp_target(struct lp_state *s,uint64_t now_us,uint64_t tick,uint32_t lux){
+- if(!s->armed||s->terminal||!tick||tick<=s->last_tick||lux>=0x4f800000u||now_us<s->last_sample)return 0;
+- s->last_tick=tick;s->last_sample=now_us;
+- s->nits_x10000=lp_interp(lp_millilux(lux),lux_nits,sizeof(lux_nits)/sizeof(lux_nits[0]));
++static inline void lp_observe(struct lp_state *s,uint64_t now_us,uint64_t tick,uint32_t sequence,uint32_t lux){
++ if(!s->armed||s->terminal||!tick||tick<=s->last_tick||lux>=0x4f800000u||now_us<s->last_sample)return;
++ uint32_t input=lp_millilux(lux);
++ uint64_t elapsed=s->light_seen?now_us-s->light_seen:0;
++ s->last_tick=tick;s->last_sample=s->light_seen=now_us;
++ s->sample_sequence=sequence;s->sample_bits=lux;
++ if(!s->initialized){
++  s->initialized=true;s->filtered=input;s->stable_since=now_us;
++  s->initial_low=s->initial_high=input;
++ }else{
++  /* Integer first-order filter, 250ms time constant. */
++  uint64_t dt=elapsed>1000000?1000000:elapsed;
++  int64_t difference=(int64_t)input-s->filtered;
++  s->filtered=(uint32_t)((int64_t)s->filtered+difference*(int64_t)dt/(int64_t)(250000+dt));
++ }
++ uint32_t previous=s->accepted_light?s->accepted:s->filtered;
++ uint32_t fraction=previous<10000?600:300;
++ uint32_t distance=(uint32_t)(((uint64_t)previous*fraction+999)/1000);
++ if(!distance)distance=1;
++ if(!s->accepted_light){
++  if(input<s->initial_low)s->initial_low=input;
++  if(input>s->initial_high)s->initial_high=input;
++  if(s->initial_high-s->initial_low>distance){
++   s->stable_since=now_us;s->initial_low=s->initial_high=input;
++  }
++  if(now_us-s->stable_since<1500000)return;
++  s->accepted=s->filtered;s->accepted_light=true;
++ }else{
++  int direction=0;
++  if(input>=previous+distance && s->filtered>=previous+distance)direction=1;
++  if(previous>=distance && input<=previous-distance && s->filtered<=previous-distance)direction=-1;
++  if(direction!=s->crossing){s->crossing=direction;s->stable_since=now_us;}
++  if(direction && now_us-s->stable_since>=1500000){
++   s->accepted=s->filtered;s->crossing=0;s->stable_since=now_us;
++  }
++ }
++ s->nits_x10000=lp_interp(s->accepted,lux_nits,sizeof(lux_nits)/sizeof(lux_nits[0]));
+  uint32_t numerator=lp_interp(s->nits_x10000,nits_backlight,sizeof(nits_backlight)/sizeof(nits_backlight[0]));
+- s->reference=(numerator+127)/255;
+- unsigned low=s->baseline-s->baseline/4;
+- unsigned visible=s->baseline<LP_FLOOR?s->baseline:LP_FLOOR;
+- if(low<visible)low=visible;
+- if(s->baseline>64 && low<s->baseline-64)low=s->baseline-64;
+- unsigned high=s->baseline+48;if(high>LP_MAX)high=LP_MAX;
+- s->goal=s->reference<low?low:s->reference>high?high:s->reference;
+- s->band=s->reference<low?0:s->reference>high?2:1;
++ unsigned target=(numerator+127)/255;
++ if(!s->goal || (s->goal>s->current)!=(target>s->current)){
++  s->ramp_clock=now_us;s->ramp_fraction=0;
++ }
++ s->goal=s->reference=target;
++}
++
++/* The SEE thread already pumps about every 20 ms. A delayed pump must never
++ * pay back a long scheduling interval in one visible step. Keep fractional
++ * counts, so an ordinary 20 ms tick does not round 7.68 down to 7 forever. */
++static inline unsigned lp_ramp_step(struct lp_state *s,uint64_t now_us){
++ if(!s->armed || s->terminal || !s->accepted_light || !s->goal ||
++    now_us<s->last_sample || now_us-s->last_sample>=LP_STALE_US ||
++    now_us<s->ramp_clock)return 0;
+  int delta=(int)s->goal-(int)s->current;
+- if(delta>=-LP_DEADBAND&&delta<=LP_DEADBAND){s->stable=0;return 0;}
+- int drift=(int)s->goal-(int)s->stable_goal;
+- if(!s->stable||drift>LP_DEADBAND||drift< -LP_DEADBAND){
+-  s->stable=1;s->stable_goal=s->goal;s->stable_since=now_us;return 0;
+- }
+- if(s->stable<LP_REQUIRED)s->stable++;
+- if(s->stable<LP_REQUIRED||s->writes>=LP_MAX_WRITES||now_us-s->stable_since<1500000||now_us-s->last_apply<1500000)return 0;
+- if(delta>LP_STEP)delta=LP_STEP;if(delta< -LP_STEP)delta=-LP_STEP;
+- return (unsigned)((int)s->current+delta);
++ if(!delta){s->ramp_clock=now_us;s->ramp_fraction=0;return 0;}
++ uint64_t elapsed=now_us-s->ramp_clock;
++ if(elapsed<LP_RAMP_MIN_US)return 0;
++ if(elapsed>LP_RAMP_MAX_US)elapsed=LP_RAMP_MAX_US;
++ s->ramp_clock=now_us;
++ uint32_t budget=s->ramp_fraction+(uint32_t)elapsed*LP_STEP_PER_SECOND;
++ unsigned step=budget/1000000;
++ s->ramp_fraction=budget%1000000;
++ if(!step)return 0;
++ unsigned remaining=(unsigned)(delta>0?delta:-delta);
++ if(step>=remaining){step=remaining;s->ramp_fraction=0;}
++ return delta>0?s->current+step:s->current-step;
+ }
+ static inline bool lp_read_dbv(uint32_t bytes,uint32_t fifo,unsigned *value)
+ {
+--- a/hk_user_preference.h
++++ b/hk_user_preference.h
+@@ -21,5 +21,8 @@
+ static inline bool lp_pref_fresh(const struct lp_pref *s,uint64_t now){
+  return s->live && !s->manual_hold && now>=s->seen && now-s->seen<=3500000;
+ }
++/* The latest acknowledged slider request owns this lit session. Only a real
++ * off->on display cycle (or an actual off->on preference) ends the hold. */
++static inline void lp_pref_screen_wake(struct lp_pref *s){s->manual_hold=false;s->live=false;}
+ static inline void lp_pref_manual(struct lp_pref *s){s->manual_hold=true;s->live=false;}
+ #endif
+--- a/panel_trial.inc
++++ b/panel_trial.inc
+@@ -3,18 +3,22 @@
+ static struct lp_pref lpUser;
+ static struct lp_state lp;
+ static uint64_t lpOwnerGeneration,lpOwnerDone,lpOwnerChangeUs,lpAttemptUs;
+-static unsigned lpOwnerLevel,lpSourceReadAttempts;
+-static bool lpReadUnknown;
++static unsigned lpOwnerLevel;
++static bool lpWaitWake,lpSawDark;
++static struct lp_slider_state lpSlider;
++static bool lpSliderAvailable;
++static unsigned lpLastOwnerRequest;
+ static unsigned lpEntries,lpNoLock,lpTerminal,lpOff,lpHbm,lpNotPushing,lpNotReady,lpWrongStatus,lpIdle,lpBaseline,lpMatched,lpSent,lpRestored;
+ static void lpMarks(void){
+  displayLog("light-panel: gates entry=%u no_lock=%u terminal=%u off=%u hbm=%u inactive=%u no_dsi=%u bad_sample=%u idle_scanout=%u baseline=%u selections=%u applied=%u restored=%u\n",
+     lpEntries,lpNoLock,lpTerminal,lpOff,lpHbm,lpNotPushing,lpNotReady,lpWrongStatus,lpIdle,lpBaseline,lpMatched,lpSent,lpRestored);
+ }
+-static void lpOwnerLocked(void){
++static void lpOwnerLocked(unsigned requested){
++ lpLastOwnerRequest=requested;
+  lpOwnerGeneration++;lpOwnerChangeUs=micros(mach_absolute_time());
+  if(lp.armed&&!lp.terminal){
+-  lp.terminal=true;lp.armed=false;lp_pref_manual(&lpUser);
+-  displayLog("light-panel: manual-priority generation=%llu applied_before=%u writes=%u\n",lpOwnerGeneration,lp.current,lp.writes);
++  lp.terminal=true;lp.armed=false;lpWaitWake=true;
++  displayLog("light-panel: system-owner generation=%llu released_auto_dbv=%u; pending display cycle or slider observation\n",lpOwnerGeneration,lp.current);
+  }
+ }
+ static void lpOwnerResultLocked(bool done){
+@@ -23,37 +27,51 @@
+  displayLog("light-panel: owner-command generation=%llu dbv=%u dma_done=%u fresh_done=%u count=%llu\n",
+        lpOwnerGeneration,gBacklight,done,done&&lpFreshDone,gBacklightSent);
+ }
+-static bool lpReadLocked(unsigned *value){
+- /* The two short packets are submitted together: MRPS 2, then a read of
+-  * GET_DISPLAY_BRIGHTNESS (0x52) with BTA+last flags. No panel register is set. */
+- if(lpIoUncertain||!instantnoodle()||gPanelOff||gHbmOn||!gPushing||!dsiReady())return false;
+- if(gPushed)pushWait();
+- uint32_t saved=displayReg(gDSI,DSI_CMD_DMA_CTRL);
+- *(volatile uint32_t*)(gDSI+DSI_CMD_DMA_CTRL)=saved&~DSI_CMD_DMA_LOW_POWER;
+- volatile uint8_t *q=(volatile uint8_t*)gDsiDma;
+- const uint8_t packets[8]={2,0,0x37,0,0x52,0,0x06,0xa0};
+- for(unsigned i=0;i<8;i++)q[i]=packets[i];
+- *(volatile uint32_t*)(gDSI+0x1d4)=1;__asm__ volatile("dsb sy":::"memory");
+- *(volatile uint32_t*)(gDSI+0x1d4)=0;__asm__ volatile("dsb sy":::"memory");
+- unsigned n=0;uint32_t data=0;
+- bool transmitted=!(displayReg(gDSI,0x1d4)>>16) && lpSubmitDma(gDSI,8,true);
+- if(transmitted){
+-  for(unsigned i=0;i<100;i++){n=displayReg(gDSI,0x1d4)>>16;if(n)break;IODelay(10);}
+-  if(n==4)data=displayReg(gDSI,0x6c);
+-  if(!n)lpIoUncertain=true;
++extern "C" void hk_light_slider_position(uint64_t bits){
++ if(!gPanelLock)return;
++ IOLockLock(gPanelLock);
++ if(lp_slider_changed(&lpSlider,bits,!gPanelOff && !lpSawDark) && lpUser.last_known==LP_PREF_ON &&
++    lpOwnerGeneration && !lpUser.manual_hold){
++  lp_pref_manual(&lpUser);lp.armed=false;lp.terminal=true;
++  displayLog("light-panel: slider-owner current-lit-session q16=%u owner=%llu\n",lpSlider.anchor,lpOwnerGeneration);
+  }
+- *(volatile uint32_t*)(gDSI+DSI_CMD_DMA_CTRL)=saved;
+- bool ok=transmitted&&lp_read_dbv(n,data,value);
+- displayLog("light-panel: read52 dma_done=%u count=%u type=%x dbv=%u valid=%u\n",transmitted,n,data>>24,ok?*value:0,ok);
+- return ok;
++ if(lpSlider.seen)lpSliderAvailable=true;
++ IOLockUnlock(gPanelLock);
+ }
+-static bool lpWriteLocked(unsigned target,const char *reason){
++static void lpPowerTransitionLocked(bool lit,bool confirmed,bool wake_acked){
++ if(!confirmed)return;
++ if(!lit){lpSawDark=true;lpOwnerDone=0;return;}
++ if(!lpSawDark)return;
++ bool held=lpUser.manual_hold;
++ lpSawDark=false;lpWaitWake=false;lpOwnerDone=0;lpSlider.seen=false;
++ lp_pref_screen_wake(&lpUser);
++ if(!lpIoUncertain){
++  lp=(struct lp_state){};
++  /* A wake transfer is a fresh acknowledgement only if it is the exact
++   * last requested OS level. Never reclassify an automatic DBV as an owner. */
++  if(wake_acked && lpOwnerGeneration && gBacklight && gBacklight==lpLastOwnerRequest){
++   lpOwnerDone=gBacklightSent;lpOwnerLevel=gBacklight;
++   lpOwnerChangeUs=micros(mach_absolute_time());
++  }
++  displayLog("light-panel: wake prior_slider_hold=%u fresh_os_replay=%u owner=%llu dbv=%u; await fresh preference\n",
++      held,lpOwnerDone!=0,lpOwnerGeneration,lpOwnerLevel);
++ }
++}
++static bool lpWriteLocked(unsigned target,const char *reason,uint64_t ramp_time=0){
+  uint64_t before=gBacklightSent;unsigned previous=gBacklight;
+  gBacklight=target;lpStrictTransfer=true;lpFreshDone=false;
+  bool sent=backlightSendLocked();lpStrictTransfer=false;
+  bool ok=sent&&lpFreshDone&&gBacklightSent==before+1;
+- displayLog("light-panel: %s target=%u before=%llu after=%llu dma_done=%u fresh_done=%u\n",
+-    reason,target,before,gBacklightSent,sent,lpFreshDone);
++ if(ramp_time){
++  /* A single line associates an actual hardware transfer with the most
++   * recent real sensor event. Independent ticks may share its sequence. */
++  displayLog("light-ramp: us=%llu seq=%u tick=%llu mlux=%u goal=%u from=%u target=%u before=%llu after=%llu dma_done=%u fresh_done=%u\n",
++   ramp_time,lp.sample_sequence,lp.last_tick,lp_millilux(lp.sample_bits),lp.goal,previous,target,
++   before,gBacklightSent,sent,lpFreshDone);
++ }else{
++  displayLog("light-panel: %s target=%u before=%llu after=%llu dma_done=%u fresh_done=%u\n",
++   reason,target,before,gBacklightSent,sent,lpFreshDone);
++ }
+  if(!ok)gBacklight=previous;
+  return ok;
+ }
+@@ -63,7 +81,6 @@
+  if(lp.touched){
+   if(!lpIoUncertain && !gPanelOff && !gHbmOn && dsiReady()){
+    restored=lpWriteLocked(lp.baseline,"restore");
+-   if(restored && lp.source==2){unsigned actual=0;restored=lpReadLocked(&actual)&&actual==lp.baseline;}
+   }
+   /* Normal wake/exit will re-use the original proven owner DBV even when a
+    * failed or interrupted transfer prevented an immediate confirmed restore. */
+@@ -80,9 +97,10 @@
+ }
+ extern "C" void hk_light_user_preference(unsigned value,uint64_t now){
+  if(!gPanelLock)return;
+- IOLockLock(gPanelLock);enum lp_change action=lp_preference(&lpUser,value,now);
++ IOLockLock(gPanelLock);unsigned previous=lpUser.last_known;enum lp_change action=lp_preference(&lpUser,value,now);
++ if(previous==LP_PREF_OFF && value==LP_PREF_ON)lpWaitWake=false;
+  if(action==LP_DISABLE){lpEndLocked("user-pref-or-service-off");}
+- if(action==LP_ENABLE && !lpIoUncertain){lp=(struct lp_state){};lpSourceReadAttempts=0;lpReadUnknown=false;}
++ if(action==LP_ENABLE && !lpIoUncertain){lp=(struct lp_state){};}
+  if(action!=LP_KEEP)displayLog("light-panel: user preference value=%u action=%u manual_hold=%u\n",value,action,lpUser.manual_hold);
+  IOLockUnlock(gPanelLock);
+ }
+@@ -91,7 +109,17 @@
+  IOLockLock(gPanelLock);
+  if(lp.armed && !lp.terminal){
+   if(!lp_pref_fresh(&lpUser,now)){lpUser.live=false;lpEndLocked("preference-expired");}
+-  else if(now-lp.last_sample>=1500000)lpEndLocked("stale");
++  else if(now<lp.last_sample || now-lp.last_sample>=LP_STALE_US)lpEndLocked("stale");
++  else if(lpWaitWake || lpIoUncertain || gPanelOff || gHbmOn || !gPushing || !dsiReady())lpEndLocked("display-ineligible");
++  else{
++   unsigned target=lp_ramp_step(&lp,now);
++   if(target){
++    lpMatched++;lp.touched=true;
++    if(lpWriteLocked(target,"apply",now)){
++     lpSent++;lp.current=target;lp.last_apply=now;lp.writes++;
++    }else lpEndLocked("transfer-failed");
++   }
++  }
+  }
+  IOLockUnlock(gPanelLock);
+ }
+@@ -104,7 +132,7 @@
+  if(!tick||!(lo|hi)){lpWrongStatus++;return;}
+  unsigned completions=0,swaps=0;
+  IOLockLock(gPanelLock);
+- if(!lp_pref_fresh(&lpUser,now))goto out;
++ if(!lp_pref_fresh(&lpUser,now) || lpWaitWake)goto out;
+  if(lp.terminal){lpTerminal++;goto out;}
+  if(lpIoUncertain){lpEndLocked("controller-uncertain");goto out;}
+  completions=__atomic_load_n(&lpCompletedFrames,__ATOMIC_RELAXED);
+@@ -128,18 +156,12 @@
+  if(!lp.armed){
+   unsigned base=0,source=0;
+   if(lpOwnerDone && lpOwnerDone==gBacklightSent && lpOwnerLevel && lpOwnerLevel==gBacklight){base=gBacklight;source=1;}
+-  else if(!lpReadUnknown && !lpSourceReadAttempts){
+-   unsigned a=0,b=0;lpSourceReadAttempts++;
+-   if(lpReadLocked(&a)&&lpReadLocked(&b)&&a==b){base=a;source=2;}else lpReadUnknown=true;
+-  }
+   if(source==1 && now>=lpOwnerChangeUs && now-lpOwnerChangeUs<2500000){
+    if(!lpAttemptUs||now-lpAttemptUs>1000000){lpAttemptUs=now;displayLog("light-panel: owner settling generation=%llu dbv=%u elapsed_us=%llu\n",lpOwnerGeneration,base,now-lpOwnerChangeUs);}
+    goto out;
+   }
+-  /* A confirmed, already visible user's baseline below 256 is allowed
+-   * only as its own lower bound. Never darken it below its original value. */
+-  if(!source||base<64||base>LP_MAX||(base<LP_FLOOR && source!=1)){
+-   if(seq==1||seq==16)displayLog("light-panel: awaiting observable visible baseline owner_done=%llu candidate=%u attempts=%u\n",lpOwnerDone,base,lpSourceReadAttempts);
++  if(!source||!lpSliderAvailable||!base||base>LP_MAX){
++   if(seq==1||seq==16)displayLog("light-panel: awaiting observable visible baseline owner_done=%llu candidate=%u slider_seen=%u\n",lpOwnerDone,base,lpSliderAvailable);
+    goto out;
+   }
+   lpBaseline++;lp.baseline=lp.current=base;lp.source=source;lp.lo=lo;lp.hi=hi;lp.last_sample=lp.start=lp.last_apply=now;lp.armed=true;
+@@ -147,18 +169,11 @@
+  }
+  if(lo!=lp.lo||hi!=lp.hi){lpEndLocked("source-changed");goto out;}
+  {
+-  unsigned target=lp_target(&lp,now,tick,lux);
+-  if(target){
+-   lpMatched++;
+-   displayLog("light-curve: seq=%u tick=%llu mlux=%u nits_x10000=%u reference_dbv=%u bounded_goal=%u stable_us=%llu\n",
+-      seq,tick,lp_millilux(lux),lp.nits_x10000,lp.reference,lp.goal,now-lp.stable_since);
+-   displayLog("light-panel: select seq=%u tick=%llu us=%llu lux_bits=%x band=%u from=%u target=%u\n",
+-     seq,tick,now,lux,lp.band,lp.current,target);
+-   lp.touched=true; /* after a timeout the old hardware level is uncertain */
+-   if(lpWriteLocked(target,"apply")){
+-    lpSent++;lp.current=target;lp.last_apply=now;lp.writes++;
+-    if(lp.source==2){unsigned read=0;if(!lpReadLocked(&read)||read!=target)lpEndLocked("readback-mismatch");}
+-   }else lpEndLocked("transfer-failed");
++  unsigned prior_goal=lp.goal;
++  lp_observe(&lp,now,tick,seq,lux);
++  if(lp.goal!=prior_goal){
++   displayLog("light-curve: seq=%u tick=%llu mlux=%u nits_x10000=%u reference_dbv=%u goal_dbv=%u stable_us=%llu\n",
++    seq,tick,lp_millilux(lux),lp.nits_x10000,lp.reference,lp.goal,now-lp.stable_since);
+   }
+  }
+ out:IOLockUnlock(gPanelLock);

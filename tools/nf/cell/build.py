@@ -24,13 +24,15 @@ BASE = None if INNER else HERE / 'base'
 SIDE = None if INNER else KERNEL.parent / 'oneplus8-audit'
 VFS = None if INNER else Path(os.environ.get('CELL_VFS_OBJ') or SIDE / 'stock-cellular-ui/activation-ui/vfs_attrlist.o')    # the object the tested kernels were linked with
 ATH = None if INNER else Path(os.environ.get('CELL_ATH11K_OBJ') or SIDE / 'cellular-data-next/claude-takeover/ath11k-cell.o')
-DRIVER = ('instantnoodle_cell.c', 'cell_net.c', 'cell_net.h', 'hk_mhi.c', 'hk_mhi.h', 'cell_dt.cpp')
+DRIVER = ('instantnoodle_cell.c', 'cell_net.c', 'cell_net.h', 'hk_mhi.c', 'hk_mhi.h', 'cell_dt.cpp', 'hk_tz.c', 'hk_keywrap.c', 'hk_keywrap.h')
 CONTAINER = 'oneplus8-build'
 UNITS = ['hk_qrtr_core', 'hk_qrtr_mhi', 'hk_abp_nas', 'hk_abp_nas_worker', 'hk_qmi_radio', 'modem_mhi', 'instantnoodle_modem',
          'hk_qmux_frontend', 'HKCellularQMUX', 'hk_qmi', 'hk_wifi', 'kern_minimac', 'subr_log_stream',
-         'hk_adsp', 'hk_sound', 'hk_mic', 'hk_speaker', 'instantnoodle_speaker']       # (the last five: the tree's audio drivers with a call's sound, voice_port.py)       # (hk_wifi: the tree's own, plus the panic text at its halt: overlay)
-NEW = ['instantnoodle_cell', 'hk_mhi', 'cell_net', 'cell_dt']
-CXX = {'HKCellularQMUX': 'xnu/files/iokit/Kernel/HKCellularQMUX.cpp', 'cell_dt': 'tools/nf/cell/cell_dt.cpp'}     # compiled as IOKit's C++          # tools/nf/cell: appended to the link
+         'hk_adsp', 'hk_sound', 'hk_mic', 'hk_speaker', 'instantnoodle_speaker',
+         'MiniAppleKeyStore']       # (MiniAppleKeyStore: the tree's own, wrapping under the root key TrustZone keeps when there is one: overlay)       # (the last five: the tree's audio drivers with a call's sound, voice_port.py)       # (hk_wifi: the tree's own, plus the panic text at its halt: overlay)
+NEW = ['instantnoodle_cell', 'hk_mhi', 'cell_net', 'cell_dt', 'hk_tz', 'hk_keywrap']        # (hk_tz: what TrustZone has running, asked, and the root key it keeps; boot-args tz=, tz_keys=. hk_keywrap: AES key wrap under that key)
+CXX = {'HKCellularQMUX': 'xnu/files/iokit/Kernel/HKCellularQMUX.cpp', 'cell_dt': 'tools/nf/cell/cell_dt.cpp',
+       'MiniAppleKeyStore': 'xnu/files/iokit/Kernel/MiniAppleKeyStore.cpp'}     # compiled as IOKit's C++          # tools/nf/cell: appended to the link
 MAY_APPEND = {'hk_abp_nas', 'hk_abp_nas_worker', 'hk_qmux_frontend', 'HKCellularQMUX'} | set(NEW)
 
 
@@ -57,7 +59,7 @@ def inner(root, check):
     for name in (NEW if check else UNITS + NEW):
         if name in CXX:
             wd, cc = io, flags(io / '.CXXFLAGS')
-            cc[1:1] = ['-I', str(fs), '-I', str(obj / 'bsd')]
+            cc[1:1] = ['-I', str(fs), '-I', str(obj / 'bsd'), '-I', str(stage / 'tools/nf/cell')]
             cc += flags(io / '.CFLAGS')[1:]
             src = stage / CXX[name]
         else:
@@ -70,6 +72,8 @@ def inner(root, check):
         unit = dest / (name + '.o')
         run(*cc, '-c', str(src), '-o', str(unit), cwd=wd)
         old = str(wd / (name + '.o'))
+        if old not in paths and name in CXX:
+            old = str(wd / (name + '.cpo'))     # (the tree's own C++ objects are named so in its list)
         if old in paths:
             assert paths.count(old) == 1, old
             paths[paths.index(old)] = str(unit)

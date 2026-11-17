@@ -418,8 +418,11 @@ static const struct rwd_format rwd_formats[] = {
 	{ 551, 'b3a8', 4, 1, "a ten-bit XR format" },
 	{ 552, 'w40a', 4, 1, "a ten-bit XR format" },
 	{ 553, 'w40a', 4, 1, "a ten-bit XR format" },
-	{ 554, 'w30r', 4, 1, "a ten-bit XR format" },
-	{ 555, 'w30r', 4, 1, "a ten-bit XR format" },
+	/* [2026-11-11: BGR10_XR and its sRGB twin are served, as eight bits over the BGRA the kernel makes of 'w30r'
+	 * (the compiler library's table has them so: tools/mesa/air/air_vk.c); CAMetalLayer asks them of a device
+	 * that says -supportsExtendedXR10Formats, and the Astronomy wallpaper draws into nothing else.] */
+	{ 554, 'BGRA', 4, 0, "MTLPixelFormatBGR10_XR, served as eight bits" },
+	{ 555, 'BGRA', 4, 0, "MTLPixelFormatBGR10_XR_sRGB, served as eight bits" },
 };
 
 /*

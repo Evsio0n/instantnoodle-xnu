@@ -238,6 +238,195 @@ static struct {
 	bool event_report_on;
 	uint64_t next_poll;
 } cell = { .state = "off", .sms_status = "none", .sms_last = "" };
+/* UIM owns SIM presence; NAS registration is published independently. The
+ * integer is the entire public ABI. AID is private to existing provisioning. */
+enum cell_sim_kind {
+	CELL_SIM_UNKNOWN, CELL_SIM_ABSENT, CELL_SIM_PRESENT, CELL_SIM_READY, CELL_SIM_PIN, CELL_SIM_PUK
+};
+struct cell_sim_card {
+	bool known;
+	uint8_t card_state, upin_state, app_type, app_state, pin1_state, pin1_retries, puk1_retries;
+	uint8_t aid_len, aid[16], slot;
+	uint16_t gw_index;
+};
+static struct cell_sim_card sim;
+static int cell_sim_state;
+/* A late logical READY can arrive immediately after physical removal.
+ * A fresh physical presence report must supersede that negative first. */
+static bool cell_sim_waiting_for_physical_insert;
+static unsigned cell_sim_revision;
+static bool cell_sim_events;
+static uint64_t cell_sim_poll_at, cell_sim_subscribe_at;
+static unsigned cell_sim_provision_tries;
+static bool cell_sim_retire_pending;
+static uint64_t cell_sim_recover_at;
+
+/* Card Status 0x10 contains four provisioning indexes, then the complete
+ * array of card records. Prefer the actual primary GW binding. If unbound,
+ * prefer a usable SIM/USIM across all slots so normal provisioning can run. */
+static int
+cell_sim_logical(const uint8_t *p, size_t length, const uint8_t *valid, size_t valid_length,
+    struct cell_sim_card *selected)
+{
+	struct cell_sim_card next = {0};
+	if (length < 9) return CELL_SIM_UNKNOWN;
+	next.gw_index = (uint16_t)(p[0] | p[1] << 8);
+	unsigned count = p[8];
+	if (count == 0 || (valid && (valid_length != count + 1 || valid[0] != count)))
+		return CELL_SIM_UNKNOWN;
+	p += 9;
+	length -= 9;
+	unsigned absent = 0, best = 0;
+	bool present = false;
+	for (unsigned slot = 0; slot < count; slot++) {
+		if (length < 6) return CELL_SIM_UNKNOWN;
+		bool usable = !valid || valid[1 + slot] == 1;
+		unsigned card = p[0], upin = p[1], apps = p[5];
+		if (usable && card == 0) absent++;
+		if (usable && card == 1) present = true;
+		p += 6;
+		length -= 6;
+		for (unsigned app = 0; app < apps; app++) {
+			if (length < 7) return CELL_SIM_UNKNOWN;
+			unsigned aid = p[6], size = 14 + aid;
+			if (size > length) return CELL_SIM_UNKNOWN;
+			unsigned type = p[0], state = p[1];
+			if (usable && card == 1 && (type == 1 || type == 2)) {
+				unsigned rank = (next.gw_index == ((slot << 8) | app) ? 16 : 0) +
+				    (state == 7 ? 8 : state == 2 || state == 3 ? 4 : 0) + type;
+				if (rank > best) {
+					best = rank;
+					next.slot = slot + 1;
+					next.card_state = card;
+					next.upin_state = upin;
+					next.app_type = type;
+					next.app_state = state;
+					next.aid_len = aid <= sizeof(next.aid) ? aid : 0;
+					memset(next.aid, 0, sizeof(next.aid));
+					memcpy(next.aid, p + 7, next.aid_len);
+					next.pin1_state = p[8 + aid];
+					next.pin1_retries = p[9 + aid];
+					next.puk1_retries = p[10 + aid];
+				}
+			}
+			p += size;
+			length -= size;
+		}
+	}
+	if (length) return CELL_SIM_UNKNOWN;
+	next.known = best != 0;
+	*selected = next;
+	if (best && next.app_state == 7) return CELL_SIM_READY;
+	if (best && next.app_state == 2) return CELL_SIM_PIN;
+	if (best && next.app_state == 3) return CELL_SIM_PUK;
+	if (present) return CELL_SIM_PRESENT;
+	return absent == count ? CELL_SIM_ABSENT : CELL_SIM_UNKNOWN;
+}
+
+/* Physical Slot Status 0x10 has different state values and a variable ICCID
+ * at the end of each record. Only GLib's UIM physical state is consumed. */
+static int
+cell_sim_physical(const uint8_t *p, size_t length, uint8_t logical_slot, bool *mapped)
+{
+	*mapped = false;
+	if (!length || !*p) return CELL_SIM_UNKNOWN;
+	unsigned count = *p++, absent = 0;
+	bool present = false;
+	length--;
+	for (unsigned slot = 0; slot < count; slot++) {
+		if (length < 10) return CELL_SIM_UNKNOWN;
+		unsigned size = 10 + p[9];
+		if (size > length) return CELL_SIM_UNKNOWN;
+		uint32_t card = (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+		if (card == 1) absent++;
+		if (card == 2) {
+			present = true;
+			if (logical_slot && p[8] == logical_slot && p[4] == 1 && !p[5] && !p[6] && !p[7])
+				*mapped = true;
+		}
+		p += size;
+		length -= size;
+	}
+	if (length) return CELL_SIM_UNKNOWN;
+	return present ? CELL_SIM_PRESENT : absent == count ? CELL_SIM_ABSENT : CELL_SIM_UNKNOWN;
+}
+
+/* A success response requires exactly one successful result and one status.
+ * A 0x32/0x48 indication has no result. Other optional TLVs are skipped. */
+static int
+cell_sim_decode(const uint8_t *p, size_t n, bool physical, bool response, struct cell_sim_card *selected,
+    uint8_t logical_slot, bool *mapped)
+{
+	const uint8_t *cards = NULL, *valid = NULL;
+	size_t cards_len = 0, valid_len = 0;
+	bool result = false;
+	memset(selected, 0, sizeof(*selected));
+	while (n) {
+		if (n < 3) return CELL_SIM_UNKNOWN;
+		unsigned type = p[0], size = p[1] | p[2] << 8;
+		p += 3; n -= 3;
+		if (size > n) return CELL_SIM_UNKNOWN;
+		if (type == 2) {
+			if (!response || result || size != 4 || p[0] || p[1] || p[2] || p[3])
+				return CELL_SIM_UNKNOWN;
+			result = true;
+		} else if (type == 0x10) {
+			if (cards) return CELL_SIM_UNKNOWN;
+			cards = p; cards_len = size;
+		} else if (type == 0x12 && !physical) {
+			if (valid) return CELL_SIM_UNKNOWN;
+			valid = p; valid_len = size;
+		}
+		p += size; n -= size;
+	}
+	if (!cards || result != response) return CELL_SIM_UNKNOWN;
+	return physical ? cell_sim_physical(cards, cards_len, logical_slot, mapped) :
+	    cell_sim_logical(cards, cards_len, valid, valid_len, selected);
+}
+
+static void
+cell_sim_clear_network(void)
+{
+	cell.registered = 0;
+	cell.bars = 0;
+	cell.dbm = 0;
+	cell.operator_name[0] = 0;
+}
+
+static void
+cell_sim_publish(int kind, const struct cell_sim_card *card)
+{
+	int old = __atomic_load_n(&cell_sim_state, __ATOMIC_ACQUIRE);
+	bool changed = old != kind || (card && sim.slot != card->slot);
+	if (changed) cell_sim_revision++;
+	if (kind == CELL_SIM_ABSENT) {
+		cell_sim_provision_tries = 0;
+		cell_sim_recover_at = 0;
+		if (cell_started) {
+			cell_started = false;
+			cell_sim_retire_pending = true; /* Only the mission owner may drop sessions. */
+		}
+	}
+	if (changed || kind != CELL_SIM_READY)
+		cell_sim_clear_network();
+	if (card) sim = *card;
+	else memset(&sim, 0, sizeof(sim));
+	__atomic_store_n(&cell_sim_state, kind, __ATOMIC_RELEASE);
+	if (changed) say("modem: UIM SIM state=%d (0 unknown, 1 absent, 2 present, 3 ready, 4 PIN, 5 PUK)\n", kind);
+}
+
+static void
+cell_sim_invalidate(void)
+{
+	cell_sim_revision++;
+	cell_sim_events = false;
+	cell_sim_waiting_for_physical_insert = false;
+	cell_sim_provision_tries = 0;
+	cell_sim_recover_at = 0;
+	cell_sim_poll_at = cell_sim_subscribe_at = 0;
+	cell_sim_publish(CELL_SIM_UNKNOWN, NULL);
+}
+
 static bool option_sms_self;            /* modem_sms_self=1: one test SMS to the SIM's own number once registered */
 static bool option_sms;                 /* modem_sms=1: one test SMS to the owner once registered */
 static bool option_bringup;             /* modem_bringup=1: the radio brought online and the SIM and network watched */
@@ -2365,6 +2554,8 @@ static void ipa_server_request(uint32_t from_node, uint32_t from_port, const uin
 static struct {
 	bool have;
 	uint16_t transaction, message, result, error;
+	uint32_t peer_node, peer_port, local_port;
+	bool intact;
 	uint8_t type;
 	uint32_t length;
 	uint8_t data[IPCR_PACKET];
@@ -2868,7 +3059,21 @@ qrtr_packet(const uint8_t *d, uint32_t length, uint32_t dl_channel)
 			}
 			say("modem: qrtr: a service: %u (%#x), version %u instance %u, at node %u port %u\n", w[1], w[1], w[2] & 0xff, w[2] >> 8, w[3], w[4]);
 			break;
+		case QRTR_BYE:
 		case QRTR_DEL_SERVER:
+			/* Drop only departed UIM endpoints so a later announcement can
+			 * replace the old port without accepting its stale indications. */
+			if (w[0] == QRTR_BYE || (h.size >= 20 && w[1] == 11)) {
+				for (unsigned i = 0; i < qrtr.servers;) {
+					if (qrtr.server[i].service == 11 &&
+					    ((w[0] == QRTR_BYE && qrtr.server[i].node == h.from_node) ||
+					     (w[0] == QRTR_DEL_SERVER && qrtr.server[i].node == w[3] && qrtr.server[i].port == w[4]))) {
+						qrtr.server[i] = qrtr.server[--qrtr.servers];
+						cell_sim_invalidate();
+					} else i++;
+				}
+			}
+			if (w[0] == QRTR_BYE) break;
 			say("modem: qrtr: service %u at node %u port %u has gone\n", w[1], w[3], w[4]);
 			break;
 		case QRTR_NEW_LOOKUP: {
@@ -2928,6 +3133,35 @@ qrtr_packet(const uint8_t *d, uint32_t length, uint32_t dl_channel)
 			tl = h.size - 7;
 		}
 		if (q[0] == 4) {
+			uint32_t uim_node, uim_port;
+			if (qmi_find(11, &uim_node, &uim_port) && uim_node == h.from_node && uim_port == h.from_port) {
+				unsigned message = q[3] | q[4] << 8;
+				if (h.to_port == QMI_PORT && (message == 0x32 || message == 0x48)) {
+					struct cell_sim_card latest;
+					bool mapped = false;
+					bool physical = message == 0x48;
+					int kind = CELL_SIM_UNKNOWN;
+					if (7u + (q[5] | (unsigned)q[6] << 8) == h.size)
+						kind = cell_sim_decode(q + 7, tl, physical, false, &latest, 0, &mapped);
+					if (physical && kind == CELL_SIM_ABSENT)
+						cell_sim_waiting_for_physical_insert = true;
+					if (physical && kind == CELL_SIM_PRESENT)
+						cell_sim_waiting_for_physical_insert = false;
+					if (!physical && cell_sim_waiting_for_physical_insert) {
+						cell_sim_poll_at = 0;
+						return; /* read back physical state; retain the current publication */
+					}
+					/* A logical negative does not establish physical absence. */
+					if (!physical && kind == CELL_SIM_ABSENT)
+						kind = __atomic_load_n(&cell_sim_state, __ATOMIC_ACQUIRE) == CELL_SIM_ABSENT ?
+						    CELL_SIM_ABSENT : CELL_SIM_UNKNOWN;
+					cell_sim_revision++;
+					cell_sim_clear_network();
+					cell_sim_publish(kind, physical || kind == CELL_SIM_UNKNOWN ? NULL : &latest);
+					cell_sim_poll_at = 0;
+				}
+				return; /* UIM indication bytes never enter the generic hex logger. */
+			}
 			{
 				uint32_t voice_node, voice_port;
 
@@ -2988,7 +3222,10 @@ qrtr_packet(const uint8_t *d, uint32_t length, uint32_t dl_channel)
 					return;
 				}
 			}
-			if ((q[3] | q[4] << 8) == 0x003a) {
+			uint32_t nas_node, nas_port;
+			if ((q[3] | q[4] << 8) == 0x003a && qmi_find(3, &nas_node, &nas_port) &&
+			    h.from_node == nas_node && h.from_port == nas_port &&
+			    __atomic_load_n(&cell_sim_state, __ATOMIC_ACQUIRE) == CELL_SIM_READY) {
 				/* NAS operator name data: TLV 0x10 is the service provider name (display condition, length, name) */
 				for (uint32_t t = 0; t + 3 <= tl;) {
 					uint32_t n = q[7 + t + 1] | q[7 + t + 2] << 8;
@@ -3036,6 +3273,11 @@ qrtr_packet(const uint8_t *d, uint32_t length, uint32_t dl_channel)
 			}
 			return;
 		}
+		qmi_reply.peer_node = h.from_node;
+		qmi_reply.peer_port = h.from_port;
+		qmi_reply.local_port = h.to_port;
+		qmi_reply.intact = 7u + (q[5] | (unsigned)q[6] << 8) == h.size && tl <= sizeof(qmi_reply.data);
+		if (tl > sizeof(qmi_reply.data)) return;
 		qmi_reply.type = q[0];
 		qmi_reply.transaction = (uint16_t)(q[1] | q[2] << 8);
 		qmi_reply.message = (uint16_t)(q[3] | q[4] << 8);
@@ -3791,7 +4033,9 @@ qmi_call_at(uint32_t node, uint32_t port, uint16_t message, const uint8_t *tlvs,
 	}
 	for (uint64_t until = mhi_op_nanoseconds(NULL) + (uint64_t)ms * 1000000ull; mhi_op_nanoseconds(NULL) < until;) {
 		mission_pump(5, NULL);
-		if (qmi_reply.have && qmi_reply.transaction == transaction && qmi_reply.type == 2) {
+		if (qmi_reply.have && qmi_reply.transaction == transaction && qmi_reply.type == 2 &&
+		    qmi_reply.message == message && qmi_reply.peer_node == node && qmi_reply.peer_port == port &&
+		    qmi_reply.local_port == qmi_src_port && qmi_reply.intact) {
 			return 0;
 		}
 	}
@@ -3830,7 +4074,8 @@ qmi_survey(void)
 			continue;
 		}
 		say("modem: qmi: %s: result %u error %u\n", asks[i].what, qmi_reply.result, qmi_reply.error);
-		qmi_hex("TLVs", qmi_reply.data, qmi_reply.length);
+		if (asks[i].service != 11) /* UIM card status contains application identifiers. */
+			qmi_hex("TLVs", qmi_reply.data, qmi_reply.length);
 	}
 }
 
@@ -4016,74 +4261,67 @@ qmi_tlv(uint8_t type, uint32_t *length)
 	return NULL;
 }
 
-static struct {
-	bool known;
-	uint8_t card_state, upin_state, app_type, app_state, pin1_state, pin1_retries, puk1_retries, aid_len, aid[16], slot;
-	uint16_t gw_index;
-} sim;
-
-/* UIM Get Card Status: what is printed is states and counters only (no identity of the card or of its subscriber) */
+/* Both queries are ordinary UIM reads. The physical report is the sole
+ * authority for "absent"; a logical error or an empty application list
+ * cannot establish that a physical card was removed. */
 static bool
 uim_card_status(void)
 {
-	uint32_t n;
-	const uint8_t *c;
-	int e = qmi_call(11, 0x002f, NULL, 0, 3000);
-
-	if (e != 0 || qmi_reply.result != 0 || (c = qmi_tlv(0x10, &n)) == NULL || n < 9) {
-		say("modem: sim: card status: %s (result %u error %u)\n", e != 0 ? "no reply" : "no card status", qmi_reply.result, qmi_reply.error);
+	uint64_t now = mhi_op_nanoseconds(NULL);
+	uint32_t node, port;
+	if (!qmi_find(11, &node, &port)) {
+		cell_sim_publish(CELL_SIM_UNKNOWN, NULL);
+		cell_sim_poll_at = now + NSEC_PER_SEC;
 		return false;
 	}
-	memset(&sim, 0, sizeof(sim));
-	sim.gw_index = (uint16_t)(c[0] | c[1] << 8);
-	{
-		uint32_t at = 8;
-		uint8_t cards = c[at++];
-
-		if (cards == 0 || at + 6 > n) {
-			say("modem: sim: no slot in the card status\n");
-			return true;
-		}
-		sim.card_state = c[at];
-		sim.upin_state = c[at + 1];
-		sim.slot = 1;
-		at += 5;
-		{
-			uint8_t apps = c[at++];
-
-			for (unsigned a = 0; a < apps && at + 7 <= n; a++) {
-				/* type, state, 4 bytes of personalisation, AID length, AID, then universal PIN, PIN1 state, PIN1 retries, PUK1 retries, PIN2 state, retries, PUK2 retries */
-				uint8_t type = c[at], state = c[at + 1], aid_len = c[at + 6];
-
-				if (at + 7 + aid_len + 7 > n) {
-					break;
-				}
-				if (sim.app_type == 0 || type == 2) {      /* a USIM is preferred */
-					sim.app_type = type;
-					sim.app_state = state;
-					sim.aid_len = aid_len < sizeof(sim.aid) ? aid_len : sizeof(sim.aid);
-					memcpy(sim.aid, c + at + 7, sim.aid_len);
-					sim.pin1_state = c[at + 7 + aid_len + 1];
-					sim.pin1_retries = c[at + 7 + aid_len + 2];
-					sim.puk1_retries = c[at + 7 + aid_len + 3];
-				}
-				at += 7 + aid_len + 7;
-			}
+	unsigned revision = cell_sim_revision;
+	if (!cell_sim_events && now >= cell_sim_subscribe_at) {
+		static const uint8_t mask[] = { 1, 4, 0, 0x11, 0, 0, 0 };
+		uint32_t n = 0;
+		int rc = qmi_call_at(node, port, 0x2e, mask, sizeof(mask), 1000);
+		const uint8_t *accepted = !rc && !qmi_reply.result && !qmi_reply.error ? qmi_tlv(0x10, &n) : NULL;
+		if (revision == cell_sim_revision) {
+			cell_sim_events = accepted && n == 4 && (accepted[0] & 0x11) == 0x11;
+			cell_sim_subscribe_at = now + 30ull * NSEC_PER_SEC;
 		}
 	}
-	sim.known = true;
-	{
-		static uint64_t last_sim;
-		uint64_t now = sim.card_state | sim.app_state << 8 | sim.pin1_state << 16 | (uint64_t)sim.pin1_retries << 24 | (uint64_t)sim.gw_index << 32;
-
-		if (now == last_sim) {
-			return true;
-		}
-		last_sim = now;
+	uint32_t current_node, current_port;
+	if (!qmi_find(11, &current_node, &current_port) || current_node != node || current_port != port)
+		return false;
+	revision = cell_sim_revision;
+	struct cell_sim_card logical = {0}, ignored;
+	bool mapped = false;
+	int rc = qmi_call_at(node, port, 0x2f, NULL, 0, 2000);
+	int state = rc ? CELL_SIM_UNKNOWN : cell_sim_decode(qmi_reply.data, qmi_reply.length, false, true, &logical, 0, &mapped);
+	if (revision != cell_sim_revision) return true;
+	rc = qmi_call_at(node, port, 0x47, NULL, 0, 2000);
+	int physical = rc ? CELL_SIM_UNKNOWN : cell_sim_decode(qmi_reply.data, qmi_reply.length, true, true, &ignored, logical.slot, &mapped);
+	if (revision != cell_sim_revision) return true;
+	/* Observe only the change in slot/application state; never the identifier,
+	 * PIN, subscriber number or physical card record. */
+	static uint32_t last_view = ~0u;
+	unsigned gw_bound = logical.known && logical.gw_index != 0xffff;
+	uint32_t view = (unsigned)physical | (unsigned)state << 3 | (unsigned)mapped << 6 |
+	    (unsigned)logical.slot << 7 | (unsigned)logical.app_state << 15 | gw_bound << 23;
+	if (view != last_view) {
+		last_view = view;
+		say("modem: UIM view physical=%d logical=%d slot=%u mapped=%u app_state=%u primary_gw_bound=%u\n",
+		    physical, state, logical.slot, mapped, logical.app_state, gw_bound);
 	}
-	say("modem: sim: primary GW index %#x; slot 1: card state %u (1 present), application type %u (2 USIM) state %u (2 PIN1 required, 7 ready), PIN1 state %u (1 enabled, not verified; 3 disabled), retries %u, PUK retries %u\n",
-	    sim.gw_index, sim.card_state, sim.app_type, sim.app_state, sim.pin1_state, sim.pin1_retries, sim.puk1_retries);
-	return true;
+	if (physical == CELL_SIM_PRESENT) cell_sim_waiting_for_physical_insert = false;
+	if (physical == CELL_SIM_ABSENT) {
+		cell_sim_waiting_for_physical_insert = true;
+		cell_sim_publish(CELL_SIM_ABSENT, NULL);
+	} else if (cell_sim_waiting_for_physical_insert)
+		cell_sim_publish(CELL_SIM_UNKNOWN, NULL);
+	else if (physical == CELL_SIM_PRESENT && (!mapped || !logical.known))
+		cell_sim_publish(CELL_SIM_PRESENT, NULL);
+	else if (state == CELL_SIM_ABSENT)
+		cell_sim_publish(CELL_SIM_UNKNOWN, NULL);
+	else
+		cell_sim_publish(state, &logical);
+	cell_sim_poll_at = mhi_op_nanoseconds(NULL) + 5ull * NSEC_PER_SEC;
+	return physical != CELL_SIM_UNKNOWN || state != CELL_SIM_UNKNOWN;
 }
 
 static int
@@ -5355,26 +5593,31 @@ modem_diagnose(void)
 	say("modem: diag: DMS operating mode: %s\n", e == 0 ? "answered" : "no reply");
 }
 
+/* This single owner performs both the initial bounded registration and each
+ * later recovery iteration. mission_pump dispatches UIM notifications, but
+ * notifications never reenter this routine or perform a synchronous call. */
 static void
-modem_bringup(void)
+modem_bringup(bool initial)
 {
-	snprintf(cell.state, sizeof(cell.state), "starting");
+	if (initial) snprintf(cell.state, sizeof(cell.state), "starting");
 	uint8_t registration = 0, radio = 0;
 	uint32_t n;
 	const uint8_t *c;
 	int e;
 
-	e = qmi_call(2, 0x002d, NULL, 0, 3000);
-	c = e == 0 ? qmi_tlv(0x01, &n) : NULL;
-	say("modem: bringup: DMS operating mode: %d (3 offline, 0 online)\n", c != NULL ? c[0] : -1);
-	if (c != NULL && c[0] != 0) {
-		/* the radio on: DMS Set Operating Mode, online */
-		static const uint8_t tlv[4] = { 0x01, 0x01, 0x00, 0x00 };
+	if (initial) {
+		e = qmi_call(2, 0x002d, NULL, 0, 3000);
+		c = e == 0 ? qmi_tlv(0x01, &n) : NULL;
+		say("modem: bringup: DMS operating mode: %d (3 offline, 0 online)\n", c != NULL ? c[0] : -1);
+		if (c != NULL && c[0] != 0) {
+			/* the radio on: DMS Set Operating Mode, online */
+			static const uint8_t tlv[4] = { 0x01, 0x01, 0x00, 0x00 };
 
-		e = qmi_call(2, 0x002e, tlv, sizeof(tlv), 5000);
-		say("modem: bringup: DMS set online: %s (result %u error %u)\n", e == 0 ? "answered" : "NO REPLY", qmi_reply.result, qmi_reply.error);
+			e = qmi_call(2, 0x002e, tlv, sizeof(tlv), 5000);
+			say("modem: bringup: DMS set online: %s (result %u error %u)\n", e == 0 ? "answered" : "NO REPLY", qmi_reply.result, qmi_reply.error);
+		}
 	}
-	for (unsigned round = 0; round < 150; round++) {
+	for (unsigned round = 0; round < (initial ? 150u : 1u); round++) {
 		bool pin_sent = false;
 
 		if (rd(pcie.bar) == 0xffffffffu) {
@@ -5393,11 +5636,9 @@ modem_bringup(void)
 			}
 		}
 		if (!uim_card_status()) {
-			modem_diagnose();
+			if (initial) modem_diagnose();
 		} else if (sim.known) {
-			static unsigned provision_tries;
-
-			if (sim.card_state == 1 && sim.app_type == 2 && sim.gw_index == 0xffff && sim.aid_len >= 5 && (sim.app_state == 1 || sim.app_state == 7) && provision_tries < 3) {
+			if (sim.card_state == 1 && sim.app_type == 2 && sim.gw_index == 0xffff && sim.aid_len >= 5 && (sim.app_state == 1 || sim.app_state == 7) && cell_sim_provision_tries < 3) {
 				/* UIM Change Provisioning Session: session type 0 (primary GW) activated with the card's USIM application (slot, its identifier) */
 				uint8_t pt[40], app[2 + sizeof(sim.aid)];
 				uint32_t pk = 0;
@@ -5409,8 +5650,8 @@ modem_bringup(void)
 				tlv_put(pt, &pk, 0x01, session, 2);
 				tlv_put(pt, &pk, 0x10, app, 2u + sim.aid_len);
 				e = qmi_call(11, 0x0038, pt, pk, 5000);
-				provision_tries++;
-				say("modem: sim: the USIM application asked to be the primary subscription (try %u): %s (result %u error %u)\n", provision_tries, e == 0 ? "answered" : "NO REPLY",
+				cell_sim_provision_tries++;
+				say("modem: sim: the USIM application asked to be the primary subscription (try %u): %s (result %u error %u)\n", cell_sim_provision_tries, e == 0 ? "answered" : "NO REPLY",
 				    qmi_reply.result, qmi_reply.error);
 			}
 			if (false && sim.app_state == 2 && sim.pin1_state == 1 && sim.pin1_retries >= 3 && !pin_sent) {       /* (the Pro owner's PIN: never sent on this phone) */
@@ -5429,7 +5670,13 @@ modem_bringup(void)
 				say("modem: sim: the PIN is required but only %u tries are left: NOT sent\n", sim.pin1_retries);
 			}
 		}
-		if (nas_registration(&registration, &radio) == 0 && registration == 1) {
+		if (option_service && __atomic_load_n(&cell_sim_state, __ATOMIC_ACQUIRE) == CELL_SIM_ABSENT) {
+			if (initial) say("modem: bringup: physical slots empty; mission owner waits for insertion\n");
+			return;
+		}
+		unsigned present_revision = cell_sim_revision;
+		if (nas_registration(&registration, &radio) == 0 && registration == 1 &&
+		    present_revision == cell_sim_revision && __atomic_load_n(&cell_sim_state, __ATOMIC_ACQUIRE) == CELL_SIM_READY) {
 			say("modem: bringup: THE MODEM IS REGISTERED ON A NETWORK\n");
 			cell_started = true;
 			modem_generation++;
@@ -5440,7 +5687,7 @@ modem_bringup(void)
 					data_bringup6();
 				}
 			}
-			if (option_sms_self) {
+			if (initial && option_sms_self) {
 				/* a message to the SIM's own number (DMS Get MSISDN), to see the receive path without anybody's help; the number is never printed */
 				char digits[24];
 				uint32_t d = 0;
@@ -5512,7 +5759,7 @@ modem_bringup(void)
 					say("modem: sms: the SIM has no readable own number (DMS Get MSISDN %u/%u)\n", qmi_reply.result, qmi_reply.error);
 				}
 			}
-			if (option_sms) {
+			if (initial && option_sms) {
 				/* one test message to the owner's number (given for these tests); an error answer is retried a few times, a missing answer is not (it may have gone) */
 				for (unsigned attempt = 0; attempt < 6; attempt++) {
 					int r = 0;      /* (the Pro's test message went to its owner's number: not from this phone) */
@@ -5526,11 +5773,41 @@ modem_bringup(void)
 			}
 			return;
 		}
-		mission_pump(2000, NULL);
+		if (initial) mission_pump(2000, NULL);
 	}
-	say("modem: bringup: not registered after the rounds\n");
+	if (initial) say("modem: bringup: not registered after the rounds\n");
 }
 
+
+/* Run outside QRTR dispatch on the ordinary mission thread. Polling remains
+ * active before the first successful registration and after physical removal.
+ * An unplug/replug observed during another QMI transaction cannot reuse the
+ * prior en1/WDS or IMS address, even if both changes arrived in one pump. */
+static void
+cell_sim_service(void)
+{
+	if (cell_sim_retire_pending) {
+		cell_sim_retire_pending = false;
+		data_down();
+		cell.event_report_on = false;
+		cell.next_poll = 0;
+		dcm_address[0] = 0;
+		dcm_activate_pending = dcm_address_pending = dcm_resend_pending = false;
+		say("modem: SIM removed: previous data and IMS address retired\n");
+	}
+	uint64_t now = mhi_op_nanoseconds(NULL);
+	if (now < cell_sim_poll_at) return;
+	int state = __atomic_load_n(&cell_sim_state, __ATOMIC_ACQUIRE);
+	if (!option_bringup || cell_started || (state != CELL_SIM_PRESENT && state != CELL_SIM_READY) ||
+	    now < cell_sim_recover_at) {
+		(void)uim_card_status();
+		return;
+	}
+	bool first = cell_sim_recover_at == 0;
+	cell_sim_recover_at = now + 5ull * NSEC_PER_SEC;
+	if (first) say("modem: SIM insertion: mission owner resumes normal registration\n");
+	modem_bringup(false);
+}
 
 /* ---- the service the rest of the system sees: sysctls kern.hackios.modem_*, and what keeps them true ------------------------------------------------ */
 
@@ -5953,7 +6230,8 @@ cell_sms_send_sysctl(__unused struct sysctl_oid *oid, __unused void *arg1, __unu
 static int
 cell_int_sysctl(__unused struct sysctl_oid *oid, __unused void *arg1, int which, struct sysctl_req *req)
 {
-	int v = which == 0 ? (cell_started ? 1 : 0) : which == 1 ? cell.registered : which == 2 ? cell.bars : which == 4 ? (data.up ? 1 : 0) | (cl6.up ? 2 : 0) : cell.dbm;
+	int v = which == 5 ? __atomic_load_n(&cell_sim_state, __ATOMIC_ACQUIRE) :
+	    which == 0 ? (cell_started ? 1 : 0) : which == 1 ? cell.registered : which == 2 ? cell.bars : which == 4 ? (data.up ? 1 : 0) | (cl6.up ? 2 : 0) : cell.dbm;
 
 	return SYSCTL_OUT(req, &v, sizeof(v));
 }
@@ -5968,6 +6246,7 @@ cell_operator_sysctl(__unused struct sysctl_oid *oid, __unused void *arg1, __unu
 }
 
 SYSCTL_DECL(_kern_hackios);
+SYSCTL_PROC(_kern_hackios, OID_AUTO, cellular_sim_state, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 5, cell_int_sysctl, "I", "UIM SIM: 0 unknown, 1 physically absent, 2 present/not ready, 3 ready, 4 PIN, 5 PUK");
 SYSCTL_PROC(_kern_hackios, OID_AUTO, cellular_up, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, cell_int_sysctl, "I", "1 once the modem is brought up");
 SYSCTL_PROC(_kern_hackios, OID_AUTO, cellular_registered, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 1, cell_int_sysctl, "I", "1 while registered on a network");
 SYSCTL_PROC(_kern_hackios, OID_AUTO, cellular_bars, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 2, cell_int_sysctl, "I", "signal bars 0..4");
@@ -6333,17 +6612,23 @@ cell_poll(void)
 	uint32_t n;
 	uint8_t registration = 0, radio = 0;
 
-	if (qmi_call(3, 0x0020, NULL, 0, 2000) == 0 && qmi_reply.result == 0 && (c = qmi_tlv(0x01, &n)) != NULL && n >= 2) {
+	unsigned revision = cell_sim_revision;
+	if (__atomic_load_n(&cell_sim_state, __ATOMIC_ACQUIRE) != CELL_SIM_READY) {
+		cell_sim_clear_network();
+		return;
+	}
+	if (qmi_call(3, 0x0020, NULL, 0, 2000) == 0 && qmi_reply.result == 0 && (c = qmi_tlv(0x01, &n)) != NULL && n >= 2 && revision == cell_sim_revision) {
 		int dbm = (int8_t)c[0];
 
 		cell.dbm = dbm;
 		cell.bars = dbm >= -70 ? 4 : dbm >= -85 ? 3 : dbm >= -100 ? 2 : dbm >= -110 ? 1 : 0;
 	}
-	if (nas_registration(&registration, &radio) == 0) {
+	if (nas_registration(&registration, &radio) == 0 && revision == cell_sim_revision) {
 		char was[sizeof(cell.state)];
 
 		strlcpy(was, cell.state, sizeof(was));
 		cell.registered = registration == 1;
+		if (!cell.registered) cell_sim_clear_network();
 		snprintf(cell.state, sizeof(cell.state), "%s radio %u, %d dBm, %d bars, %u message(s) received", registration == 1 ? "registered" : "not registered", radio, cell.dbm, cell.bars, cell.sms_received);
 		if (strcmp(was, cell.state) != 0) {
 			say("modem: cell: %s\n", cell.state);
@@ -6711,7 +6996,7 @@ mission_run(uint32_t seconds)
 		say("modem: qmi: DMS set operating mode low power: %s (result %u error %u)\n", e == 0 ? "answered" : "NO REPLY", qmi_reply.result, qmi_reply.error);
 	}
 	if (option_bringup) {
-		modem_bringup();
+		modem_bringup(true);
 	} else {
 		qmi_survey();
 	}
@@ -6754,6 +7039,8 @@ mission_run(uint32_t seconds)
 			sahara_in.tail++;
 		}
 		data_poll();
+		if (option_service)
+			cell_sim_service();
 		if (option_service && cell_started) {
 			cell_tick();
 		}
@@ -7105,6 +7392,8 @@ run_steps(void)
 static void
 modem_reset_state(void)
 {
+	cell_sim_invalidate();
+	cell_sim_retire_pending = false;
 	bzero(&qrtr, sizeof(qrtr));
 	bzero(qrtr_routes, sizeof(qrtr_routes));
 	bzero(&qrtr_force, sizeof(qrtr_force));
@@ -7143,6 +7432,7 @@ cell_main(void)
 	}
 	for (unsigned round = 0;; round++) {
 		run_steps();
+		cell_sim_invalidate();
 		if (!option_service || round >= 200) {
 			break;
 		}
@@ -7329,6 +7619,9 @@ void hk_cell_quiesce(void);
 void
 hk_cell_quiesce(void)
 {
+	/* Panic/loader return has stopped other CPUs: no logging or sleeping. */
+	__atomic_store_n(&cell_sim_state, CELL_SIM_UNKNOWN, __ATOMIC_RELEASE);
+	cell_sim_clear_network();
 	pcie.up = false;
 	__asm__ volatile ("dmb ish" ::: "memory");
 	if (pcie.clocked) {

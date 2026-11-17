@@ -1,0 +1,67 @@
+--- a/overlay/xnu/files/bsd/kern/kern_minimac.c
++++ b/overlay/xnu/files/bsd/kern/kern_minimac.c
+@@ -234,6 +234,34 @@
+  */
+ #define SANDBOX_SYSCALL_CHECK           2
+ 
++/* Limited native P2P profile for this port. The same predicate selects
++ * the enforced MAC hooks and the result of the membership query. */
++extern kern_return_t miniamfi_entitlement_string(struct proc *, const char *, const char *);
++static bool
++minisandbox_p2p_profile(proc_t p)
++{
++	return miniamfi_entitlement_string(p, "com.apple.private.sandbox.profile:embedded",
++	           "wifip2pd") == KERN_SUCCESS;
++}
++
++static int
++minisandbox_p2p_system_change(kauth_cred_t cred)
++{
++	return cred == kauth_cred_get() && minisandbox_p2p_profile(current_proc()) ? EPERM : 0;
++}
++
++static int
++minisandbox_p2p_reboot(kauth_cred_t cred, __unused int howto)
++{
++	return minisandbox_p2p_system_change(cred);
++}
++
++static int
++minisandbox_p2p_debug(kauth_cred_t cred, __unused struct proc_ident *target)
++{
++	return minisandbox_p2p_system_change(cred);
++}
++
+ static int
+ minisandbox_check(struct proc *p, user_addr_t arg)
+ {
+@@ -243,7 +271,8 @@
+ 	uint64_t yes = 1;
+ 	static int said;
+ 
+-	if (strnstr(p->p_comm, "BlastDoo", sizeof(p->p_comm)) == NULL) {
++	if (strnstr(p->p_comm, "BlastDoo", sizeof(p->p_comm)) == NULL &&
++	    !minisandbox_p2p_profile(p)) {
+ 		return 0;
+ 	}
+ 	if (copyin(arg, &a, sizeof(a)) != 0 || a.operation != 0 || a.answer == 0 || (pid_t)a.pid != proc_getpid(p)) {
+@@ -252,8 +281,7 @@
+ 	if (said++ < 4) {
+ 		printf("minisandbox: %s[%d] asks whether it is sandboxed: told that it is\n", p->p_comm, proc_getpid(p));
+ 	}
+-	(void)copyout(&yes, (user_addr_t)a.answer, sizeof(yes));
+-	return 0;
++	return copyout(&yes, (user_addr_t)a.answer, sizeof(yes));
+ }
+ 
+ /* Which request numbers have been seen: one log line each, to learn what user space asks for. */
+@@ -385,6 +413,9 @@
+ 
+ static const struct mac_policy_ops minisandbox_ops = {
+ 	.mpo_policy_syscall = minisandbox_policy_syscall,
++	.mpo_system_check_settime = minisandbox_p2p_system_change,
++	.mpo_system_check_reboot = minisandbox_p2p_reboot,
++	.mpo_proc_check_debug = minisandbox_p2p_debug,
+ 	.mpo_priv_grant = minisandbox_priv_grant,
+ };
+ 
