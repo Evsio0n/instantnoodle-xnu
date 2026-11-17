@@ -1292,6 +1292,8 @@ Transactions for a writable APFS (the in-place write and the slot store exist; `
 5 s countdown too short to choose Developer mode by hand; text console only ("the loader's own graphics are a later step"). Files: `xnuloader/flashboot.c`. Refs: INSTALL.md.
 
 ### T28 Security model — Security · Partial · P2
+**2026-11-17 source update:** the cellular overlay now includes opt-in keymaster-backed root wrapping and record upgrade handling, with RAM reboot/corruption/upgrade evidence. Daily does not enable it. Passcode, lock enforcement, legacy fallback and persistent-volume qualification remain open. See [TrustZone scope](research/trustzone-keystore.md). The main-tree/default stand-in described below remains unchanged.
+
 AMFI and Sandbox stand-ins accept everything; `MiniAppleKeyStore` models a never-locked no-passcode device and protects nothing; no Secure Enclave; no passcode support; kernel runs whatever
 it is given. Documented honestly as stand-ins ([kernel-standins.md](research/kernel-standins.md)). Not a roadmap item to "finish" unless a security goal is declared.
 
