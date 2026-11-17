@@ -21,9 +21,11 @@ setup the upstream documentation describes (`common/setup.sh`, `common/ugit`) is
 
 ## Status
 
-Verified on **one** unit (IN2010, panel AMB655UV01) as of **2026-11-11**. "Installed" means it is in the build that boots
+Updated **2026-11-17**, using device evidence through **2026-11-15** from **one** unit (IN2010, panel AMB655UV01). "Installed" means it is in the build that boots
 from the phone's own flash with no computer attached. "RAM" means it has only run in a test boot from RAM. Most checks
 were made on RAM boots of the same kernel and libraries as the installed build; the notes say where that matters.
+
+This documentation update summarizes device evidence through **2026-11-15**. **Daily 2026-11-15** is installed: retained user data, UFS write/readback, actual boot and boot-success marker passed. Automatic brightness, native Settings, SIM/carrier display and the third-party installer are integrated; long-term stability remains unqualified. “Daily” is a build label. See the [current status and validation limits](docs/STATUS-2026-11-17.md). This is a documentation publication, with no system image and no claim that the public source reproduces the latest integration.
 
 ### Works
 
@@ -34,14 +36,14 @@ were made on RAM boots of the same kernel and libraries as the installed build; 
 | Metal over Vulkan (Mesa turnip), whole system | ✅ installed | The default now: compositor, home screen, Settings, Safari, Photos, Maps, Camera. Stutter and memory growth remain, see Known issues |
 | Own display driver (MDP layers), 90 Hz | ✅ installed | Hardware planes instead of GPU composition where possible; no tearing triangles; 0 underruns and 0 SMMU faults in the runs read |
 | Touch, power key, volume down | ✅ installed | |
-| Manual brightness, EDR and HBM | ✅ installed | No auto-brightness yet |
+| Manual/automatic brightness, EDR and HBM | ✅ installed | Real ambient light, smooth brightness curve and native Auto-Brightness toggle integrated; cover/uncover and toggle tests passed |
 | HDR photos | ✅ installed | Gain maps through real CoreImage on Metal; checked by eye in RAM boots |
 | Maps | ✅ installed | Real map data draws correctly; gestures lag. Checked by eye in RAM boots |
 | Wi-Fi 2.4/5 GHz (QCA6390), Safari | ✅ installed | WPA2; joins a network saved in the build's `fw-wifi/network` by itself. That file is yours and is not in this repository |
 | All three back cameras' and the front camera's preview | ✅ installed | The preview's repeating frames are fixed. Preview is 15 fps in the dark |
 | Flashlight and camera flash | ✅ installed | On by default |
 | Bluetooth | ✅ installed | On by default; the controller comes up. Audio to a device not rechecked on this build |
-| Cellular: carrier, signal, mobile data | ✅ installed | Snapdragon X55 modem. The driver is the OnePlus 8 Pro port's ([dekefake/hackios-op8pro](https://github.com/dekefake/hackios-op8pro)), moved to this phone: [tools/nf/cell](tools/nf/cell/README.md). Data works beside Wi-Fi |
+| Cellular: carrier, signal, mobile data | ✅ installed | Snapdragon X55 modem. The driver is the OnePlus 8 Pro port's ([dekefake/hackios-op8pro](https://github.com/dekefake/hackios-op8pro)), moved to this phone: [tools/nf/cell](tools/nf/cell/README.md). Data works beside Wi-Fi; native Mobile Data carrier name and No SIM/reinsertion updates verified |
 | SMS | ✅ installed | Both ways in Messages: Chinese, emoji, long messages, the lock-screen notification. No MMS |
 | Phone calls (VoLTE) | ✅ installed | Both ways from iOS's own Phone app, with sound at the earpiece. The call volume cannot be changed yet; the speaker button and mute are not confirmed by ear |
 | Speakers, main microphone, vibration | 🧪 installed, partly rechecked | The microphone and the earpiece carry real calls on this build. iOS's own sounds through the speakers worked in earlier RAM boots and were not rechecked |
@@ -53,12 +55,14 @@ were made on RAM boots of the same kernel and libraries as the installed build; 
 |---|---|
 | System sleep | **Off in the installed build**, so the power key only locks the screen and battery drain is higher. With Wi-Fi off, sleep and wake work in RAM. With Wi-Fi on, its firmware crashes on resume and the phone must be restarted by hand |
 | GPS | The modem's location service answers and reports, but there has been no fix outdoors and nothing feeds iOS's location service yet |
-| Sensors, auto-brightness | Need the sensor DSP (SLPI) and its whole stack; the DSP comes up and is being probed, no sensor data yet. With no proximity sensor **the screen stays on at the ear during a call**; no rotation either |
+| Other sensors | Automatic brightness is verified and integrated. Proximity/ear-screen-off and rotation remain incomplete; sensor DSP power release is still pending |
 | The rest of telephony | Hold, call waiting, keypad tones, MMS, voicemail and Personal Hotspot are not done. A call over a Bluetooth headset and emergency calls have not been tried |
-| Third-party apps | First steps: an unencrypted app can be fetched, registered and its icon shown, and it has been seen to start. It has not been seen to draw. Encrypted (FairPlay) apps will not run |
+| Broad third-party app compatibility | TrollStore Lite entry and official iSH installation flow accepted by the owner; installer integrated. Arbitrary IPA compatibility, removal and persistence need broader regression. FairPlay apps are unsupported |
 | App Store, Apple ID, iCloud, push, FairPlay | Blocked: Apple's servers want a signature made with keys inside a real iPhone's Secure Enclave, and this project does not forge a device's identity. So no iMessage or FaceTime, and an app gets no notifications while it is closed. Calls, SMS and the phone's own notifications do not depend on it |
 | Macro camera (GC2375) | Detected only |
 | Portrait mode depth | Needs two cameras streaming at once |
+
+AirDrop experimental RAM builds completed native Mac small-file reception with matching hashes. iPhone photo finalization and stable discovery remain unresolved. It is excluded from Daily and paused.
 
 ### Known issues
 
@@ -88,7 +92,7 @@ phone's `userdata` and removes Android.
 
 1. Metal: the stutter of daily use and the compositor's memory growth (pipeline cache first; measurement before any fix)
 2. Wi-Fi across system sleep, so the installed build can sleep
-3. Sensors through the SLPI: proximity first now that calls work, then auto-brightness and rotation
+3. Long-term automatic-brightness regression and SLPI power release; proximity and rotation
 4. Cellular: the driver into the normal build; call volume, hold, keypad tones, MMS
 5. GPS: a fix outdoors, then iOS's location service
-6. Third-party apps; then a TrustZone-backed keychain and the Titan 480 hardware ISP
+6. Broader app compatibility, removal and persistence; secure storage and hardware ISP remain incomplete

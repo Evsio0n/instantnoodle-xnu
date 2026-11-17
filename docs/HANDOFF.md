@@ -1,5 +1,9 @@
 # HANDOFF — start here when you begin a new session
 
+## Public documentation update — 2026-11-17
+
+See [STATUS-2026-11-17.md](STATUS-2026-11-17.md) for device evidence through November 15. Daily is installed with retained data; automatic brightness, native Settings and installer integration supersede the November 11 status below. AirDrop remains paused and excluded. This publication changes documentation only; no phone operation or integration-source synchronization was performed.
+
 ## Cellular on the OnePlus 8: data, SMS, VoLTE calls with sound; installed, committed, published — 2026-11-11 (the cellular session)
 - **Installed at the owner's word (「接下來你build日用系統吧」): boot slot 1 = generation 1794355933 "Cellular 2026-11-11"**, `out/instantnoodle-cell-bundle.img` d89f9edf (0600: it holds the Wi-Fi file): kernel `out/kernels/cell-0a663690...mach`, boot volume `out/cell-daily-root.apfs` 7dae4b7a, the Metal 3 bundle's line plus `modem=5 cell=1`. Slot 0 keeps "Metal 3 2026-11-06". The boot guard recorded it as up. `boot_a`, `boot_b` and the slots' attributes were not written. The phone was last started from the UFS with the menu image (`python3 tools/sensors/cold_recover.py`, no flag) and is in the owner's hands; the owner: 「顯示了，能用能打電話」.
 - **Two boot images:** `cold_recover.py --developer` = `out/instantnoodle-fwreader.img` (USB by default); no flag = `out/instantnoodle-uefi-fast.img` (the menu; the installed system from the UFS). The owner: the menu's keys (ButtonDxe) still have a problem.
